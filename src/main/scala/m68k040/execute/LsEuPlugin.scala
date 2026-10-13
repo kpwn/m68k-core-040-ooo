@@ -1759,6 +1759,21 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // register randomization spuriously hold even an ORDINARY (non-split) send.
     val alignedSendHeld = alignedValid(alignedSendPtr) && alignedMem(alignedSendPtr).twoAccess &&
                           alignedMem(alignedSendPtr).splitSecond && alignedSlotAPending
+    // D4, MIXED-MODE SPLIT: a split whose slot B is INHIBITED launched at the ROB head with
+    // the bus quiet (`dLaunchOk`), but slot A went first -- and a CACHEABLE slot A that
+    // missed leaves its MSHR allocated (FILLED/LINGER, install) for a few cycles AFTER it
+    // has answered (`nbEarlyResponse`). Sending B then offers an INHIBITED miss to a busy
+    // non-blocking L1D, the exact D4 contract the cache asserts. Hold B (not presented, so
+    // it is not "entering" either) until `busQuiesced` again. Deadlock-free: only work
+    // already accepted gates `busQuiesced`; nothing younger can launch or send behind this
+    // op (`inhibLoadInFlight`, in-order ring send) and the walkers stay fenced.
+    val alignedSendD4Hold: Bool =
+      if (!inhibitedFullBarrier) False
+      else alignedValid(alignedSendPtr) && alignedMem(alignedSendPtr).twoAccess &&
+           alignedMem(alignedSendPtr).splitSecond &&
+           (alignedMem(alignedSendPtr).cmode === m68k040.cache.CacheMode.INHIBITED) &&
+           !dcache.busQuiesced
+    if (inhibitedFullBarrier) alignedSendD4Hold.simPublic()
     // ── WHY THE INHIBITED BARRIER DOES NOT GATE THIS SEND ─────────────────────────
     // An earlier revision blocked the ring from SENDING an entry program-YOUNGER than an op
     // that had resolved INHIBITED at P4, letting OLDER entries through. The decision was
@@ -1786,7 +1801,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // `alignedValid`, asserted below), so it is dropped from both valids -- exact.
     val alignedSendValid = (if (parkRetime) True else !alignedEmpty) && alignedValid(alignedSendPtr) &&
                            !alignedSent(alignedSendPtr) && !bkBusy && !excActive &&
-                           !alignedSendHeld
+                           !alignedSendHeld && !alignedSendD4Hold
     val alignedRspValid = (if (parkRetime) True else !alignedEmpty) && alignedValid(alignedRspPtr) &&
                           alignedSent(alignedRspPtr) && !bkBusy
     // Which ring entry does THIS cycle's response answer? By the slot id the command

@@ -120,6 +120,11 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
     val cd = dut.clockDomain
     cd.forkStimulus(10)
     val dataMem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd)
+
+    // Shipping L1D (`nonBlocking && hotDoor`): every cacheable refill leaves on the
+    // read-only hot door `axiDh`. Unattached, its R channel floats (random R beats /
+    // MSHRs that never fill). Same memory image and model L2 as the cold port.
+    m68k040.sim.HotDoorAttach.model(dut.dcache, cd, dataMem)
     // The DTLB walker now reaches memory through the D-cache, so the page table must
     // live in the D-SIDE memory rather than a private walker image. Aliasing the old
     // name onto it keeps every buildPage/pokeDescriptor call site below unchanged.
@@ -237,13 +242,11 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
                          s.fSuper.toBoolean, s.fAtc.toBoolean)
       if (dut.trace.logic.cancelValid.toBoolean && !dut.trace.logic.cancelAll.toBoolean)
         cancelTokens :+= dut.trace.logic.cancelToken.toInt
-      if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-          dut.dcache.logic.axi.ar.ready.toBoolean) {
-        // Page-table traffic now shares this AXI port, so exclude the descriptor region
-        // to keep `dcacheAr` meaning what it meant before: DATA line refills.
-        val a = dut.dcache.logic.axi.ar.payload.addr.toLong & 0xffffffffL
+      // Page-table traffic now shares the D-side ports, so exclude the descriptor region
+      // to keep `dcacheAr` meaning what it meant before: DATA line refills. Both read
+      // doors count (cacheable refills use the hot door in the shipping L1D).
+      for (a <- m68k040.cache.DcacheTestAxi.arFireAddrs(dut.dcache))
         if (a < Root || a >= Pagt + 0x1000L) dcacheAr += 1
-      }
 
       val terminal = completions.nonEmpty && (!expectFault || faults.nonEmpty)
       if (terminal && terminalAt < 0) terminalAt = cycle

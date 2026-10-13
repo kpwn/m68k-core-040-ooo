@@ -18,6 +18,10 @@ object DcacheTestAxi {
     dc.hotDoor && dc.logic.axiDh.ar.valid.toBoolean && dc.logic.axiDh.ar.ready.toBoolean
   /** An AR handshake on either read door. */
   def arFire(dc: DcachePlugin): Boolean = coldArFire(dc) || hotArFire(dc)
+  /** Physical addresses of this cycle's AR handshakes on either read door. */
+  def arFireAddrs(dc: DcachePlugin): Seq[Long] =
+    (if (coldArFire(dc)) Seq(dc.logic.axi.ar.payload.addr.toLong & 0xffffffffL) else Nil) ++
+    (if (hotArFire(dc)) Seq(dc.logic.axiDh.ar.payload.addr.toLong & 0xffffffffL) else Nil)
   /** AR valid on either read door (handshake not required). */
   def arValid(dc: DcachePlugin): Boolean =
     dc.logic.axi.ar.valid.toBoolean || (dc.hotDoor && dc.logic.axiDh.ar.valid.toBoolean)

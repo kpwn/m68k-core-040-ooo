@@ -94,7 +94,12 @@ class L2TlbSpec extends AnyFunSuite {
     val host = db on (new PluginHost)
     val ctrl = new MmuControlPlugin(l2TlbEntries = l2Entries, l2TlbSurvive = survive,
                                     l2TlbGranules = granules)
-    val dtlb = new DtlbPlugin()
+    // L1 DTLB victim buffer pinned OFF: every count below assumes the L1 DTLB alone
+    // holds at most 32 translations (`evictD`'s 64 fillers push a page out, and a
+    // 64-page pass must miss the L1 at least 32 times). The shipping default adds a
+    // 32-entry victim buffer (64 resident), which turns those L1 misses into
+    // promotes and the L2 counts into zeros. `DtlbVictimSpec` covers the buffer.
+    val dtlb = new DtlbPlugin(victimEntries = 0)
     val itlb = new ItlbPlugin()
     val dprobe = new DProbe()
     val iprobe = new IProbe()

@@ -227,12 +227,14 @@ class M1ThrowawayFrameIrqSpec extends AnyFunSuite {
                           minIrqEntries: Int = 1,
                           minIterations: Int = 0,
                           expectResult: Long = PassWord,
+                          stormDrainCycles: Int = 800,
                           mmuOn: Boolean = false): Unit = {
     val image = ProgramAssembler.assemble(src, loadAddr).getOrElse(fail(s"assemble failed for $simName"))
     compiled.doSim(simName, seed = 1) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd,
+        new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The two walker AXI agents that used to be attached here are GONE: since
       // `2db5bd3` the table walkers have no AXI master of their own and reach memory
       // through the D-cache, so their traffic already lands in `dmem`. (These agents
@@ -334,7 +336,7 @@ class M1ThrowawayFrameIrqSpec extends AnyFunSuite {
             fired += 1
           }
           dut.intCtrl.logic.iplIn #= 0
-          cd.waitSampling(800)
+          cd.waitSampling(stormDrainCycles)
 
         case "sweep" =>
           // Anchor on the guest's per-iteration Scratch store, wait exactly `phase`
@@ -393,8 +395,14 @@ class M1ThrowawayFrameIrqSpec extends AnyFunSuite {
           "it likely wedged, so a clean result would prove nothing")
 
       if (auditFrames) {
-        val wantMsp = Set(MspBase - 8, MspBase - 6, MspBase - 4, MspBase - 2)
-        val wantIsp = Set(IspBase - 8, IspBase - 6, IspBase - 4, IspBase - 2)
+        // `CPU_EXC_FAST_FRAMES` (shipping default) pushes a 4-aligned format-$0/$1 frame
+        // as two aligned LONG stores (base-8, base-4) instead of four word stores; both
+        // stack bases here are 4-aligned. The set is still exact: any drift shows.
+        def frameAddrs(base: Long): Set[Long] =
+          if (m68k040.top.ShippingCoreConfig.excFastFrames && (base & 3) == 0) Set(base - 8, base - 4)
+          else Set(base - 8, base - 6, base - 4, base - 2)
+        val wantMsp = frameAddrs(MspBase)
+        val wantIsp = frameAddrs(IspBase)
         assert(mspFrameHits.keySet.toSet == wantMsp,
           f"$simName: the MASTER stack's frame-word address set DRIFTED. expected exactly " +
           f"${wantMsp.toSeq.sorted.map(a => f"0x$a%08x").mkString(",")}, observed ${fmtSet(mspFrameHits)}")
@@ -715,9 +723,15 @@ class M1ThrowawayFrameIrqSpec extends AnyFunSuite {
     // The handler is long and nests, so a single mainline iteration spans many
     // interrupts -- the liveness bar is on ENTRIES (80), with only a token bar on loop
     // iterations. A measured run does ~120 entries in ~32 iterations.
+    // The storm's mean inter-pulse gap (~100 cycles) is shorter than this handler once
+    // every stack access is a precise, fully-fenced INHIBITED access (D-cache off here,
+    // `CPU_INHIBITED_FULL_BARRIER` shipping default): the nest deepens through the whole
+    // storm and is still unwinding 800 cycles after it. Give the unwind room; the
+    // iteration bar then proves every nested level returned (no wedge) and the guest's
+    // own marker check still convicts any stack imbalance.
     runScenario("m1_throwaway_longhandler", balanceLoop(longHandler), mode = "storm",
                 auditFrames = false, pulses = 700, minIrqEntries = 80,
-                minIterations = 15, expectResult = 0L)
+                minIterations = 15, expectResult = 0L, stormDrainCycles = 100000)
   }
 
   // ══════════════════════════════════════════════════════════════════════════════════

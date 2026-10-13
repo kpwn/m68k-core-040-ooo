@@ -105,6 +105,11 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
     val cd = dut.clockDomain
     cd.forkStimulus(10)
     val dataMem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd)
+
+    // Shipping L1D (`nonBlocking && hotDoor`): every cacheable refill leaves on the
+    // read-only hot door `axiDh`. Unattached, its R channel floats (random R beats /
+    // MSHRs that never fill). Same memory image and model L2 as the cold port.
+    m68k040.sim.HotDoorAttach.model(dut.dcache, cd, dataMem)
     // The DTLB walker now reaches memory through the D-cache, so the page table must
     // live in the D-SIDE memory rather than a private walker image. Aliasing the old
     // name onto it keeps every buildPage/pokeDescriptor call site below unchanged.
@@ -467,7 +472,10 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
         s"parallel=$parallelCycles enq=$enqCycles cmd=$cmdCycles " +
         s"earlyUse=$earlyUseCycles completion=$completionCycles")
       val latencies = completionCycles.zip(issueCycles).map { case (done, issue) => done - issue }
-      assert(latencies.forall(_ == (if(fallThrough) 7 else 8)),
+      // `CPU_LS_P3_LAUNCH` (shipping default ON, c72cb0f6) launches an ordinary L1 load
+      // from P3: one cycle off load-to-use (8 -> 7, fall-through 7 -> 6).
+      val p3 = if (m68k040.top.ShippingCoreConfig.lsP3Launch) 1 else 0
+      assert(latencies.forall(_ == (if(fallThrough) 7 - p3 else 8 - p3)),
         s"resident load latency: fallThrough=$fallThrough, cycles=$latencies")
       println(s"VIPT hints=$allowHints fallThrough=$fallThrough: issue=$issueCycles probe=$probeCycles " +
         s"resolve=$rspCycles cacheCmd=$cmdCycles earlyUse=$earlyUseCycles " +
@@ -514,7 +522,7 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
         assert(readPreg(dut, 41) == BigInt(if((n & 1) == 0) chainVaB else chainVaA),
           s"pointer chase used the wrong physical line at load $n")
       }
-      assert(chainLatencies.forall(_ == (if(fallThrough) 7 else 8)),
+      assert(chainLatencies.forall(_ == (if(fallThrough) 7 - p3 else 8 - p3)),
         s"dependent resident LSU latency: $chainLatencies")
       println(s"DEPENDENT_LSU_LATENCY fallThrough=$fallThrough cycles=$chainLatencies")
     }

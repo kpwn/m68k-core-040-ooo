@@ -585,6 +585,8 @@ object WalkExcHarness {
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
                                                    sharedMem = dsideMem, injectBusErrors = true,
                                                    dcfg = memCfg)
+      // P6 hot door (shipping L1D): same image / model L2, exactly as PortedTestRunner.
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, dmem)
       dmem.setByteWriteObserver((addr, byte) => iAgent.mem.write(addr, byte))
       for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
       for (i <- 0 until 4) dmem.mem.write(SentinelAddr + i, 0.toByte)
@@ -763,8 +765,7 @@ object WalkExcHarness {
         def legal(a: Long): Boolean =
           (a < 0x01000000L) || (a >= 0x40800000L && a < codeTop) ||
           (a >= 0x60000000L && a < 0x60040000L) || ((a >>> 16) == 0xffffL)
-        if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) {
-          val a = dut.dcache.logic.axi.ar.payload.addr.toLong & 0xffffffffL
+        for (a <- m68k040.cache.DcacheTestAxi.arFireAddrs(dut.dcache)) {
           if (!legal(a)) {
             badAr += 1
             if (badAr == 1L) {

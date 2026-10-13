@@ -334,6 +334,15 @@ class DtlbVictimSpec extends AnyFunSuite {
       var g = 0
       while (!e.p.walkerBusy.toBoolean && g < 50) { e.cd.waitSampling(); g += 1 }
       assert(e.p.walkerBusy.toBoolean, "B's walk launched")
+      // Squash only once the walk is in its DESCRIPTOR phase (first read issued, its
+      // 24-cycle response outstanding). With the shared L2 TLB (shipping default) the
+      // walk starts with an L2 probe; `abortOnFlush` stops it at that probe's answer,
+      // a couple of cycles in, so a squash two cycles after launch leaves no walk
+      // running to be "detached" from -- not the scenario this test is about.
+      val l0 = e.mem.loadCount
+      g = 0
+      while (e.mem.loadCount == l0 && g < 50) { e.cd.waitSampling(); g += 1 }
+      assert(e.mem.loadCount > l0, "B's walk issued its first descriptor read")
       e.cd.waitSampling(2)
       e.p.umFlush #= true; e.cd.waitSampling(); e.p.umFlush #= false
       val pr0 = e.promotes

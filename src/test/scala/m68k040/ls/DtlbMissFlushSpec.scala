@@ -311,6 +311,11 @@ class DtlbFlushReuseSpec extends AnyFunSuite {
     val cd = dut.clockDomain
     cd.forkStimulus(10)
     val dataMem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd)
+
+    // Shipping L1D (`nonBlocking && hotDoor`): every cacheable refill leaves on the
+    // read-only hot door `axiDh`. Unattached, its R channel floats (random R beats /
+    // MSHRs that never fill). Same memory image and model L2 as the cold port.
+    m68k040.sim.HotDoorAttach.model(dut.dcache, cd, dataMem)
     // The DTLB walker now reaches memory through the D-cache, so the page table must
     // live in the D-SIDE memory rather than a private walker image. Aliasing the old
     // name onto it keeps every buildPage/pokeDescriptor call site below unchanged.
@@ -512,12 +517,9 @@ class DtlbFlushReuseSpec extends AnyFunSuite {
             dut.dcache.logic.loadCmdPort.payload.token.toInt ==
               m68k040.cache.DLoadToken.WALK_DTLB)
           walkerArCycles += cycle
-        if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-            dut.dcache.logic.axi.ar.ready.toBoolean) {
-          val a = dut.dcache.logic.axi.ar.payload.addr.toLong & 0xffffffffL
+        for (a <- m68k040.cache.DcacheTestAxi.arFireAddrs(dut.dcache))
           if (a < DtlbMissTestPages.Root || a >= DtlbMissTestPages.Pagt + 0x1000L)
             dataArOutsideTables += 1
-        }
         cd.waitSampling()
         cycle += 1
         issueFire
@@ -563,9 +565,20 @@ class DtlbFlushReuseSpec extends AnyFunSuite {
       assert(reqEvents.map(e => (e._2, e._3)).toSeq == Seq(
         (vpn(oldVa), oldToken), (vpn(newVa), newToken)),
         s"epoch-tagged request association: $reqEvents")
-      assert(rspEvents.map(e => (e._2, e._3, e._4)).toSeq == Seq(
-        (oldPpn, oldToken, false), (newPpn, newToken, false)),
-        s"old response must drain and new response must remain distinct: $rspEvents")
+      // `CPU_DTLB_HIT_UNDER_WALK` (shipping default): the squashed walk DETACHES
+      // (`walkDead`) -- its response is dropped instead of draining, and the new
+      // generation may translate while it is still running. `CPU_WALK_ABORT_ON_FLUSH`
+      // additionally stops it at the next level, so it need not issue all three reads.
+      // Without the flag the old response drains first, as originally pinned.
+      val detach = m68k040.top.ShippingCoreConfig.dtlbHitUnderWalk
+      val abortWalk = m68k040.top.ShippingCoreConfig.walkAbortOnFlush
+      if (detach)
+        assert(rspEvents.map(e => (e._2, e._3, e._4)).toSeq == Seq((newPpn, newToken, false)),
+          s"a detached (squashed) walk must produce no response; new response only: $rspEvents")
+      else
+        assert(rspEvents.map(e => (e._2, e._3, e._4)).toSeq == Seq(
+          (oldPpn, oldToken, false), (newPpn, newToken, false)),
+          s"old response must drain and new response must remain distinct: $rspEvents")
       assert(probeEvents.map(e => (e._2, e._3)).toSeq == Seq(
         (oldVa, robId), (newVa, robId)),
         s"VIPT ROB-token reuse/cancel sequence: $probeEvents")
@@ -587,21 +600,30 @@ class DtlbFlushReuseSpec extends AnyFunSuite {
       assert(wbEvents.map(e => (e._2, e._3, e._4)).toSeq ==
         Seq((robId, word(newImage), true)), s"stale/reused wbObs stream: $wbEvents")
       assert(faults.isEmpty, s"flush/reuse path raised faults: $faults")
-      assert(walkerArCycles.size == 3,
-        s"exactly one old-epoch three-level walk expected: descriptor reads=$walkerArCycles")
+      if (abortWalk)
+        assert(walkerArCycles.nonEmpty && walkerArCycles.size <= 3,
+          s"one old-epoch walk, aborted at a level boundary: descriptor reads=$walkerArCycles")
+      else
+        assert(walkerArCycles.size == 3,
+          s"exactly one old-epoch three-level walk expected: descriptor reads=$walkerArCycles")
       // Descriptor reads now share this AXI port, so the region check is what preserves
       // this assertion's meaning: "neither the old access nor the reused L1 hit reached
       // memory". Page-table traffic is expected here and is counted separately above.
       assert(dataArOutsideTables == 0,
         s"old access or reused L1 hit unexpectedly reached data AXI: AR=$dataArOutsideTables")
       val oldReqCycle = reqEvents.find(_._3 == oldToken).get._1
-      val oldRspCycle = rspEvents.find(_._3 == oldToken).get._1
       val newReqCycle = reqEvents.find(_._3 == newToken).get._1
       val newRspCycle = rspEvents.find(_._3 == newToken).get._1
-      assert(oldReqCycle < flushCycle && flushCycle < oldRspCycle,
-        s"flush was not inside the old walk: req=$oldReqCycle flush=$flushCycle rsp=$oldRspCycle")
-      assert(newReqCycle >= oldRspCycle,
-        s"new generation entered before stale response drained: newReq=$newReqCycle oldRsp=$oldRspCycle")
+      if (detach) {
+        assert(oldReqCycle < flushCycle && flushCycle <= newReqCycle,
+          s"flush was not inside the old walk: req=$oldReqCycle flush=$flushCycle newReq=$newReqCycle")
+      } else {
+        val oldRspCycle = rspEvents.find(_._3 == oldToken).get._1
+        assert(oldReqCycle < flushCycle && flushCycle < oldRspCycle,
+          s"flush was not inside the old walk: req=$oldReqCycle flush=$flushCycle rsp=$oldRspCycle")
+        assert(newReqCycle >= oldRspCycle,
+          s"new generation entered before stale response drained: newReq=$newReqCycle oldRsp=$oldRspCycle")
+      }
       assert(newRspCycle == newReqCycle + 1,
         s"resident reused response latency: req=$newReqCycle rsp=$newRspCycle")
       assert(completions.head._1 > cmdEvents.head._1,

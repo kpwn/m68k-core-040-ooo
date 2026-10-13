@@ -164,6 +164,11 @@ class WalkerDescriptorCoherencySpec extends AnyFunSuite {
     val cd = dut.clockDomain
     cd.forkStimulus(10)
     val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd)
+
+    // Shipping L1D (`nonBlocking && hotDoor`): every cacheable refill leaves on the
+    // read-only hot door `axiDh`. Unattached, its R channel floats (random R beats /
+    // MSHRs that never fill). Same memory image and model L2 as the cold port.
+    m68k040.sim.HotDoorAttach.model(dut.dcache, cd, mem)
     val s = dut.src.logic
     s.iValid #= false
     s.iMemOp #= MemOp.LOAD
@@ -508,9 +513,18 @@ class WalkerDescriptorCoherencySpec extends AnyFunSuite {
         f"set before the drain and is clear after it. The drain rewrote the whole " +
         f"low byte from the value sampled at walk time, discarding everything " +
         f"software changed in between.")
-      assert((after & 0x18L) == 0x18L,
-        f"the drain lost its own update: read back 0x$after%08x, expected U (bit 3) " +
-        f"and M (bit 4) both set")
+      if (m68k040.top.ShippingCoreConfig.umAtomic) {
+        // `CPU_UM_ATOMIC` (shipping default): the drain re-reads the descriptor and DROPS
+        // its update when any non-U/M bit changed since the walk -- the 68040 orders the
+        // supervisor's store AFTER its locked U/M update, so that store's value (here
+        // U = M = 0, W = 1) is final, byte for byte.
+        assert(after == (descBase | WBit),
+          f"umAtomic: the supervisor's descriptor store must be final: read back " +
+          f"0x$after%08x, expected 0x${descBase | WBit}%08x")
+      } else
+        assert((after & 0x18L) == 0x18L,
+          f"the drain lost its own update: read back 0x$after%08x, expected U (bit 3) " +
+          f"and M (bit 4) both set")
     }
   }
 }
