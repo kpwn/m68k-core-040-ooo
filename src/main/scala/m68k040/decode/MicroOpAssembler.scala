@@ -3785,10 +3785,14 @@ object MicroOpAssembler {
     // cracked as [T0 := EA (LS AGU, leaGenUop)] + ... + [ibranch -> (T0)], so the branch EU
     // needs no index read port. The address µop reads the PRE-push A7 for JSR, so it also
     // subsumes the JSR (A7) snapshot for indexed forms.
+    // Without the flag the crack is still taken for a JSR whose INDEX register is A7: the
+    // trailing ibranch would otherwise read the index AFTER the push (post-push A7), while
+    // the 68040 forms the EA from the pre-push A7. (The base-A7 case is the snapshot below.)
     val brIdxCrack: Bool =
       if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx)
         ((isJmpOp && !jmpBad) || (isJsrOp && !jsrBad)) && srcEa.indexValid
-      else False
+      else
+        isJsrOp && !jsrBad && srcEa.indexValid && (srcEa.indexReg === U(15, 5 bits))
     val jsrNeedsSnap = isJsrOp && !jsrBad && srcEa.baseValid && !brIdxCrack &&
                        (srcEa.base === U(15, 5 bits))   // 15 = A7
     val ibrUop = DecodedUop()
@@ -3809,7 +3813,7 @@ object MicroOpAssembler {
     // the LS-EU AGU / LEA's leaGenUop. Non-indexed JMP/JSR leaves indexValid=False -> the
     // branch EU's index term is forced to zero (mirrors the LS EU's psrcCValid gating).
     ibrUop.srcCReg       := srcEa.indexReg
-    ibrUop.srcCValid     := (if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx) False else srcEa.indexValid)
+    ibrUop.srcCValid     := (if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx) False else srcEa.indexValid && !brIdxCrack)
     ibrUop.dstReg        := 0;          ibrUop.dstValid  := False
     ibrUop.useImm        := True
     ibrUop.imm           := Mux(brIdxCrack, B(0, 32 bits), Mux(srcEa.pcRel, ctrlPcRelAddr, srcEa.disp))

@@ -3116,12 +3116,10 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     ucRowBits := ucRowBitsRom
     when(ucMdMiRow0) { ucRowBits := Microcode.descToBits(Microcode.mdMiRow0) }
     when(ucMdMiRow1) { ucRowBits := Microcode.descToBits(Microcode.mdMiRow1) }
-    // CPU_PRF_TRIM_BRIDX: JMP enters the shared JSR/JMP program one row past the push, so
-    // that row is the JMP's macro boundary (opword bit 6: JMP 0x4EC0 vs JSR 0x4E80).
-    if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx) {
-      val ucMiJmpFirst = (ucPc === U(Microcode.MI_JMP_ENTRY, ucPc.getWidth bits)) && ucCtx.opword(6)
-      when(ucMiJmpFirst) { ucRowBits := Microcode.descToBits(Microcode.miJmpTrimFirstRow) }
-    }
+    // Memory-indirect JMP/JSR share one program; a JMP (opword bit 6: JMP 0x4EC0 vs JSR
+    // 0x4E80) replaces the JSR's push row with a no-op address row (both non-last).
+    val ucMiJmpNoPush = (ucPc === U(Microcode.MI_JMPJSR_PUSH_ROW, ucPc.getWidth bits)) && ucCtx.opword(6)
+    when(ucMiJmpNoPush) { ucRowBits := Microcode.descToBits(Microcode.miJmpNopRow) }
     val ucCurUop  = Microcode.resolveFromBits(ucRowBits, ucCtx, True)
     // isLast straight off the ROM: the two substituted rows and the rows they replace are
     // all non-last, so the sequencing loop (isLast -> ucNextPc -> ROM address) gains no mux.

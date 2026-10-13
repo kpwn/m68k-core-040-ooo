@@ -4579,6 +4579,73 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 1 + 1 + 1 + 2 + 1, seedDside = true)
   }
 
+  // ── Memory-indirect JMP/JSR with A7 in the EA (jsra7) ───────────────────────
+  // The EA of JSR ([bd,A7..],od) / ([bd,An],A7,od) / ([bd,PC],A7,od) must be formed from
+  // the PRE-push A7 (68040 / Musashi). The MI_JSR µcode program must therefore load the
+  // pointer and form the final address BEFORE the return-address push. A wrong (post-push)
+  // A7 selects the `bad` pointer / lands 4 bytes early in front of `fn`. SP := 0x3000.
+  // Full-format ext words: 0x0162 = IS, bd.w, mem-indirect od.w ; 0x1922/0x1926 = D1.L
+  // pre/post-indexed bd.w od.w ; 0xF922/0xF926 = A7.L pre/post-indexed bd.w od.w.
+  test("lock-step: jsra7 jsr/jmp ([0,A7],od) reads the PRE-push A7", VerilatorTest) {
+    runLockStep("jsra7-base-a7",
+      "lea 0x3000,%sp ; " +
+      "move.l #fn-8,-(%sp) ; .short 0x4EB7,0x0162,0x0000,0x0008 ; addq.l #4,%sp ; " +
+      "move.l #t1-8,-(%sp) ; .short 0x4EF7,0x0162,0x0000,0x0008 ; moveq #9,%d0 ; t1: addq.l #4,%sp ; " +
+      "moveq #7,%d2 ; .stop: bra .stop ; " +
+      "fn: addq.l #1,%d3 ; rts",
+      nInstr = 1 + (1 + 1 + 2 + 1) + (1 + 1 + 1) + 1)
+  }
+
+  test("lock-step: jsra7 jsr ([bd,A7,Xn],od) and ([bd,A7],Xn,od) read the PRE-push A7", VerilatorTest) {
+    runLockStep("jsra7-base-a7-indexed",
+      "lea 0x3000,%sp ; moveq #4,%d1 ; " +
+      "move.l #fn-8,-(%sp) ; move.l #bad-8,-(%sp) ; .short 0x4EB7,0x1922,0x0000,0x0008 ; addq.l #8,%sp ; " +
+      "move.l #fn-12,-(%sp) ; move.l #bad-12,-(%sp) ; .short 0x4EB7,0x1926,0x0004,0x0008 ; addq.l #8,%sp ; " +
+      "moveq #7,%d2 ; .stop: bra .stop ; " +
+      "bad: moveq #9,%d0 ; .stop2: bra .stop2 ; " +
+      "fn: addq.l #1,%d3 ; rts",
+      nInstr = 2 + 2 * (2 + 1 + 2 + 1) + 1)
+  }
+
+  test("lock-step: jsra7 jsr ([bd,An,A7.L],od) and ([bd,An],A7.L,od) index the PRE-push A7", VerilatorTest) {
+    // pre : ptr @ (0x2000 + 0 + 0x3000) = 0x5000 (post-push A7 would read 0x4FFC)
+    // post: ptr @ 0x2000 ; target = ptr + 0x3000 + 8 (post-push A7 lands at fn-4)
+    runLockStep("jsra7-index-a7",
+      "lea 0x3000,%sp ; lea 0x2000,%a0 ; " +
+      "move.l #fn-8,0x5000 ; move.l #bad-8,0x4FFC ; .short 0x4EB0,0xF922,0x0000,0x0008 ; " +
+      "move.l #fn-0x3008,0x2000 ; .short 0x4EB0,0xF926,0x0000,0x0008 ; " +
+      "moveq #7,%d2 ; .stop: bra .stop ; " +
+      "bad: moveq #9,%d0 ; .stop2: bra .stop2 ; moveq #9,%d0 ; moveq #9,%d0 ; " +
+      "fn: addq.l #1,%d3 ; rts",
+      nInstr = 2 + (2 + 1 + 2) + (1 + 1 + 2) + 1)
+  }
+
+  test("lock-step: jsra7 jsr ([bd,PC,A7.L],od) and ([bd,PC],A7.L,od) index the PRE-push A7", VerilatorTest) {
+    // pre : ptr @ (e1 + bd + 0x3000) = p1 (post-push A7 would read p0 = bad-8)
+    // post: ptr @ p2 ; target = ptr + 0x3000 + 8 (post-push A7 lands at fn-4)
+    runLockStep("jsra7-pc-index-a7",
+      "lea 0x3000,%sp ; " +
+      ".short 0x4EBB ; e1: .short 0xF922,p1-e1-0x3000,0x0008 ; " +
+      ".short 0x4EBB ; e2: .short 0xF926,p2-e2,0x0008 ; " +
+      "moveq #7,%d2 ; .stop: bra .stop ; " +
+      "bad: moveq #9,%d0 ; .stop2: bra .stop2 ; moveq #9,%d0 ; moveq #9,%d0 ; " +
+      "fn: addq.l #1,%d3 ; rts ; " +
+      ".align 4 ; p0: .long bad-8 ; p1: .long fn-8 ; p2: .long fn-0x3008",
+      nInstr = 1 + 3 + 3 + 1, seedDside = true)
+  }
+
+  test("lock-step: jsra7 non-memind jsr (d8,An,A7.L) / (d8,PC,A7.L) index the PRE-push A7", VerilatorTest) {
+    // Brief format, A7.L as the INDEX: target = base + 0x3000 + d8 (post-push A7 lands at
+    // fn-4). 0x4EB0/0x4EBB + ext 0xF800 | d8.
+    runLockStep("jsra7-brief-index-a7",
+      "lea 0x3000,%sp ; lea fn-0x3000,%a0 ; jsr 0(%a0,%sp.l) ; " +
+      "jsr fn-0x3000(%pc,%sp.l) ; " +
+      "moveq #7,%d2 ; .stop: bra .stop ; " +
+      "moveq #9,%d0 ; moveq #9,%d0 ; " +
+      "fn: addq.l #1,%d3 ; rts",
+      nInstr = 2 + 3 + 3 + 1)
+  }
+
   // ── real-ROM-bytes repro (Part 19 follow-up, 2026-08-28): the EXACT byte-for-byte
   // ROM encoding of the fault-site JSR+BSRW pair at their REAL absolute PCs, per the
   // task recommendation "build a directed sim repro using the ACTUAL real ROM bytes
