@@ -1312,9 +1312,9 @@ object Microcode {
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
          sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC130 (i0)
     Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SBfMiDispLo,
-         sz = SzLong),                                                                    // µPC131 (i1)
+         sz = SzLong, miHostIndex = true),                                                                    // µPC131 (i1)
     Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte),                                                                    // µPC132 (i2)
+         sz = SzByte, miHostIndex = true),                                                                    // µPC132 (i2)
     Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
          imm = SBfResImm, sz = SzLong),                                                   // µPC133 (i3)
     Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = SBfRdDst, sz = SzLong,
@@ -1374,9 +1374,9 @@ object Microcode {
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
          sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC142 (k0)
     Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SBfMiDispLo,
-         sz = SzLong),                                                                    // µPC143 (k1)
+         sz = SzLong, miHostIndex = true),                                                                    // µPC143 (k1)
     Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte),                                                                    // µPC144 (k2)
+         sz = SzByte, miHostIndex = true),                                                                    // µPC144 (k2)
     Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
          imm = SBfResImm, sz = SzLong),                                                   // µPC145 (k3)
     Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST2, sz = SzLong,
@@ -1388,9 +1388,9 @@ object Microcode {
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
          sz = SzLong, miPtrIndex = true),                                                 // µPC149 (k7, recompute)
     Desc(UMove, mem = MStore, srcA = ST2, srcB = ST0, useImm = true, imm = SBfMiDispLo,
-         sz = SzLong),                                                                    // µPC150 (k8)
+         sz = SzLong, miHostIndex = true),                                                                    // µPC150 (k8)
     Desc(UMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte, isLast = true),                                                     // µPC151 (k9)
+         sz = SzByte, miHostIndex = true, isLast = true),                                                     // µPC151 (k9)
 
     // ── MULDIV @152..165: MULx.L / DIVx.L <ea> with ea = (An)+ / -(An) ──────────────
     // (These 14 rows held the original MI_BF_INS_DO0 program, which no entry routed to --
@@ -1698,7 +1698,9 @@ object Microcode {
     Desc(UMove, mem = MStore, srcA = ST3, srcB = ST1, useImm = true, imm = SBfMiDispHi,
          sz = SzByte, miHostIndex = true, isLast = true),                                 // µPC225 (r13)
 
-    // MI_BF_INS_DO0_V2 — BFINS, STATIC offset (Do=0; width may be dynamic), NO-INDEX only
+    // MI_BF_INS_DO0_V2 — BFINS, STATIC offset (Do=0; width may be dynamic). Indexed EAs:
+    // s0 pre-indexes (miPtrIndex), the host loads/stores post-index (miHostIndex), as in the
+    // DO1 rows (2026-10-13; was no-index only).
     // (mirrors the original MI_BF_INS_DO0 @152's own scope — this is a same-scope
     // REPLACEMENT, not a feature extension). task #197 left the original MI_BF_INS_DO0
     // wired but non-functional (a genuine hang, root cause not found — leading unconfirmed
@@ -1728,9 +1730,9 @@ object Microcode {
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST3, useImm = true, imm = SEaDispLo,
          sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC226 (s0)
     Desc(UMove, mem = MLoad, srcA = ST3, dst = ST0, useImm = true, imm = SBfMiDispLo,
-         sz = SzLong),                                                                    // µPC227 (s1)
+         sz = SzLong, miHostIndex = true),                                                                    // µPC227 (s1)
     Desc(UMove, mem = MLoad, srcA = ST3, dst = ST1, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte),                                                                    // µPC228 (s2)
+         sz = SzByte, miHostIndex = true),                                                                    // µPC228 (s2)
     Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
          imm = SBfResImm, sz = SzLong),                                                   // µPC229 (s3)
     Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST0, sz = SzLong,
@@ -1738,17 +1740,17 @@ object Microcode {
     Desc(UBfReg, srcA = ST0, srcB = SBfDn2, srcC = ST2, dst = ST2, sz = SzLong,
          bfDyn = true, bfWritesNz = true),                                                // µPC231 (s5)
     Desc(UMove, mem = MLoad, srcA = ST3, dst = ST0, useImm = true, imm = SBfMiDispLo,
-         sz = SzLong),                                                                    // µPC232 (s6)
+         sz = SzLong, miHostIndex = true),                                                                    // µPC232 (s6)
     Desc(UBfMem, srcA = ST0, srcB = ST2, dst = ST0, useImm = true, imm = SBfImm,
          sz = SzLong, bfStoreForm = 2),                                                   // µPC233 (s7)
     Desc(UMove, mem = MLoad, srcA = ST3, dst = ST1, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte),                                                                    // µPC234 (s8)
+         sz = SzByte, miHostIndex = true),                                                                    // µPC234 (s8)
     Desc(UBfMem, srcA = ST1, srcB = ST2, dst = ST1, useImm = true, imm = SBfImm,
          sz = SzLong, bfStoreForm = 3),                                                   // µPC235 (s9)
     Desc(UMove, mem = MStore, srcA = ST3, srcB = ST0, useImm = true, imm = SBfMiDispLo,
-         sz = SzLong),                                                                    // µPC236 (s10)
+         sz = SzLong, miHostIndex = true),                                                                    // µPC236 (s10)
     Desc(UMove, mem = MStore, srcA = ST3, srcB = ST1, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte, isLast = true),                                                     // µPC237 (s11)
+         sz = SzByte, miHostIndex = true, isLast = true),                                                     // µPC237 (s11)
   )
   private def romP8(): Vector[Desc] = Vector(
     // ════════════════════════════════════════════════════════════════════════
@@ -2419,6 +2421,17 @@ object Microcode {
   val MULDIV_MUL64_ENTRY = 155  // rows 155..158 (load, An update, MUL, MULHI)
   val MULDIV_DIVQ_ENTRY  = 159  // rows 159..161 (load, An update, DIV)
   val MULDIV_DIVQR_ENTRY = 162  // rows 162..165 (load, An update, DIV, DIVREM)
+  // MULx.L / DIVx.L with a MEMORY-INDIRECT source reuse the same four programs: the ROM is
+  // full (511 of 512 rows), so instead of 14 new rows DecodeStage substitutes each
+  // program's first two rows when ctx.mdMi is set -- [mdLoad][mdAnUpd] become
+  // [pointer load -> T0][operand load (T0 + od (+post-index)) -> T0] (the MI_BF_* /
+  // §5 host-op pointer-chain shape), and the op rows read T0 unchanged.
+  val MULDIV_ENTRIES: Seq[Int] = Seq(152, 155, 159, 162)
+  val mdMiRow0: Desc = Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true,
+    imm = SEaDispLo, sz = SzLong, miPtrIndex = true, isFirst = true)
+  val mdMiRow1: Desc = Desc(UMove, mem = MLoad, srcA = ST0, dst = ST0, useImm = true,
+    imm = SMiOd, sz = SzLong, miHostIndex = true)
+  require(Seq(MULDIV_MUL32_ENTRY, MULDIV_MUL64_ENTRY, MULDIV_DIVQ_ENTRY, MULDIV_DIVQR_ENTRY) == MULDIV_ENTRIES)
   require(Seq(MULDIV_MUL32_ENTRY, MULDIV_MUL64_ENTRY, MULDIV_DIVQ_ENTRY, MULDIV_DIVQR_ENTRY)
             .forall(e => rom(e) == mdLoad && rom(e + 1) == mdAnUpd) &&
           rom(MULDIV_MUL32_ENTRY + 2).uop == UMulLo && rom(MULDIV_MUL32_ENTRY + 2).isLast &&
@@ -2671,6 +2684,9 @@ object Microcode {
     val mdLo     = UInt(5 bits)   // ext[14:12] Dl / Dq
     val mdSigned = Bool()         // ext[11]
     val md64     = Bool()         // ext[10]
+    // MULx.L / DIVx.L with a MEMORY-INDIRECT source: DecodeStage substitutes the first two
+    // rows of the MULDIV program (see `mdMiRow0`/`mdMiRow1`).
+    val mdMi     = Bool()
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────

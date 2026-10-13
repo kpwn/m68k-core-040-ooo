@@ -542,7 +542,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val slot1IsBfMemindMemEarly = fed.valid && fed.payload.slot1Valid &&
       (slot1Spec0.op === DecOp.BITFIELD) && !slot1Spec0.microcoded &&
       ((slot1Spec0.bfOp === 0) || (slot1Spec0.bfOp === 1) || (slot1Spec0.bfOp === 3) || (slot1Spec0.bfOp === 5)) &&
-      (s1bfEa.klass === EaClass.MEMINDIRECT) && (s1bfDo || !s1bfEa.indexValid)
+      (s1bfEa.klass === EaClass.MEMINDIRECT)
 
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
     // slot0 is NOT 3-µop, slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred), and
@@ -1265,7 +1265,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // the existing fail-safe illegal trap. DYNAMIC-offset (Do=1) IS admitted regardless of
     // index (task #203: MI_BF_RD_DO1 now supports pre/post-indexing, see its updated
     // header comment in Microcode.scala) -- `s0bfDo` (already computed above) gates it.
-    val s0bfMemindOk = (s0bfEa.klass === EaClass.MEMINDIRECT) && (s0bfDo || !s0bfEa.indexValid)
+    // Indexed STATIC-offset memind is admitted too: the MI_BF_*_DO0 host loads/stores carry
+    // miHostIndex (post-index) like the DO1 rows, and the pointer load miPtrIndex (pre-index).
+    val s0bfMemindOk = s0bfEa.klass === EaClass.MEMINDIRECT
     val slot0IsBfMemindMem = fed.valid && (spec0.op === DecOp.BITFIELD) && !spec0.microcoded &&
                              s0bfRdOnly && s0bfMemindOk
     // A slot0 owned by the µcode engine: an OperationDecoder-microcoded op OR a full-format
@@ -1884,7 +1886,10 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // task #197, unexercised by any then-passing test (all used offset<8). Every DYNAMIC-
     // offset (Do=1) memind entry is unaffected (`ucBfByteOff` is already forced 0 for
     // Do=1, so `ucBfDispLo === ucBfEaDec.disp` there regardless).
-    val ucBfPtrDispLo = Mux(ucBfEaDec.klass === EaClass.MEMINDIRECT, ucBfEaDec.disp, ucBfDispLo)
+    // ([bd,PC],...) bit-field: the pointer address is pc+4 (the EA's own ext word) + bd.
+    val ucBfPtrDispLo = Mux(ucBfEaDec.klass === EaClass.MEMINDIRECT,
+      Mux(ucBfEaDec.pcRel, (ucEntryPkt.pc + U(4, 32 bits) + ucBfEaDec.disp.asUInt).asBits, ucBfEaDec.disp),
+      ucBfDispLo)
     // Task #199 (bf_pcrel_read/bf_pcrel_idx_traps_alive): the PC-relative reference point
     // for a dynamic-offset (Do=1) bit-field read = the address of the EA's OWN extension
     // word = pc+4 (2 leading words: opword + bf-ext word — mirrors the OLD 3a
@@ -1989,8 +1994,16 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     ucEntryCtx.mdLo     := ucMdExt(14 downto 12).asUInt.resize(5)
     ucEntryCtx.mdSigned := ucMdExt(11)
     ucEntryCtx.md64     := ucMdExt(10)
-    val ucIsMulDiv = ucEntrySpec.microcoded &&
-      ((ucEntrySpec.form === OpForm.MULL) || (ucEntrySpec.form === OpForm.DIVL))
+    // A memory-indirect MULx.L/DIVx.L source (slot0IsMemInd brought it here; it is not
+    // `microcoded`) runs the same MULDIV programs with their first two rows substituted
+    // (ctx.mdMi, see Microcode.mdMiRow0/1). Its EA is the ext-word-shifted `ucBfEaDec`
+    // window: eaBase/eaIndex*/eaDispLo (bd, pc+4 folded for PC) are that decode's by
+    // default, and miOd/miPost are taken from it below.
+    val ucIsMulDivForm = (ucEntrySpec.form === OpForm.MULL) || (ucEntrySpec.form === OpForm.DIVL)
+    val ucIsMulDivMi = ucIsMulDivForm && !ucEntrySpec.microcoded &&
+                       (ucBfEaDec.klass === EaClass.MEMINDIRECT)
+    val ucIsMulDiv = ucIsMulDivForm && (ucEntrySpec.microcoded || ucIsMulDivMi)
+    ucEntryCtx.mdMi := ucIsMulDivMi
     val ucMdHasRem = ucMdExt(10) || (ucMdExt(2 downto 0) =/= ucMdExt(14 downto 12))
     // ── Task 6b: F-line FP-generic genuine memory-source loads Ctx population ──────────
     // `OperationDecoder`'s new memory-mode-<ea> arm routes the WHOLE opword-ambiguous
@@ -2667,7 +2680,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `ucFpMemBad`, `eaBase` and `eaIndex*` above already use for this family. Reading
     // `ucMiEa` here would walk the pointer chain with a displacement decoded from the wrong
     // word. (2026-09-17, with the FP memory-indirect EA support.)
-    ucEntryCtx.miOd         := Mux(ucIsFpMem, ucBfEaDec.od, ucMiEa.od)
+    ucEntryCtx.miOd         := Mux(ucIsFpMem || ucIsMulDivMi, ucBfEaDec.od, ucMiEa.od)
     // task #203: a bit-field op's memory-indirect EA is decoded SEPARATELY (`ucBfEaDec`,
     // over the bf-ext-shifted word window — a plain-op decode over `ucMiEa`'s own window
     // would misread a bit-field's ext words entirely). `ctx.miPost` is READ by the NEW
@@ -2675,7 +2688,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // this override strictly to `ucEntrySpec.op === DecOp.BITFIELD` so a NON-bit-field
     // memory-indirect op (which owns the real `ucMiEa` window) is completely unaffected
     // (zero regression risk to the already-working §5 host-op indexed-memind family).
-    ucEntryCtx.miPost       := Mux(ucIsFpMem || (ucEntrySpec.op === DecOp.BITFIELD), ucBfEaDec.memPost, ucMiEa.memPost)
+    ucEntryCtx.miPost       := Mux(ucIsFpMem || ucIsMulDivMi || (ucEntrySpec.op === DecOp.BITFIELD), ucBfEaDec.memPost, ucMiEa.memPost)
     ucEntryCtx.miOp         := ucEntrySpec.op
     // BITOP (BTST/BCHG/BCLR/BSET) tt sub-kind (task #152): OperationDecoder carries it as
     // opword[7:6] regardless of static/dynamic form (see OperationDecoder.scala's `tt`),
@@ -2906,7 +2919,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // routing now targets MI_BF_INS_DO0_V2 (the original MI_BF_INS_DO0 was a genuine,
     // never-root-caused hang — V2 sidesteps it structurally, see Microcode.scala).
     val ucBfIsMemindEa = ucBfEaDec.klass === EaClass.MEMINDIRECT
-    val ucBfIsMemind = ucBfIsMemindEa && (ucBfDo || !ucBfEaDec.indexValid)
+    val ucBfIsMemind = ucBfIsMemindEa
     val ucIsBfMemindRd  = !ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.BITFIELD) &&
                           ucBfEntRdOnly && ucBfIsMemind
     val ucIsBfMemindRmw = ucIsBfRmw && ucBfIsMemind
@@ -3077,9 +3090,21 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `ucCtx` needs NO such adjustment: it is a Reg latched on ucBegin and constant for the
     // whole chain, so reading it live (as before) is correct — the old code read the same Reg.
     val ucNextPc  = UInt(9 bits)   // task 6b: widened 8->9 bits alongside ucPc/OpSpec.ucEntry
-    val ucRowBits = ucReadRow(ucNextPc.resize(log2Up(Microcode.romSize)))
+    val ucRowBitsRom = ucReadRow(ucNextPc.resize(log2Up(Microcode.romSize)))
+    // MULx.L/DIVx.L memory-indirect (ctx.mdMi): rows 0/1 of the MULDIV program are replaced
+    // by the pointer-chain loads (Microcode.mdMiRow0/1). The select is off REGISTERED state
+    // (ucPc, ucCtx) and so settles in parallel with the BRAM read; the row itself is one
+    // 2:1 mux against a constant.
+    val ucMdMiRow0 = ucCtx.mdMi && Microcode.MULDIV_ENTRIES.map(e => ucPc === U(e, ucPc.getWidth bits)).reduce(_ || _)
+    val ucMdMiRow1 = ucCtx.mdMi && Microcode.MULDIV_ENTRIES.map(e => ucPc === U(e + 1, ucPc.getWidth bits)).reduce(_ || _)
+    val ucRowBits = Microcode.DescBits()
+    ucRowBits := ucRowBitsRom
+    when(ucMdMiRow0) { ucRowBits := Microcode.descToBits(Microcode.mdMiRow0) }
+    when(ucMdMiRow1) { ucRowBits := Microcode.descToBits(Microcode.mdMiRow1) }
     val ucCurUop  = Microcode.resolveFromBits(ucRowBits, ucCtx, True)
-    val ucCurLast = ucRowBits.isLast
+    // isLast straight off the ROM: the two substituted rows and the rows they replace are
+    // all non-last, so the sequencing loop (isLast -> ucNextPc -> ROM address) gains no mux.
+    val ucCurLast = ucRowBitsRom.isLast
 
         val pushProduced = Stream(PushPayload())
     // True exactly when the `otherwise` (normal head) arm of the chain below is selected:

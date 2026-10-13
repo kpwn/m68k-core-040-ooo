@@ -8,11 +8,9 @@
 |   1. brief-format (d8,PC,Xn)                  -- implemented: value check
 |   2. full-format (bd,PC,Xn) no-memind         -- implemented: value check
 |   3. full-format ([bd,PC,Xn],od) memind pre-indexed, STATIC offset
-|      -- not implemented: must raise a precise, recoverable vec-4 trap
-|      (never wedge) and execution continues.
+|                                               -- implemented: value check
 |
-| When real support for case 3 lands, WIDEN it: replace its trap-expect
-| with a value check (never delete the case).
+| No case may trap (vec 4 is counted in D6 and fails the test).
 |
 | PASS sentinel: 0xC0FFEE00 -> 0xFFFF0000.  FAIL: 0xDEADBEEF.
 
@@ -52,11 +50,21 @@ _c2:
     cmp.l   #0x81, %d0
     bne     _fail
 
-    | ---- Case 3: full-format memind pre-indexed, static offset -> vec 4 ----
+    | ---- Case 3: ([0x100,PC,D3.W]) memind pre-indexed, static offset -> 0x81 ----
+    | D3 = _ptr3 - (_e3 + 0x100): the pointer is read from _ptr3 (= _bfdat).
+    lea     _ptr3, %a1
+    lea     _e3+0x100, %a2
+    sub.l   %a2, %a1
+    move.l  %a1, %d3
     lea     _c3(%pc), %a5
-    .word   0xE9FB, 0x0008, 0x3121, 0x0100
+    moveq   #0, %d0
+    .word   0xE9FB, 0x0008
+_e3:
+    .word   0x3121, 0x0100
 _c3:
-    cmp.l   #1, %d6
+    tst.l   %d6
+    bne     _fail
+    cmp.l   #0x81, %d0
     bne     _fail
 
     bfextu  _bfdat(%pc){#4:#8}, %d0
@@ -83,6 +91,8 @@ _ill_handler:
     rte
 
     .align  4
+_ptr3:
+    .long   _bfdat
 _bfdat:
     .long   0x81234567
     .long   0x89ABCDEF

@@ -1,0 +1,189 @@
+# DecodeLegalityEnumSpec known mismatches: `case description|dut result|Musashi result`.
+# Each line is an understood, not-yet-fixed 68040 EA-legality difference. The spec fails on
+# any mismatch missing from this list and prints the entries that no longer mismatch (delete
+# them). Groups (see the spec's commit messages for the analysis):
+#  - dut=ILL musashi=ok/CHK, memory-indirect EAs: MI support missing for CMP2/CHK2, CHK,
+#    MUL.W/DIV.W, NBCD, memory shifts, MOVE from SR/CCR / to CCR, BFFFO with a dynamic
+#    offset, and MOVE ([..],[..],Xn,od) with a post-indexed destination -- each needs new
+#    microcode rows and the ROM is full (511 of 512).
+#  - dut=ILL musashi=ok, #imm: TST #imm and BTST Dn,#imm (68020+) need a crack of their own.
+#  - dut=ok/CHK musashi=ILL: over-acceptance of garbage encodings (An source for byte ops,
+#    OR/AND, MUL/DIV/CHK; MOVE.B An,Dn; MOVEA.B; CAS.B #imm); rejecting them adds terms to
+#    the fast `bad` tree.
+ADD.b <ea>,D1 A0|ok|ILL
+ADD.b <ea>,D1 A1|ok|ILL
+ADD.b <ea>,D1 A2|ok|ILL
+ADD.b <ea>,D1 A3|ok|ILL
+ADD.b <ea>,D1 A4|ok|ILL
+ADDQ.b A0|ok|ILL
+ADDQ.b A1|ok|ILL
+ADDQ.b A2|ok|ILL
+ADDQ.b A3|ok|ILL
+ADDQ.b A4|ok|ILL
+AND.b <ea>,D1 A0|ok|ILL
+AND.b <ea>,D1 A1|ok|ILL
+AND.b <ea>,D1 A2|ok|ILL
+AND.b <ea>,D1 A3|ok|ILL
+AND.b <ea>,D1 A4|ok|ILL
+AND.l <ea>,D1 A0|ok|ILL
+AND.l <ea>,D1 A1|ok|ILL
+AND.l <ea>,D1 A2|ok|ILL
+AND.l <ea>,D1 A3|ok|ILL
+AND.l <ea>,D1 A4|ok|ILL
+AND.w <ea>,D1 A0|ok|ILL
+AND.w <ea>,D1 A1|ok|ILL
+AND.w <ea>,D1 A2|ok|ILL
+AND.w <ea>,D1 A3|ok|ILL
+AND.w <ea>,D1 A4|ok|ILL
+ASL mem (..,A0,Xn)[MI-post]|ILL|ok
+ASL mem (..,A0,Xn)[MI-pre]|ILL|ok
+ASR mem (..,A0,Xn)[MI-post]|ILL|ok
+ASR mem (..,A0,Xn)[MI-pre]|ILL|ok
+BFFFO dyn (..,A0,Xn)[MI-post]|ILL|ok
+BFFFO dyn (..,A0,Xn)[MI-pre]|ILL|ok
+BFFFO dyn (..,PC,Xn)[MI-pre]|ILL|ok
+BTST D1 #imm|ILL|ok
+CAS.b #imm|ok|ILL
+CHK2.b (..,A0,Xn)[MI-post]|ILL|CHK
+CHK2.b (..,A0,Xn)[MI-pre]|ILL|CHK
+CHK2.b (..,PC,Xn)[MI-pre]|ILL|CHK
+CHK2.l (..,A0,Xn)[MI-post]|ILL|CHK
+CHK2.l (..,A0,Xn)[MI-pre]|ILL|CHK
+CHK2.l (..,PC,Xn)[MI-pre]|ILL|CHK
+CHK2.w (..,A0,Xn)[MI-post]|ILL|CHK
+CHK2.w (..,A0,Xn)[MI-pre]|ILL|CHK
+CHK2.w (..,PC,Xn)[MI-pre]|ILL|CHK
+CHK.L D1 A0|ok|ILL
+CHK.L D1 (..,A0,Xn)[MI-post]|ILL|ok
+CHK.L D1 (..,A0,Xn)[MI-pre]|ILL|ok
+CHK.L D1 A1|ok|ILL
+CHK.L D1 A2|ok|ILL
+CHK.L D1 A3|ok|ILL
+CHK.L D1 A4|ok|ILL
+CHK.L D1 (..,PC,Xn)[MI-pre]|ILL|ok
+CHK.W D1 A0|CHK|ILL
+CHK.W D1 (..,A0,Xn)[MI-post]|ILL|CHK
+CHK.W D1 (..,A0,Xn)[MI-pre]|ILL|CHK
+CHK.W D1 A1|CHK|ILL
+CHK.W D1 A2|CHK|ILL
+CHK.W D1 A3|CHK|ILL
+CHK.W D1 A4|CHK|ILL
+CHK.W D1 (..,PC,Xn)[MI-pre]|ILL|CHK
+CMP2.b (..,A0,Xn)[MI-post]|ILL|ok
+CMP2.b (..,A0,Xn)[MI-pre]|ILL|ok
+CMP2.b (..,PC,Xn)[MI-pre]|ILL|ok
+CMP2.l (..,A0,Xn)[MI-post]|ILL|ok
+CMP2.l (..,A0,Xn)[MI-pre]|ILL|ok
+CMP2.l (..,PC,Xn)[MI-pre]|ILL|ok
+CMP2.w (..,A0,Xn)[MI-post]|ILL|ok
+CMP2.w (..,A0,Xn)[MI-pre]|ILL|ok
+CMP2.w (..,PC,Xn)[MI-pre]|ILL|ok
+CMP.b <ea>,D1 A0|ok|ILL
+CMP.b <ea>,D1 A1|ok|ILL
+CMP.b <ea>,D1 A2|ok|ILL
+CMP.b <ea>,D1 A3|ok|ILL
+CMP.b <ea>,D1 A4|ok|ILL
+DIVS.L 64 A0|ok|ILL
+DIVS.L 64 A1|ok|ILL
+DIVS.L 64 A2|ok|ILL
+DIVS.L 64 A3|ok|ILL
+DIVS.L 64 A4|ok|ILL
+DIVS.W A0|ok|ILL
+DIVS.W (..,A0,Xn)[MI-post]|ILL|ok
+DIVS.W (..,A0,Xn)[MI-pre]|ILL|ok
+DIVS.W A1|ok|ILL
+DIVS.W A2|ok|ILL
+DIVS.W A3|ok|ILL
+DIVS.W A4|ok|ILL
+DIVS.W (..,PC,Xn)[MI-pre]|ILL|ok
+DIVU.L A0|ok|ILL
+DIVU.L A1|ok|ILL
+DIVU.L A2|ok|ILL
+DIVU.L A3|ok|ILL
+DIVU.L A4|ok|ILL
+DIVU.W A0|ok|ILL
+DIVU.W (..,A0,Xn)[MI-post]|ILL|ok
+DIVU.W (..,A0,Xn)[MI-pre]|ILL|ok
+DIVU.W A1|ok|ILL
+DIVU.W A2|ok|ILL
+DIVU.W A3|ok|ILL
+DIVU.W A4|ok|ILL
+DIVU.W (..,PC,Xn)[MI-pre]|ILL|ok
+LSL mem (..,A0,Xn)[MI-post]|ILL|ok
+LSL mem (..,A0,Xn)[MI-pre]|ILL|ok
+LSR mem (..,A0,Xn)[MI-post]|ILL|ok
+LSR mem (..,A0,Xn)[MI-pre]|ILL|ok
+MOVE.b A0,D1|ok|ILL
+MOVE.b A1,D1|ok|ILL
+MOVE.b A2,D1|ok|ILL
+MOVE.b A3,D1|ok|ILL
+MOVE.b A4,D1|ok|ILL
+MOVE.b D0,A0|ok|ILL
+MOVE.b D0,A1|ok|ILL
+MOVE.b D0,A2|ok|ILL
+MOVE.b D0,A3|ok|ILL
+MOVE.b D0,A4|ok|ILL
+MOVE fromCCR (..,A0,Xn)[MI-post]|ILL|ok
+MOVE fromCCR (..,A0,Xn)[MI-pre]|ILL|ok
+MOVE fromSR (..,A0,Xn)[MI-post]|ILL|ok
+MOVE fromSR (..,A0,Xn)[MI-pre]|ILL|ok
+MOVE.l [A0]+X+od,[A1]+X+od|ILL|ok
+MOVE.l [A0],[A1]+X+od|ILL|ok
+MOVE.l [PC],[A1]+X+od|ILL|ok
+MOVE toCCR (..,A0,Xn)[MI-post]|ILL|ok
+MOVE toCCR (..,A0,Xn)[MI-pre]|ILL|ok
+MOVE toCCR (..,PC,Xn)[MI-pre]|ILL|ok
+MULS.L 64 A0|ok|ILL
+MULS.L 64 A1|ok|ILL
+MULS.L 64 A2|ok|ILL
+MULS.L 64 A3|ok|ILL
+MULS.L 64 A4|ok|ILL
+MULS.W (..,A0,Xn)[MI-post]|ILL|ok
+MULS.W (..,A0,Xn)[MI-pre]|ILL|ok
+MULS.W (..,PC,Xn)[MI-pre]|ILL|ok
+MULU.L A0|ok|ILL
+MULU.L A1|ok|ILL
+MULU.L A2|ok|ILL
+MULU.L A3|ok|ILL
+MULU.L A4|ok|ILL
+MULU.W (..,A0,Xn)[MI-post]|ILL|ok
+MULU.W (..,A0,Xn)[MI-pre]|ILL|ok
+MULU.W (..,PC,Xn)[MI-pre]|ILL|ok
+NBCD (..,A0,Xn)[MI-post]|ILL|ok
+NBCD (..,A0,Xn)[MI-pre]|ILL|ok
+OR.b <ea>,D1 A0|ok|ILL
+OR.b <ea>,D1 A1|ok|ILL
+OR.b <ea>,D1 A2|ok|ILL
+OR.b <ea>,D1 A3|ok|ILL
+OR.b <ea>,D1 A4|ok|ILL
+OR.l <ea>,D1 A0|ok|ILL
+OR.l <ea>,D1 A1|ok|ILL
+OR.l <ea>,D1 A2|ok|ILL
+OR.l <ea>,D1 A3|ok|ILL
+OR.l <ea>,D1 A4|ok|ILL
+OR.w <ea>,D1 A0|ok|ILL
+OR.w <ea>,D1 A1|ok|ILL
+OR.w <ea>,D1 A2|ok|ILL
+OR.w <ea>,D1 A3|ok|ILL
+OR.w <ea>,D1 A4|ok|ILL
+ROL mem (..,A0,Xn)[MI-post]|ILL|ok
+ROL mem (..,A0,Xn)[MI-pre]|ILL|ok
+ROR mem (..,A0,Xn)[MI-post]|ILL|ok
+ROR mem (..,A0,Xn)[MI-pre]|ILL|ok
+ROXL mem (..,A0,Xn)[MI-post]|ILL|ok
+ROXL mem (..,A0,Xn)[MI-pre]|ILL|ok
+ROXR mem (..,A0,Xn)[MI-post]|ILL|ok
+ROXR mem (..,A0,Xn)[MI-pre]|ILL|ok
+SUB.b <ea>,D1 A0|ok|ILL
+SUB.b <ea>,D1 A1|ok|ILL
+SUB.b <ea>,D1 A2|ok|ILL
+SUB.b <ea>,D1 A3|ok|ILL
+SUB.b <ea>,D1 A4|ok|ILL
+SUBQ.b A0|ok|ILL
+SUBQ.b A1|ok|ILL
+SUBQ.b A2|ok|ILL
+SUBQ.b A3|ok|ILL
+SUBQ.b A4|ok|ILL
+TST.b #imm|ILL|ok
+TST.l #imm|ILL|ok
+TST.w #imm|ILL|ok

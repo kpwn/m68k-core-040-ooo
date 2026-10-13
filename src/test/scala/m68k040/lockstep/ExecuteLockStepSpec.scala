@@ -7647,6 +7647,36 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 6 + 6 + 2, seedDside = true)
   }
 
+  // Static-offset bit fields through INDEXED memory-indirect EAs (post- and pre-indexed,
+  // read and RMW) and through ([bd,PC]) (the pointer address must fold pc+4).
+  test("lock-step: decl BF static memory-indirect indexed and ([bd,PC])", VerilatorTest) {
+    runLockStep("decl-bf-memind-idx",
+      "move.l #0x3000,%a0 ; moveq #4,%d3 ; move.l #0x3200,0x3100 ; move.l #0x3300,0x3104 ; " +
+      "move.l #0x12345678,0x3206 ; move.l #0xF0F0F0F0,0x3300 ; " +
+      ".short 0xE9F0,0x0108,0x3926,0x0100,0x0002 ; " +    // bfextu ([0x100,a0],d3.l,2){#4:#8},d0
+      ".short 0xEAF0,0x0104,0x3921,0x0100 ; " +           // bfchg ([0x100,a0,d3.l]){#4:#4}
+      ".short 0xEBFB,0x1010 ; e9: .short 0x0161,p9-e9 ; " + // bfexts ([p9,pc]){#0:#16},d1
+      "move.l 0x3300,%d4 ; loop: bra loop ; " +
+      ".align 4 ; p9: .long 0x3206",
+      nInstr = 6 + 3 + 2, seedDside = true)
+  }
+
+  // MULx.L / DIVx.L with MEMORY-INDIRECT sources: no-index, pre-indexed, post-indexed
+  // with od, and ([bd,PC]) -- .L32, .L64 and the DIVxL remainder form.
+  test("lock-step: decl MULx.L/DIVx.L memory-indirect sources", VerilatorTest) {
+    runLockStep("decl-muldiv-memind",
+      "move.l #0x3000,%a0 ; moveq #4,%d3 ; move.l #0x3200,0x3100 ; move.l #0x3300,0x3104 ; " +
+      "move.l #7,0x3200 ; move.l #9,0x3206 ; move.l #-3,0x3300 ; " +
+      "move.l #1000,%d5 ; move.l #0x12345,%d6 ; moveq #-1,%d2 ; move.l #100000,%d7 ; " +
+      ".short 0x4C30,0x6000,0x0161,0x0100 ; " +          // mulu.l ([0x100,a0]),d6
+      ".short 0x4C30,0x2C01,0x3921,0x0100 ; " +          // muls.l ([0x100,a0,d3.l]),d1:d2
+      ".short 0x4C70,0x5005,0x3926,0x0100,0x0002 ; " +   // divu.l ([0x100,a0],d3.l,2),d5
+      ".short 0x4C7B,0x7800 ; e4: .short 0x0161,p4-e4 ; " + // divsl.l ([p4,pc]),d0:d7
+      "move.l %d7,%d4 ; loop: bra loop ; " +
+      ".align 4 ; p4: .long 0x3300",
+      nInstr = 11 + 4 + 2, seedDside = true)
+  }
+
   // ── MULx.L / DIVx.L with an AUTO-UPDATE source EA, (An)+ and -(An) ──────────────
   // A real 68040 accepts every data addressing mode for the long multiply/divide. These
   // used to raise vector 4 (silicon: `muls.l (%a1)+,%d4:%d5`, 4C19 5C04, Acrobat Reader).
