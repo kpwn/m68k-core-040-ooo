@@ -190,7 +190,7 @@ class FpuProtocolSpec extends AnyFunSuite {
       uop.dstArch := 0
       uop.psrcA := 0; uop.psrcAValid := True
       uop.psrcB := 0; uop.psrcBValid := True
-      uop.psrcC := 0; uop.psrcCValid := True
+      uop.psrcC := 0; uop.psrcCValid := False   // only an Extended MEMORY source carries a 3rd int source (Microcode fpMemChunkTemp(2)); a register op never does
       uop.pdst := 0; uop.pdstValid := False; uop.pdstOld := 0
       uop.pNzvcSrc := 0; uop.readsNzvc := False
       uop.pNzvcDst := 0; uop.writesNzvc := False; uop.pNzvcOld := 0

@@ -207,6 +207,10 @@ object DivEuPlugin {
   *       core; while busy, hold; on done -> writeback + complete + wakeup (or euFault).
   */
 class DivEuPlugin extends FiberPlugin with DivEuService {
+  /** `CPU_PRF_TRIM_DIVH`: no dedicated `rdH` int-PRF read port. A uop with a valid third
+    * source (DIV.L 64/32 Dr, CMP2/CHK2 Rn, BF* srcC, FMOVE.X T2 chunk) spends one extra
+    * cycle in the registered issue slot reading `psrcC` through `rdA`. */
+  private val prfTrimDivH: Boolean = m68k040.top.ShippingCoreConfig.prfTrimDivH
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[UInt]   = null
   var wakeupPort: Flow[UInt]       = null
@@ -289,7 +293,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val irf = host[IntRegFileService]
     rdA = irf.newRead()   // CHK: Dn ; DIV: dividend low (Dq)
     rdB = irf.newRead()   // CHK: bound ; DIV: divisor (when register)
-    rdH = irf.newRead()   // DIV64: dividend high (Dr)
+    if (!prfTrimDivH) rdH = irf.newRead()   // DIV64: dividend high (Dr)
     // Zero hits in the four-kernel sweep and under test-fast, but see AluEuPlugin's
     // note: that proved nothing for the slow-ALU bypass either. Not marked deadProbe.
     intW = irf.newWrite(latency = 1); intByp = irf.newBypass()
@@ -424,14 +428,30 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
 
     // ---- S0: read operands ----
     val u0 = ip.payload.uop
-    rdA.addr := u0.psrcA
     rdB.addr := u0.psrcB
-    rdH.addr := u0.psrcC     // DIV.L 64/32 dividend HIGH word (Dr) via the 3rd source
+    // CPU_PRF_TRIM_DIVH: `cPhase` is the extra cycle in which `rdA` reads psrcC into `cHeld`;
+    // the uop cannot be accepted until that read has been captured.
+    val cPhase = Bool()
+    val s0HTrim = Bits(32 bits)
+    if (prfTrimDivH) {
+      val cDone = RegInit(False)
+      val cHeld = Reg(Bits(32 bits))
+      cPhase := ip.valid && u0.psrcCValid && !cDone
+      rdA.addr := Mux(cPhase, u0.psrcC, u0.psrcA)
+      when(cPhase) { cHeld := rdA.data; cDone := True }
+      when(ip.fire || flushSig) { cDone := False }
+      s0HTrim := cHeld
+    } else {
+      cPhase := False
+      rdA.addr := u0.psrcA
+      rdH.addr := u0.psrcC     // DIV.L 64/32 dividend HIGH word (Dr) via the 3rd source
+      s0HTrim := rdH.data
+    }
     nzvcRd.addr := u0.pNzvcSrc                  // CMP2/CHK2 old NZVC (preserve N/V)
     fpccRd.addr := u0.pFpccSrc                  // Task 9b: DecOp.FPCTRLRD's FPCC source
     val s0A = rdA.data
     val s0B = Mux(u0.useImm, u0.imm, rdB.data)
-    val s0H = rdH.data
+    val s0H = s0HTrim
     val s0Nzvc = nzvcRd.data                    // {N(3),Z(2),V(1),C(0)}
 
     // Iterative/legacy lane occupancy.  A main MUL bypasses this lane and has its own
@@ -472,7 +492,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // FLUSHED iterative op until FpDivSqrtCore is genuinely free again (see the iterAck
     // contract below) -- which is precisely what makes the gate correct rather than
     // optimistic.
-    ip.ready := !flushSig && (!ip.valid || Mux(issueIsMul,
+    ip.ready := !flushSig && !cPhase && (!ip.valid || Mux(issueIsMul,
       mulCanAccept,
       Mux(issueIsMulHi, mulHiAvailable,
       Mux(issueIsBf, bfCanAccept,
@@ -1162,7 +1182,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       // carry the packed FP command word, which would otherwise mux the int immediate over
       // the real T1 chunk.
       fpS1IntB   := rdB.data
-      fpS1IntC   := rdH.data
+      fpS1IntC   := s0H
       fpS1FpDst  := fpRdA.data
       fpS1FpSrc  := fpRdB.data
       fpS1Imm    := fpImmTab.fpImmRdData   // side-table read, tag = u0.imm[FP_IMM_TAG_W-1:0]
@@ -1696,7 +1716,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     when(bfStart) {
       bf1A          := Mux(u0.psrcAValid, rdA.data, B(0, 32 bits))
       bf1B          := rdB.data
-      bf1C          := rdH.data
+      bf1C          := s0H
       bf1Packed     := s0B            // the useImm mux (== AluEu's s1Src2)
       bf1Op         := u0.bfOp
       bf1Dynamic    := u0.bfDynamic

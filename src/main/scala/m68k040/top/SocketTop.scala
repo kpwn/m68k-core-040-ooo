@@ -767,6 +767,7 @@ object GenSocketTopVerilog {
             s"dcacheNbDynamicRelease=${ShippingCoreConfig.dcacheNbDynamicRelease} " +
             s"dcacheNbProbeMissStage=${ShippingCoreConfig.dcacheNbProbeMissStage} " +
             s"prfReadTrim=${ShippingCoreConfig.prfReadTrim} " +
+            s"prfTrimDivH=${ShippingCoreConfig.prfTrimDivH} " +
             // TLB-miss cost chain (constructor DEFAULTS of LsEuPlugin / DtlbPlugin).
             s"walkAgeLimit=${ShippingCoreConfig.walkAgeLimit} " +
             s"dtlbHitUnderWalk=${ShippingCoreConfig.dtlbHitUnderWalk} " +
