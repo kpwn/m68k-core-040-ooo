@@ -777,7 +777,7 @@ object ShippingCoreConfig {
     * modif) in an async-read distributed RAM instead of per-slot flops + MuxOH. Tag half
     * stays in flops for the CAM. Cycle-identical. Default OFF; `CPU_TLB_VIC_PAYLOAD_LUTRAM=1`
     * enables; reaches every harness via the plugin constructor defaults; echoed in SHIPPING_CONFIG. */
-  val tlbVicPayloadLutram: Boolean = envFlag("CPU_TLB_VIC_PAYLOAD_LUTRAM", false)
+  val tlbVicPayloadLutram: Boolean = envFlag("CPU_TLB_VIC_PAYLOAD_LUTRAM", true)
 
   /** ROB: let a resolved CORRECTLY-predicted branch that ends its macro retire in slot 0
     * alongside a non-branch slot-1 uop (`RobPlugin.pairCorrectBranch`). Default OFF = every
