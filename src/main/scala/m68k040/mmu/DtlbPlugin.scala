@@ -65,6 +65,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                  victimNegativeControl: Int = DtlbPlugin.VictimNegativeControl.None,
                  /** `ShippingCoreConfig.tlbVicPayloadLutram`: victim payload in LUTRAM. */
                  victimPayloadLutram: Boolean = m68k040.top.ShippingCoreConfig.tlbVicPayloadLutram,
+                 /** `ShippingCoreConfig.dtlbArrayLutram`: main TLB arrays in LUTRAM. */
+                 arrayLutram: Boolean = m68k040.top.ShippingCoreConfig.dtlbArrayLutram,
                  /** `ShippingCoreConfig.beRetime`: the MOVEC/debug-apply ATC flush is a REGISTERED pulse. */
                  beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime,
                  /** `ShippingCoreConfig.umAtomic`: atomic, order-checked U/M drain. */
@@ -178,8 +180,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   var flushAll:      Bool = null
 
   val logic = during build new Area {
-    val tlb    = if (victimEntries > 0) new Tlb(entries, ways, banks, reportEvictions = true)
-                 else new Tlb(entries, ways, banks)
+    val tlb    = if (victimEntries > 0) new Tlb(entries, ways, banks, reportEvictions = true, arrayLutram = arrayLutram)
+                 else new Tlb(entries, ways, banks, arrayLutram = arrayLutram)
     // ── Multi-hot evidence plumbing (2026-09-17) ───────────────────────────────
     // `dbgMultiHotClear` is a plugin-level default-False wire so DebugCtrlPlugin can
     // override it from its write decode, and so a DUT that wires nothing still
