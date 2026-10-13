@@ -643,6 +643,12 @@ REG OFF_FETCH_CHECK_HIT_PC 0x0180C RO 5 0x00000000 First mismatching accepted fe
 REG OFF_FETCH_CHECK_HIT_WORD 0x01810 RO 5 0x00000000 Captured expected opcode [31:16], observed opcode [15:0].
 REG OFF_FETCH_CHECK_SEEN  0x01814 RO 5 0x00000000 Saturating count of accepted nonfault packets at selected PC, including matches.
 FEAT fetch_word_check      25 5 Passive accepted-fetch PC/opcode comparator and first-mismatch capture.
+# Build-option identity bit, never implied by a stage (hence STAGE 9): set ONLY by a
+# CPU_DBG_LITE build. Halt/step/break-PC/halt-exc mask/live regs/arch apply/cache maint/
+# build id and the core OFF_PERF_* set (OFF_PERF_CTL[15:8] = 14) remain; the rings, fetch
+# check, multi-hot/stall-pack/MMU-probe evidence, halt-after, A7-odd/PC-range lanes, the
+# I-prefetch/exception/detail counters and the arch-shadow READBACK are absent and read 0.
+FEAT dbg_lite              26 9 Perf-lite debug build (CPU_DBG_LITE): debug-only evidence logic removed; absent offsets read 0.
 
 # ------------------------------------------------------------ socket ports --
 # Verbatim from macqd700-soc/rtl/soc/cpu_socket.vh:145-176. DIR is from the

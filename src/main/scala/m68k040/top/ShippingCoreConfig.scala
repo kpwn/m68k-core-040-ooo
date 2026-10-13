@@ -908,4 +908,18 @@ object ShippingCoreConfig {
     * core through the D-cache diagnostic fault instead of the exception unit's
     * DOUBLE_FAULT (both halt). Default OFF; echoed in `SHIPPING_CONFIG`. */
   val excFramesCopyback: Boolean = envFlag("CPU_EXC_FRAMES_COPYBACK", true)
+  /** Perf-lite DebugCtrl (census 2026-10-13 item 6). A BUILD OPTION, never a shipping
+    * default: every silicon measurement depends on the full debug counter set.
+    * Read as `DebugCtrlPlugin`'s constructor DEFAULT (the `sqDepth` precedent), so the
+    * SocketTop, FullCoreSynth and every directly-built debug DUT agree with this line.
+    * Keeps halt/resume/step, PC breakpoints, the halt-on-exception mask, live register
+    * readback, arch write/apply, cache maintenance (coherent mem r/w), build id, and the
+    * board-perf core counter set (cycles, inst, mispred + class pair, flush, branch,
+    * I/D miss, D/I walks, retire/dcache/walk stall). Drops the PC/branch/exception rings,
+    * fetch-word check, multi-hot/stall-pack/MMU-probe evidence, halt-after-N, the A7-odd
+    * and PC-range halt lanes, the I-prefetch/exception/detail counter banks and the
+    * arch-shadow READBACK; dropped offsets read 0, writes are accepted and ignored.
+    * Advertised as OFF_FEATURES bit 26 (`dbg_lite`). Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val dbgLite: Boolean = envFlag("CPU_DBG_LITE", false)
 }

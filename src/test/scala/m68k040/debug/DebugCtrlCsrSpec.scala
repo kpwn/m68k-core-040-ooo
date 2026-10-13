@@ -52,11 +52,14 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
       DbgAxiDriver.idle(dut.axi)
       dut.clockDomain.waitSampling(20)
       val got = DbgAxiDriver.read(dut.axi, dut.clockDomain, DebugRegMap.OFF_FEATURES.toLong)
-      val want = DebugRegMap.featuresForStage(1).toLong
+      val want = DebugRegMap.featuresForStage(1).toLong | DbgLite.featureMask
       assert(got == want, f"OFF_FEATURES = 0x$got%08X, expected 0x$want%08X")
-      assert(got == 0x0004000FL, "spec section 15.5 fixes the Stage-1 value")
+      assert((got & ~DbgLite.featureMask) == 0x0004000FL, "spec section 15.5 fixes the Stage-1 value")
+      assert(((got >> DbgLite.featureBit) & 1L) == (if (DbgLite.on) 1L else 0L),
+        "OFF_FEATURES bit 26 (dbg_lite) must be set exactly in a CPU_DBG_LITE build")
       // Every bit that is set must belong to a feature this stage really built.
-      for ((name, bit, featStage) <- DebugRegMap.features if ((got >> bit) & 1L) == 1L)
+      for ((name, bit, featStage) <- DebugRegMap.features
+           if ((got >> bit) & 1L) == 1L && name != "dbg_lite")
         assert(featStage <= 1,
           s"OFF_FEATURES advertises '$name' (bit $bit, stage $featStage) from a stage-1 build")
       // And every optional bit must be clear (spec Stage 1: "Keep every optional feature
@@ -82,7 +85,7 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
       assert(DbgAxiDriver.write(dut.axi, dut.clockDomain,
         DebugRegMap.OFF_FEATURES.toLong, 0xFFFFFFFFL) == 0)
       assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
-        DebugRegMap.OFF_FEATURES.toLong) == DebugRegMap.featuresForStage(1).toLong)
+        DebugRegMap.OFF_FEATURES.toLong) == (DebugRegMap.featuresForStage(1).toLong | DbgLite.featureMask))
     }
   }
 
@@ -106,15 +109,23 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
       DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_D0, 0xAABBCCDDL, strb = 0x5)
       DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_SSP, 0x55667788L)
       DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_DFC, 0x00000006L)
-      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_D0) == 0x11BB33DDL)
-      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_SSP) == 0x55667788L)
-      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_DFC) == 6L)
+      // Lite: the shadows are write-only over AXI (read 0); check the register itself.
+      def shadow(off: Int, idx: Int): Long =
+        if (DbgLite.on) {
+          assert(DbgAxiDriver.read(dut.axi, cd, off) == 0L, f"lite: shadow 0x$off%05x must read 0")
+          dut.dbg.logic.csr.archShadow(idx).toLong
+        } else DbgAxiDriver.read(dut.axi, cd, off)
+      assert(shadow(DebugRegMap.OFF_ARCH_D0, 0) == 0x11BB33DDL)
+      assert(shadow(DebugRegMap.OFF_ARCH_SSP, 17) == 0x55667788L)
+      assert(shadow(DebugRegMap.OFF_ARCH_DFC, 31) == 6L)
       val dirty = dut.dbg.logic.csr.archDirty.toBigInt
       assert(dirty.testBit(0) && dirty.testBit(17) && dirty.testBit(31))
       assert(dirty.bitCount == 3, f"unexpected dirty mask 0x$dirty%08x")
 
       DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_DBG_RESET_CTL, 1L)
       cd.waitSampling(2)
+      // Lite keeps the (unreadable) shadow data across a wipe; clearing dirty is what
+      // makes the wipe effective, since an apply writes only dirty fields.
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_D0) == 0L)
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_SSP) == 0L)
       assert(dut.dbg.logic.csr.archDirty.toBigInt == 0)
@@ -143,7 +154,7 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
       // counter has a real producer", and claiming it on a build with no producers is
       // precisely the lie the bit exists to prevent.
       val perfBit = 1L << DebugRegMap.features.find(_._1 == "perf_counters").get._2
-      assert(got == (DebugRegMap.featuresForStage(2).toLong & ~perfBit),
+      assert(got == ((DebugRegMap.featuresForStage(2).toLong & ~perfBit) | DbgLite.featureMask),
         f"OFF_FEATURES read 0x$got%08x; expected the stage-2 bitmap minus the " +
         f"conditional perf_counters bit")
       assert((got & perfBit) == 0L,
@@ -503,6 +514,7 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
   }
 
   test("Stage 2 halt-after target is byte-strobed, epoch-tagged, explicitly armed, and one-shot") {
+    DbgLite.skip("halt-after-N")
     M68kSim().compile(new DebugCtrlDut(stageArg = 2, withCommitStubArg = true)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       DbgAxiDriver.idle(dut.axi)

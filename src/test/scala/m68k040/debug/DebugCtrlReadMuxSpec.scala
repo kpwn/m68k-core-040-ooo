@@ -239,6 +239,20 @@ class DebugCtrlReadMuxSpec extends AnyFunSuite {
       exp(DebugRegMap.OFF_LIVE_AREG7, 0xA7000041L)
       exp(DebugRegMap.OFF_LIVE_A7, 0xA7000041L)
 
+      // CPU_DBG_LITE: every source the lite build does not construct must read ZERO even
+      // though it was just written above -- dropped features fail benignly, never alias.
+      if (DbgLite.on) {
+        val liteZero = Seq(DebugRegMap.OFF_CAP_TRACE, DebugRegMap.OFF_CAP_TRACE2,
+          DebugRegMap.OFF_HALT_AFTER_LO, DebugRegMap.OFF_HALT_AFTER_HI, DebugRegMap.OFF_HALT_CTL,
+          DebugRegMap.OFF_A7ODD_CTL, DebugRegMap.OFF_A7ODD_PC0, DebugRegMap.OFF_A7ODD_PC1,
+          DebugRegMap.OFF_A7ODD_PC2, DebugRegMap.OFF_A7ODD_VALUE, DebugRegMap.OFF_A7ODD_COUNT,
+          DebugRegMap.OFF_PCRANGE_CTL, DebugRegMap.OFF_PCRANGE_LO, DebugRegMap.OFF_PCRANGE_HI,
+          DebugRegMap.OFF_PCRANGE_PC0, DebugRegMap.OFF_PCRANGE_PC1, DebugRegMap.OFF_PCRANGE_PC2,
+          DebugRegMap.OFF_PCRANGE_COUNT) ++
+          (0 until 8).flatMap(i => Seq(DebugRegMap.OFF_ARCH_D0 + i * 4, DebugRegMap.OFF_ARCH_A0 + i * 4)) ++
+          archMisc.map(_._1)
+        liteZero.foreach(o => expected(o) = 0L)
+      }
       expected.foreach { case (off, want) =>
         val got = DbgAxiDriver.read(b, cd, off.toLong)
         assert(got == want,

@@ -25,6 +25,7 @@ class PerfDetailSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq(source, dbg)) }
   }
   for (enabled <- Seq(false, true)) test(s"detail CSR capability, clear, freeze and exact window; enabled=$enabled") {
+    if (enabled) DbgLite.skip("the detailed-perf counter bank")
     M68kSim().compile(new CsrDut(enabled)).doSim { d =>
       import DebugRegMap._
       val cd = d.clockDomain; cd.forkStimulus(10)

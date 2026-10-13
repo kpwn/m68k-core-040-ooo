@@ -62,10 +62,15 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                       val enable:    Boolean = true,
                       val historyDepth: Int  = 32,
                       val detailedPerf: Boolean = false,
-                      val pcRangeEnable: Boolean = true) extends FiberPlugin
+                      val pcRangeEnable: Boolean = true,
+                      val lite: Boolean = m68k040.top.ShippingCoreConfig.dbgLite) extends FiberPlugin
                       with m68k040.services.DebugIrqInjectService {
   require(porCycles >= 1, s"DebugCtrlPlugin: porCycles must be >= 1 (got $porCycles)")
   require(stage >= 1, s"DebugCtrlPlugin: stage must be >= 1 (got $stage)")
+  /** CPU_DBG_LITE (census 2026-10-13 item 6): the perf-lite build. See
+    * `ShippingCoreConfig.dbgLite` for the kept/dropped list. Every `lite` gate below is an
+    * elaboration-time `if`, so `lite = false` elaborates exactly the pre-flag netlist. */
+  private val pcRangeBuilt = pcRangeEnable && !lite
   require(historyDepth == 0 || historyDepth == 32,
     s"DebugCtrlPlugin: initial forensic history is either disabled or depth 32 (got $historyDepth)")
   require(buildId >= 0 && buildId < (BigInt(1) << DebugRegMap.DBG_DW),
@@ -190,7 +195,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     val dbgSystem = if (enable && stage >= 3) host.get[DebugSystemStateService] else None
     val committedMap = if (enable && stage >= 3) host.get[CommittedMapService] else None
     val debugMemory = if (enable && stage >= 3) host.get[DebugMemoryService] else None
-    val historyEnabled = enable && stage >= 3 && historyDepth > 0
+    val historyEnabled = enable && stage >= 3 && historyDepth > 0 && !lite
     val debugHistory = if (historyEnabled) host.get[DebugHistoryService] else None
     // OFF_EXC_COUNT source. Deliberately a SEPARATE lookup from `debugHistory`
     // above: the counter must exist whenever there is an exception-entry
@@ -246,7 +251,9 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         Set.empty[String] else Set("perf_counters"))
     val advertisedFeatures = DebugRegMap.features
       .filter(f => f._3 <= stage && !unavailableFeatures.contains(f._1))
-      .foldLeft(BigInt(0))((acc, f) => acc | (BigInt(1) << f._2))
+      .foldLeft(BigInt(0))((acc, f) => acc | (BigInt(1) << f._2)) |
+      // `dbg_lite` is a build-option identity bit (stage 9: never implied by a stage).
+      (if (lite) BigInt(1) << DebugRegMap.features.find(_._1 == "dbg_lite").get._2 else BigInt(0))
 
     // A NAMED (not anonymous) local class, so its type stays visible OUTSIDE the
     // `enable` gate below: Stage-1 whitebox tests (`DebugCtrlCsrSpec`, `DebugCtrlResetSpec`,
@@ -451,16 +458,20 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * takes off `arAddr`'s cone. */
       val readIsLiveInt = RegInit(False); readIsLiveInt.simPublic()
 
+      /** Lite: a data register whose reset value is never observable needs no reset (each
+        * one saved is one fewer SR load on the debug-POR / clear nets). Full: `init 0`. */
+      def liteNoInit[T <: BitVector](r: T): T = { if (!lite) r.init(r.getZero); r }
+
       // ── Per-REGION registered partial read words (read mux stage 1) ───────────────
       // One 32-bit register per address region of `DebugRegMap`. Exactly one can be
       // non-zero for any address, so stage 2 ORs them; see the read mux for the full
       // argument and for why the mux was split at all.
-      val rdCore  = Reg(Bits(DebugRegMap.DBG_DW bits)) init 0; rdCore.simPublic()
-      val rdLane  = Reg(Bits(DebugRegMap.DBG_DW bits)) init 0; rdLane.simPublic()
-      val rdCount = Reg(Bits(DebugRegMap.DBG_DW bits)) init 0; rdCount.simPublic()
-      val rdArch  = Reg(Bits(DebugRegMap.DBG_DW bits)) init 0; rdArch.simPublic()
-      val rdLive  = Reg(Bits(DebugRegMap.DBG_DW bits)) init 0; rdLive.simPublic()
-      val rdHead  = Reg(Bits(DebugRegMap.DBG_DW bits)) init 0; rdHead.simPublic()
+      val rdCore  = liteNoInit(Reg(Bits(DebugRegMap.DBG_DW bits))); rdCore.simPublic()
+      val rdLane  = liteNoInit(Reg(Bits(DebugRegMap.DBG_DW bits))); rdLane.simPublic()
+      val rdCount = liteNoInit(Reg(Bits(DebugRegMap.DBG_DW bits))); rdCount.simPublic()
+      val rdArch  = liteNoInit(Reg(Bits(DebugRegMap.DBG_DW bits))); rdArch.simPublic()
+      val rdLive  = liteNoInit(Reg(Bits(DebugRegMap.DBG_DW bits))); rdLive.simPublic()
+      val rdHead  = liteNoInit(Reg(Bits(DebugRegMap.DBG_DW bits))); rdHead.simPublic()
 
       // ── Registered copies of the four p141 stall packs (FMax, 2026-09-17) ─────────
       // `DcachePlugin.dbgStallDcPack`, `LsEuPlugin.dbgStallGrantPack`,
@@ -479,23 +490,28 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // read path into registered per-region muxes. `dbgArbPack` is the same kind of
       // signal as the four below -- a deep combinational pack of live arbitration state
       // -- so it is registered on the same terms rather than wired into the mux raw.
-      val stallArbPackReg = stallArb
+      // Lite: the wedge-diagnosis packs are not built (their offsets read 0). The one bit
+      // a perf counter consumes -- OFF_STALL_DC bit 1, `DcachePlugin.busy`, feeding
+      // `perfStallDc` -- keeps its own flop at the same position and depth.
+      val stallArbPackReg = if (lite) B(0, 32 bits) else stallArb
         .map(a => RegNext(a.logic.dbgArbPack) init B(0, 32 bits))
         .getOrElse(B(0, 32 bits))
-      val stallDcPackReg = stallDcache
+      val stallDcPackReg = if (lite) stallDcache
+        .map(d => B(0, 30 bits) ## (RegNext(d.logic.dbgStallDcPack(1)) init False) ## False)
+        .getOrElse(B(0, 32 bits)) else stallDcache
         .map(d => RegNext(d.logic.dbgStallDcPack) init B(0, 32 bits))
         .getOrElse(B(0, 32 bits))
-      val stallGrantPackReg = stallLsEu
+      val stallGrantPackReg = if (lite) B(0, 32 bits) else stallLsEu
         .map(l => RegNext(l.logic.dbgStallGrantPack) init B(0, 32 bits))
         .getOrElse(B(0, 32 bits))
-      val stallExcPackReg = stallRob
+      val stallExcPackReg = if (lite) B(0, 32 bits) else stallRob
         .map(r => RegNext(r.logic.exc.dbgStallExcPack) init B(0, 32 bits))
         .getOrElse(B(0, 32 bits))
       // Both walkers in one word: DTLB in [15:0] (the D-side walker arm C routed
       // through L1D, i.e. the suspect) and ITLB in [31:16] (the control -- if the
       // I-side walker is idle while the D-side is stuck, that localises the stall to
       // the D-cache port hand-over).
-      val stallWalkPackReg = if (stallDtlb.nonEmpty || stallItlb.nonEmpty) {
+      val stallWalkPackReg = if (!lite && (stallDtlb.nonEmpty || stallItlb.nonEmpty)) {
         val dtlbBits = stallDtlb.map(_.logic.walker.io.dbgPack).getOrElse(B(0, 16 bits))
         val itlbBits = stallItlb.map(_.logic.walker.io.dbgPack).getOrElse(B(0, 16 bits))
         RegNext(itlbBits ## dtlbBits) init B(0, 32 bits)
@@ -533,8 +549,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         mhCt.reverse.map(_.asBits).reduce(_ ## _),   // [31:8] six 4-bit counters
         B(0, 2 bits),                                 // [7:6]  reserved
         mhSt.reverse.map(_.asBits).reduce(_ ## _))    // [5:0]  six sticky bits
-      val multiHotStatusReg = RegNext(mhStatusRaw.resize(32)) init B(0, 32 bits)
-      val multiHotAddrRegs = Seq(
+      val multiHotStatusReg = if (lite) B(0, 32 bits) else RegNext(mhStatusRaw.resize(32)) init B(0, 32 bits)
+      val multiHotAddrRegs = if (lite) Seq.fill(6)(B(0, 32 bits)) else Seq(
         mhAddr(mhIc.map(_.addr)),
         mhAddr(mhDc.map(_.dbgMultiHotLoad.addr)),
         mhAddr(mhDc.map(_.dbgMultiHotProbe.addr)),
@@ -542,8 +558,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         mhAddr(stallItlb.map(_.logic.tlb.io.dbgMultiHotVpn)),
         mhAddr(stallDtlb.map(_.logic.tlb.io.dbgMultiHotVpn))
       ).map(a => RegNext(a.asBits) init B(0, 32 bits))
-      multiHotStatusReg.simPublic()
-      multiHotAddrRegs.foreach(_.simPublic())
+      if (!lite) {
+        multiHotStatusReg.simPublic()
+        multiHotAddrRegs.foreach(_.simPublic())
+      }
 
       // ══ WINDOWED PERFORMANCE COUNTERS (OFF_PERF_*, 2026-09-17) ════════════════
       // The owner's request, verbatim: "do we have any perf counters available? i
@@ -593,6 +611,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // Residual: at most one event per lane at each edge, two on the edge-detected
       // lanes. Over a window of millions of cycles that is noise.
       val perfBuilt = stage >= 2
+      /** The rarely-read banks (I-prefetch coverage, exception path, detail) -- absent in lite. */
+      val perfFull = perfBuilt && !lite
 
       /** RUN level. POR = 1 so a build behaves like the free-running counters until a
         * host deliberately takes a window. Written by OFF_PERF_CTL bit 1. */
@@ -638,13 +658,33 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * clear landing on the same cycle as an increment discards the in-flight event
         * rather than carrying it into the new window. That costs at most one event and
         * buys a window that provably starts at zero. */
-      def perfCounter(evt: Bool): UInt = {
+      def perfCounter(evt: Bool): UInt = if (lite) perfLazyCounter(evt.asUInt, 32, evt) else {
         val r = Reg(UInt(32 bits)) init 0
         when(evt && perfRunQ) { r := r + 1 }
         when(perfClear) { r := 0 }
         r.simPublic()
         r
       }
+
+      /** Lite: LAZY CLEAR. The count register has NO reset and NO clear; a 1-bit `live`
+        * flag per counter carries both. CLEAR (and the debug POR) drops `live`; the next
+        * counted cycle restarts from zero (`Mux(live, r, 0) + incr`, which folds into the
+        * incrementer's own LUTs) and sets `live`; a read of a non-live counter returns 0.
+        * Observable behaviour is the full build's: a cleared counter reads 0, and an event
+        * on the clear cycle is discarded (`live := False` is assigned last). What changes
+        * is the clear's fan-out: one SR load per COUNTER instead of one per counter BIT. */
+      def perfLazyCounter(incr: UInt, width: Int, en: Bool): UInt = {
+        val r = Reg(UInt(width bits))
+        val live = RegInit(False)
+        when(en && perfRunQ) { r := Mux(live, r, U(0, width bits)) + incr.resize(width); live := True }
+        when(perfClear) { live := False }
+        r.simPublic(); live.simPublic()
+        val value = Mux(live, r, U(0, width bits))
+        perfLazyRegs.put(value, (r, live))
+        value
+      }
+      /** Lite only: counter value -> its (register, live) pair, for testbench seeding. */
+      val perfLazyRegs = new java.util.IdentityHashMap[UInt, (UInt, Bool)]()
 
       /** 64-bit windowed accumulator; `incr` is 0..2 (the dual retire slots) or a
         * constant 1 (cycles). Same clear-wins ordering as `perfCounter`.
@@ -653,7 +693,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * `cycleCountReg` above is already a 64-bit free-running counter in this same
         * area and this design closes 200 MHz with it in place. That is a measurement,
         * not an argument. */
-      def perfCounter64(incr: UInt): UInt = {
+      def perfCounter64(incr: UInt): UInt = if (lite) perfLazyCounter(incr, 64, True) else {
         val r = Reg(UInt(64 bits)) init 0
         when(perfRunQ) { r := r + incr.resize(64) }
         when(perfClear) { r := 0 }
@@ -730,8 +770,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       //     DEMAND miss counts in neither lane.
       // Both sources are wires in `IcachePlugin.logic`, read through the same `host.get`
       // reach-in this file already uses for `s1Unresolved` and the multi-hot packs.
-      val perfEvtIcPfIssued = perfTap(mhIcache.map(_.logic.pfArIssued))
-      val perfEvtIcPfUsed   = perfTap(mhIcache.map(_.logic.pfHitUseful))
+      val perfEvtIcPfIssued = if (perfFull) perfTap(mhIcache.map(_.logic.pfArIssued)) else False
+      val perfEvtIcPfUsed   = if (perfFull) perfTap(mhIcache.map(_.logic.pfHitUseful)) else False
 
       // ── IC_MISS_SEQ: NEXT-LINE PREFETCH'S EXACT CEILING (2026-09-27) ────────────
       // A demand miss whose line is the PREVIOUS demand miss's line + 64. That is the
@@ -763,13 +803,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * latched that miss's line. The event and the datum are therefore the same age and
         * neither needs a tap. */
       val icMissLine = mhIcache.map(_.logic.s1Line(31 downto 6))
-      val icPrevMissLine  = if (perfBuilt) Reg(UInt(26 bits)) init 0 else U(0, 26 bits)
+      val icPrevMissLine  = if (perfFull) Reg(UInt(26 bits)) init 0 else U(0, 26 bits)
       /** No previous miss yet: the FIRST miss out of reset has no predecessor and must not
         * be classified against a reset-value zero. Deliberately NOT cleared by `perfClear`
         * -- it describes the machine, not the window, and zeroing it would make the first
         * miss of every window unclassifiable instead of merely edge-approximate. */
-      val icPrevMissValid = if (perfBuilt) RegInit(False) else False
-      val perfEvtIcMissSeq = if (perfBuilt) icMissLine.map { line =>
+      val icPrevMissValid = if (perfFull) RegInit(False) else False
+      val perfEvtIcMissSeq = if (perfFull) icMissLine.map { line =>
         val seq = perfEvtIcMiss && icPrevMissValid && (line === (icPrevMissLine + 1))
         when(perfEvtIcMiss) { icPrevMissLine := line; icPrevMissValid := True }
         seq
@@ -794,7 +834,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // `perfStallDc` above reuses `stallDcPackReg(1)` instead of adding a tap of its own.
       // So this lane is ONE flop deep like the other stall lanes, not two, and costs zero
       // additional flops.
-      val perfLvlIcPfLate = mhIcache.map(_.logic.heldOnSetBusyQ).getOrElse(False)
+      val perfLvlIcPfLate = if (lite) False else mhIcache.map(_.logic.heldOnSetBusyQ).getOrElse(False)
       /** Live read-back of `IcachePlugin.prefetchEnable`, one flop behind. Registered
         * rather than read straight into the AR-decoded read mux for the same reason every
         * other producer tap is: the read mux is wide and its select cone is long, and a
@@ -829,10 +869,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val perfMispredCond   = if (perfBuilt) perfCounter(perfEvtMispredCond) else U(0, 32 bits)
       val perfDcMiss      = if (perfBuilt) perfCounter(perfEvtDcMiss) else U(0, 32 bits)
       val perfIcMiss      = if (perfBuilt) perfCounter(perfEvtIcMiss) else U(0, 32 bits)
-      val perfIcMissSeq   = if (perfBuilt) perfCounter(perfEvtIcMissSeq) else U(0, 32 bits)
-      val perfIcPfIssued  = if (perfBuilt) perfCounter(perfEvtIcPfIssued) else U(0, 32 bits)
-      val perfIcPfUsed    = if (perfBuilt) perfCounter(perfEvtIcPfUsed) else U(0, 32 bits)
-      val perfIcPfLate    = if (perfBuilt) perfCounter(perfLvlIcPfLate) else U(0, 32 bits)
+      val perfIcMissSeq   = if (perfFull) perfCounter(perfEvtIcMissSeq) else U(0, 32 bits)
+      val perfIcPfIssued  = if (perfFull) perfCounter(perfEvtIcPfIssued) else U(0, 32 bits)
+      val perfIcPfUsed    = if (perfFull) perfCounter(perfEvtIcPfUsed) else U(0, 32 bits)
+      val perfIcPfLate    = if (perfFull) perfCounter(perfLvlIcPfLate) else U(0, 32 bits)
       val perfDtlbWalk    = if (perfBuilt) perfCounter(perfRise(perfLvlDtlbWalk)) else U(0, 32 bits)
       val perfItlbWalk    = if (perfBuilt) perfCounter(perfRise(perfLvlItlbWalk)) else U(0, 32 bits)
       // The top-line stall: ROB non-empty and nothing retired. Both terms are taps, so
@@ -854,24 +894,24 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // takes the usual one-flop `perfTap`, so no counter adder touches a live cone.
       // BUSY / (ENTRY + RTE) is the board's mean cycles per sequencer episode (it
       // also includes MOVEC/MOVE-SR/CPUSH/FSAVE episodes, so it is an upper bound).
-      def excEvt(bit: Int): Bool = perfTap(excPerfSvc.map(_.excPerfEvents(bit)))
-      val perfExcEntry    = if (perfBuilt) perfCounter(excEvt(0)) else U(0, 32 bits)
-      val perfExcAline    = if (perfBuilt) perfCounter(excEvt(1)) else U(0, 32 bits)
-      val perfExcInt      = if (perfBuilt) perfCounter(excEvt(2)) else U(0, 32 bits)
-      val perfExcRte      = if (perfBuilt) perfCounter(excEvt(3)) else U(0, 32 bits)
-      val perfExcBusy     = if (perfBuilt) perfCounter(excEvt(4)) else U(0, 32 bits)
+      def excEvt(bit: Int): Bool = if (perfFull) perfTap(excPerfSvc.map(_.excPerfEvents(bit))) else False
+      val perfExcEntry    = if (perfFull) perfCounter(excEvt(0)) else U(0, 32 bits)
+      val perfExcAline    = if (perfFull) perfCounter(excEvt(1)) else U(0, 32 bits)
+      val perfExcInt      = if (perfFull) perfCounter(excEvt(2)) else U(0, 32 bits)
+      val perfExcRte      = if (perfFull) perfCounter(excEvt(3)) else U(0, 32 bits)
+      val perfExcBusy     = if (perfFull) perfCounter(excEvt(4)) else U(0, 32 bits)
 
       // Optional diagnostic producers are accessed only through services. All
       // events use the same one-cycle tap / RUN alignment as the baseline set.
-      val detailRob = if (perfBuilt && detailedPerf)
+      val detailRob = if (perfFull && detailedPerf)
         host.get[m68k040.services.RobPerfDetailService].flatMap(_.robPerfEvents) else None
-      val detailDispatch = if (perfBuilt && detailedPerf)
+      val detailDispatch = if (perfFull && detailedPerf)
         host.get[m68k040.services.DispatchPerfDetailService].flatMap(_.dispatchPerfEvents) else None
       val detailCounters = (detailRob.toSeq ++ detailDispatch.toSeq).flatMap { events =>
         (0 until events.getWidth).map(bit => perfCounter(perfTap(Some(events(bit)))))
       }
       // Version 1, independent producer counts. Zero means absent, never idle.
-      val detailCap = if (!detailedPerf || !perfBuilt) BigInt(0) else
+      val detailCap = if (!detailedPerf || !perfFull) BigInt(0) else
         BigInt(0xD1010000L | (detailRob.map(_.getWidth).getOrElse(0) << 8) |
           detailDispatch.map(_.getWidth).getOrElse(0))
 
@@ -892,7 +932,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * prefetch counters (PF_ISSUED, PF_USED, IC_MISS_SEQ, PF_LATE), all added
         * 2026-09-27 on two separate branches. 0 when the block is not built -- so a host
         * reading 0 here knows the block is absent rather than merely idle. */
-      val perfNumCounters = if (perfBuilt) 23 else 0
+      // Lite: 14 = the 12 base counters + the two mispredict-CLASS counters.
+      val perfNumCounters = if (!perfBuilt) 0 else if (lite) 14 else 23
 
       // ── OFF_IC_PREFETCH_CTL: runtime on/off for the I-cache next-line prefetcher ──
       // `IcachePlugin.prefetchEnable` was runtime-SHAPED but not runtime-REACHABLE:
@@ -959,13 +1000,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // five stall packs above: the only new load on `pageSizeRekey` / `flushPoisonArm`
       // is one flop D-input, and the counters' carry chains start from a flop and end
       // in the read mux. Nothing is added to the ATC lookup cone.
-      val mmuRekeyDPulse  = stallDtlb.map(d => RegNext(d.logic.pageSizeRekey) init False)
+      // Lite: the MMU probe block is not built (every source reads as "never fired").
+      val mmuRekeyDPulse  = if (lite) False else stallDtlb.map(d => RegNext(d.logic.pageSizeRekey) init False)
                                      .getOrElse(False)
-      val mmuRekeyIPulse  = stallItlb.map(i => RegNext(i.logic.pageSizeRekey) init False)
+      val mmuRekeyIPulse  = if (lite) False else stallItlb.map(i => RegNext(i.logic.pageSizeRekey) init False)
                                      .getOrElse(False)
-      val mmuPoisonDPulse = stallDtlb.map(d => RegNext(d.logic.flushPoisonArm) init False)
+      val mmuPoisonDPulse = if (lite) False else stallDtlb.map(d => RegNext(d.logic.flushPoisonArm) init False)
                                      .getOrElse(False)
-      val mmuPoisonIPulse = stallItlb.map(i => RegNext(i.logic.flushPoisonArm) init False)
+      val mmuPoisonIPulse = if (lite) False else stallItlb.map(i => RegNext(i.logic.flushPoisonArm) init False)
                                      .getOrElse(False)
 
       // Sticky latches + saturating counts. Cleared ONLY by a write to
@@ -1311,26 +1353,30 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // `debugClearStickyRequest`: that one clears the halt reason/report latches, and
       // folding the two together would mean every ordinary halt-reason clear silently
       // erased the corruption evidence this register exists to preserve.
-      val multiHotClearRequest = if (stage >= 2) RegInit(False) else False
+      val multiHotClearRequest = if (stage >= 2 && !lite) RegInit(False) else False
       if (stage >= 2) {
         manualHaltLevel.simPublic()
         debugStopRequest.simPublic(); debugResumeRequest.simPublic(); debugStepRequest.simPublic()
         debugClearStickyRequest.simPublic()
-        multiHotClearRequest.simPublic()
+        if (!lite) multiHotClearRequest.simPublic()
         debugStopRequest := False
         debugResumeRequest := False
         debugStepRequest := False
         debugClearStickyRequest := False
-        multiHotClearRequest := False
+        if (!lite) multiHotClearRequest := False
       }
 
       // Halt-after configuration is debug-owned and therefore survives CPU reset.
       // A target write disarms and advances the epoch; OFF_HALT_CTL bit 0 explicitly
       // arms the complete 64-bit value. The ROB consumes an automatic hit once.
-      val haltAfterTarget = if (stage >= 2) Reg(UInt(64 bits)) init 0 else U(0, 64 bits)
-      val haltAfterEpoch = if (stage >= 2) Reg(UInt(8 bits)) init 0 else U(0, 8 bits)
-      val haltAfterArmed = if (stage >= 2) RegInit(False) else False
-      if (stage >= 2) {
+      // Lite: halt-after-N is not built. The ROB sees a never-armed target (constants), so
+      // its compare/retire-block logic is constant-folded; OFF_HALT_AFTER_* and
+      // OFF_HALT_CTL bit 0 read 0 and writes to them are ignored.
+      val haltAfterBuilt = stage >= 2 && !lite
+      val haltAfterTarget = if (haltAfterBuilt) Reg(UInt(64 bits)) init 0 else U(0, 64 bits)
+      val haltAfterEpoch = if (haltAfterBuilt) Reg(UInt(8 bits)) init 0 else U(0, 8 bits)
+      val haltAfterArmed = if (haltAfterBuilt) RegInit(False) else False
+      if (haltAfterBuilt) {
         haltAfterTarget.simPublic(); haltAfterEpoch.simPublic(); haltAfterArmed.simPublic()
       }
       // `awIsHaltAfter` (a flop captured on the same edge as `awAddr`) replaces the
@@ -1341,10 +1387,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // decode), so reusing it would put this signal -- the head of the design's worst
       // cone -- behind whatever buffering that fanout needs. Written out, the whole
       // expression is five flops into one LUT6.
-      val haltAfterInvalidate = if (stage >= 2) {
+      val haltAfterInvalidate = if (haltAfterBuilt) {
         awPend && wPend && !bPend && wStrbAny && awIsHaltAfter
       } else False
-      if (stage >= 2) haltAfterInvalidate.simPublic()
+      if (haltAfterBuilt) haltAfterInvalidate.simPublic()
 
       // WHY THIS SIGNAL IS NOT ALSO PUT BEHIND A PIPELINE REGISTER (2026-09-17).
       // A whole-group export register -- RegNext on target/epoch/armed/invalidate
@@ -1369,15 +1415,17 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         Vec.fill(8)(Reg(Bits(32 bits)) init 0) else null
       // A7-ODD halt lane control (bit 0 enable, bits 31:16 threshold); debug reset
       // domain like the masks, so it survives the CPU resets a boot trial issues.
-      val a7OddCtl = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
+      // Lite: the A7-odd and PC-range halt lanes are not built (ROB inputs are constant off).
+      val a7OddBuilt = stage >= 5 && !lite
+      val a7OddCtl = if (a7OddBuilt) Reg(Bits(32 bits)) init 0 else if (stage >= 5) B(0, 32 bits) else null
       // Reduced debug retains these addresses as zero/ignore stubs, without flops.
-      val pcRangeCtl = if (stage >= 5 && pcRangeEnable) Reg(Bits(32 bits)) init 0 else B(0, 32 bits)
-      val pcRangeLo  = if (stage >= 5 && pcRangeEnable) Reg(Bits(32 bits)) init 0 else B(0, 32 bits)
-      val pcRangeHi  = if (stage >= 5 && pcRangeEnable) Reg(Bits(32 bits)) init 0 else B(0, 32 bits)
+      val pcRangeCtl = if (stage >= 5 && pcRangeBuilt) Reg(Bits(32 bits)) init 0 else B(0, 32 bits)
+      val pcRangeLo  = if (stage >= 5 && pcRangeBuilt) Reg(Bits(32 bits)) init 0 else B(0, 32 bits)
+      val pcRangeHi  = if (stage >= 5 && pcRangeBuilt) Reg(Bits(32 bits)) init 0 else B(0, 32 bits)
       if (stage >= 5) {
         breakPc.simPublic(); breakPcEnable.simPublic(); breakSkipOnce.simPublic()
-        haltExceptionMask.simPublic(); a7OddCtl.simPublic()
-        if (pcRangeEnable) {
+        haltExceptionMask.simPublic(); if (a7OddBuilt) a7OddCtl.simPublic()
+        if (pcRangeBuilt) {
           pcRangeCtl.simPublic(); pcRangeLo.simPublic(); pcRangeHi.simPublic()
         }
         frontendDebug.foreach { matcher =>
@@ -1398,13 +1446,18 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // One word/dirty bit per independently applicable field. Logical indices are
       // deliberately decoupled from CSR word offsets because APPLY/STATUS occupy two
       // holes before SFC/DFC in the frozen deployed map.
-      val archShadow = if (stage >= 3) Vec.fill(32)(Reg(Bits(32 bits)) init 0) else null
+      // Lite: shadows carry no reset (their content is reachable only through a dirty bit,
+      // and archDirty keeps its reset) and are not read back (OFF_ARCH_* data words read 0).
+      val archShadow = if (stage >= 3) Vec.fill(32)(liteNoInit(Reg(Bits(32 bits)))) else null
       val archDirty  = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
       if (stage >= 3) { archShadow.simPublic(); archDirty.simPublic() }
       val archWriteMask = if (stage >= 3) Bits(32 bits) else null
       if (stage >= 3) archWriteMask := B(0, 32 bits)
       def archWord(index: Int): Bits = if (stage >= 3) archShadow(index) else B(0, 32 bits)
-      def writeArch(index: Int): Unit = if (stage >= 3) when(wStrb.orR) {
+      // Lite: the apply reads the shadows in place (no 1024-flop snapshot), so a shadow
+      // write while an apply is busy is ignored rather than staged. The host tools wait for
+      // ARCH_STATUS done before writing again, so this is never reached in practice.
+      def writeArch(index: Int): Unit = if (stage >= 3) when(if (lite) wStrb.orR && !archApplyBusy else wStrb.orR) {
         archShadow(index) := merged(archShadow(index))
         archDirty(index) := True
         archWriteMask(index) := True
@@ -1422,7 +1475,11 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val archApplySettle = RegInit(False)   // CPU_BE_RETIME only (constant False otherwise)
       val archApplyDirty = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
       val archApplyRewrite = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
-      val archApplyShadow = if (stage >= 3) Vec.fill(32)(Reg(Bits(32 bits)) init 0) else null
+      val archApplyShadow = if (stage >= 3 && !lite) Vec.fill(32)(Reg(Bits(32 bits)) init 0) else null
+      /** The value an apply writes: the start-of-apply snapshot (full), or the shadow
+        * itself (lite; frozen for the apply's duration by `writeArch`). */
+      def applySrc(index: Int): Bits = if (lite) archShadow(index) else archApplyShadow(index)
+      def applySrc(index: UInt): Bits = if (lite) archShadow(index) else archApplyShadow(index)
       val archApplyComplete = if (stage >= 3) Bool() else False
       if (stage >= 3) {
         archApplyBusy.simPublic(); archApplyDone.simPublic(); archApplyRejected.simPublic()
@@ -1613,7 +1670,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             if (m68k040.top.ShippingCoreConfig.beRetime) archApplySettle := False
             archApplyDirty := archDirty
             archApplyRewrite := 0
-            for (i <- 0 until 32) archApplyShadow(i) := archShadow(i)
+            if (!lite) for (i <- 0 until 32) archApplyShadow(i) := archShadow(i)
           }
         }.elsewhen(archApplyBusy) {
           when(!effectiveHalt) {
@@ -1643,7 +1700,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                   debugIntWrite.valid := archApplyDirty(archApplyIndex)
                   debugIntWrite.address := committedMap.get.intPhys(
                     archApplyIndex.resize(log2Up(committedMap.get.intPhys.length))).resized
-                  debugIntWrite.data := archApplyShadow(archApplyIndex.resize(5))
+                  debugIntWrite.data := applySrc(archApplyIndex.resize(5))
                 }
                 when(archApplyIndex === 15) { archApplyPhase := 2 }
                   .otherwise { archApplyIndex := archApplyIndex + 1 }
@@ -1655,7 +1712,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                     debugIntWrite.valid := archApplyDirty(archApplyIndex)
                     debugIntWrite.address := committedMap.get.intPhys(
                       archApplyIndex.resize(log2Up(committedMap.get.intPhys.length))).resized
-                    debugIntWrite.data := archApplyShadow(archApplyIndex.resize(5))
+                    debugIntWrite.data := applySrc(archApplyIndex.resize(5))
                   }
                   when(archApplyIndex === 15) { archApplySettle := True }
                     .otherwise { archApplyIndex := archApplyIndex + 1 }
@@ -1683,31 +1740,31 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               systemApply.payload.pcValid := archApplyDirty(29)
               systemApply.payload.sfcValid := archApplyDirty(30)
               systemApply.payload.dfcValid := archApplyDirty(31)
-              systemApply.payload.usp := archApplyShadow(16).asUInt
-              systemApply.payload.msp := archApplyShadow(17).asUInt
-              systemApply.payload.isp := archApplyShadow(18).asUInt
-              systemApply.payload.sr := archApplyShadow(19)(15 downto 0).asUInt
-              systemApply.payload.vbr := archApplyShadow(20).asUInt
-              systemApply.payload.cacr := archApplyShadow(21).asUInt
-              systemApply.payload.tc := archApplyShadow(22).asUInt
-              systemApply.payload.itt0 := archApplyShadow(23).asUInt
-              systemApply.payload.itt1 := archApplyShadow(24).asUInt
-              systemApply.payload.dtt0 := archApplyShadow(25).asUInt
-              systemApply.payload.dtt1 := archApplyShadow(26).asUInt
-              systemApply.payload.urp := archApplyShadow(27).asUInt
-              systemApply.payload.srp := archApplyShadow(28).asUInt
-              systemApply.payload.pc := archApplyShadow(29).asUInt
-              systemApply.payload.sfc := archApplyShadow(30)(2 downto 0).asUInt
-              systemApply.payload.dfc := archApplyShadow(31)(2 downto 0).asUInt
+              systemApply.payload.usp := applySrc(16).asUInt
+              systemApply.payload.msp := applySrc(17).asUInt
+              systemApply.payload.isp := applySrc(18).asUInt
+              systemApply.payload.sr := applySrc(19)(15 downto 0).asUInt
+              systemApply.payload.vbr := applySrc(20).asUInt
+              systemApply.payload.cacr := applySrc(21).asUInt
+              systemApply.payload.tc := applySrc(22).asUInt
+              systemApply.payload.itt0 := applySrc(23).asUInt
+              systemApply.payload.itt1 := applySrc(24).asUInt
+              systemApply.payload.dtt0 := applySrc(25).asUInt
+              systemApply.payload.dtt1 := applySrc(26).asUInt
+              systemApply.payload.urp := applySrc(27).asUInt
+              systemApply.payload.srp := applySrc(28).asUInt
+              systemApply.payload.pc := applySrc(29).asUInt
+              systemApply.payload.sfc := applySrc(30)(2 downto 0).asUInt
+              systemApply.payload.dfc := applySrc(31)(2 downto 0).asUInt
               if (debugNzvcWrite != null) {
                 debugNzvcWrite.valid := archApplyDirty(19)
                 debugNzvcWrite.address := committedMap.get.nzvcPhys.resized
-                debugNzvcWrite.data := archApplyShadow(19)(3 downto 0)
+                debugNzvcWrite.data := applySrc(19)(3 downto 0)
               }
               if (debugXWrite != null) {
                 debugXWrite.valid := archApplyDirty(19)
                 debugXWrite.address := committedMap.get.xPhys.resized
-                debugXWrite.data := archApplyShadow(19)(4 downto 4)
+                debugXWrite.data := applySrc(19)(4 downto 4)
               }
               archApplyBusy := False
               archApplyDone := True
@@ -1808,8 +1865,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         }
         at(DebugRegMap.OFF_PC)      { livePc.asBits }
         at(DebugRegMap.OFF_LAST_PC) { lastPc.asBits }
-        at(DebugRegMap.OFF_HALT_AFTER_LO) { haltAfterTarget(31 downto 0).asBits }
-        at(DebugRegMap.OFF_HALT_AFTER_HI) { haltAfterTarget(63 downto 32).asBits }
+        if (haltAfterBuilt) {
+          at(DebugRegMap.OFF_HALT_AFTER_LO) { haltAfterTarget(31 downto 0).asBits }
+          at(DebugRegMap.OFF_HALT_AFTER_HI) { haltAfterTarget(63 downto 32).asBits }
+        }
         if (stage >= 5) {
           at(DebugRegMap.OFF_BREAK_PC0) { breakPc(0).asBits }
           at(DebugRegMap.OFF_BREAK_PC1) { breakPc(1).asBits }
@@ -1877,7 +1936,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
 
       // ── Region 1: 0x00100-0x00FFF + 0x00200 block, halt lanes / cache maint ─────
       val readLane = new ReadRegion {
-        if (stage >= 5) {
+        if (stage >= 5 && !lite) {
           at(DebugRegMap.OFF_A7ODD_CTL) { a7OddCtl }
           at(DebugRegMap.OFF_PCRANGE_CTL) { pcRangeCtl }
           at(DebugRegMap.OFF_PCRANGE_LO)  { pcRangeLo }
@@ -1950,6 +2009,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         // the counter block rather than the halt-captured arch block.
         // The four packs are read from their REGISTERED copies (see above): they are
         // deep combinational packs of live core state and belong nowhere near a mux.
+        // Lite: none of the evidence words below (stall packs, multi-hot) is built.
+        if (!lite) {
         at(DebugRegMap.OFF_STALL_ARB)   { stallArbPackReg }
         at(DebugRegMap.OFF_STALL_DC)    { stallDcPackReg }
         at(DebugRegMap.OFF_STALL_GRANT) { stallGrantPackReg }
@@ -1965,6 +2026,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         at(DebugRegMap.OFF_MULTIHOT_DCSTORE)  { multiHotAddrRegs(3) }
         at(DebugRegMap.OFF_MULTIHOT_ITLB)     { multiHotAddrRegs(4) }
         at(DebugRegMap.OFF_MULTIHOT_DTLB)     { multiHotAddrRegs(5) }
+        }
         // ── Windowed performance counters (2026-09-17) ────────────────────────
         // Region 2 so they are LIVE -- no halt required. A halt would itself change
         // the numbers, which for a performance counter is the one thing that must not
@@ -2000,6 +2062,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         // two counters TOGETHER -- USED/ISSUED is coverage, ISSUED-USED is wasted
         // bandwidth, and neither number means anything alone.
         at(DebugRegMap.OFF_IC_PREFETCH_CTL)   { icPfCtlWord }
+        // Lite: the I-prefetch coverage, exception-path and MMU-probe banks are absent.
+        if (!lite) {
         at(DebugRegMap.OFF_PERF_IC_PF_ISSUED) { perfIcPfIssued.asBits }
         at(DebugRegMap.OFF_PERF_IC_PF_USED)   { perfIcPfUsed.asBits }
         // The two diagnosis counters. IC_MISS_SEQ against OFF_PERF_IC_MISS says how much
@@ -2025,10 +2089,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         at(DebugRegMap.OFF_MMU_REKEY_COUNT)   { mmuRekeyCount.asBits }
         at(DebugRegMap.OFF_MMU_IPOISON_COUNT) { mmuPoisonCountI.asBits }
         at(DebugRegMap.OFF_MMU_DPOISON_COUNT) { mmuPoisonCountD.asBits }
+        }
       }
 
       // ── Region 3: 0x02000-0x020FF, halted architectural write shadows ───────────
       val readArch = new ReadRegion {
+        // Lite: the host-write shadows are write-only (read 0); APPLY/STATUS stay readable.
+        if (!lite) {
         for (i <- 0 until 8) {
           at(DebugRegMap.OFF_ARCH_D0 + i * 4) { archWord(i) }
           at(DebugRegMap.OFF_ARCH_A0 + i * 4) { archWord(8 + i) }
@@ -2049,6 +2116,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         at(DebugRegMap.OFF_ARCH_PC)   { archWord(29) }
         at(DebugRegMap.OFF_ARCH_SFC)  { archWord(30) }
         at(DebugRegMap.OFF_ARCH_DFC)  { archWord(31) }
+        }
         at(DebugRegMap.OFF_ARCH_APPLY) {
           B(0, 31 bits) ## archApplyBusy
         }
@@ -2131,7 +2199,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           // caught only because DebugCtrlMultiHotSpec tests the clear rather than
           // assuming it.
           is(DebugRegMap.OFF_MULTIHOT_STATUS) {
-            if (stage >= 2) when(wStrb(0)) {
+            if (stage >= 2 && !lite) when(wStrb(0)) {
               when(wData(0)) { multiHotClearRequest := True }
             }
           }
@@ -2189,7 +2257,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             }
           }
           is(DebugRegMap.OFF_HALT_AFTER_LO) {
-            if (stage >= 2) when(wStrb.orR) {
+            if (haltAfterBuilt) when(wStrb.orR) {
               haltAfterTarget(31 downto 0) :=
                 merged(haltAfterTarget(31 downto 0).asBits).asUInt
               haltAfterEpoch := haltAfterEpoch + 1
@@ -2197,7 +2265,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             }
           }
           is(DebugRegMap.OFF_HALT_AFTER_HI) {
-            if (stage >= 2) when(wStrb.orR) {
+            if (haltAfterBuilt) when(wStrb.orR) {
               haltAfterTarget(63 downto 32) :=
                 merged(haltAfterTarget(63 downto 32).asBits).asUInt
               haltAfterEpoch := haltAfterEpoch + 1
@@ -2231,21 +2299,21 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               }
             }
             is(DebugRegMap.OFF_A7ODD_CTL) {
-              when(wStrb.orR) { a7OddCtl := merged(a7OddCtl).asBits }
+              if (a7OddBuilt) when(wStrb.orR) { a7OddCtl := merged(a7OddCtl).asBits }
             }
             is(DebugRegMap.OFF_PCRANGE_CTL) {
-              if (pcRangeEnable) when(wStrb.orR) { pcRangeCtl := merged(pcRangeCtl).asBits }
+              if (pcRangeBuilt) when(wStrb.orR) { pcRangeCtl := merged(pcRangeCtl).asBits }
             }
             is(DebugRegMap.OFF_PCRANGE_LO) {
-              if (pcRangeEnable) when(wStrb.orR) { pcRangeLo := merged(pcRangeLo).asBits }
+              if (pcRangeBuilt) when(wStrb.orR) { pcRangeLo := merged(pcRangeLo).asBits }
             }
             is(DebugRegMap.OFF_PCRANGE_HI) {
-              if (pcRangeEnable) when(wStrb.orR) { pcRangeHi := merged(pcRangeHi).asBits }
+              if (pcRangeBuilt) when(wStrb.orR) { pcRangeHi := merged(pcRangeHi).asBits }
             }
           }
           is(DebugRegMap.OFF_HALT_CTL) {
             if (stage >= 2) when(wStrb(0)) {
-              when(wData(0)) { haltAfterArmed := True }
+              if (haltAfterBuilt) when(wData(0)) { haltAfterArmed := True }
               when(wData(2)) { debugClearStickyRequest := True }
             }
           }
@@ -2305,7 +2373,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
 
       // An automatic stop is one-shot. Clear the arm after the ROB acknowledges the
       // hit; resume cannot immediately retrigger against the same absolute target.
-      if (stage >= 2) when(haltAfterConsumed) { haltAfterArmed := False }
+      if (haltAfterBuilt) when(haltAfterConsumed) { haltAfterArmed := False }
 
       // ── SoC-fabric configuration wipe (spec 15.3) ────────────────────────────────
       // Applied after the write decode on purpose: in SpinalHDL a later `when` wins, which
@@ -2321,7 +2389,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         ramWindow := U(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits)
         mon       := U(DebugRegMap.MON_SENSE_POR, 7 bits)
         if (stage >= 3) {
-          for (i <- 0 until 32) archShadow(i) := B(0, 32 bits)
+          if (!lite) for (i <- 0 until 32) archShadow(i) := B(0, 32 bits)
           archDirty := B(0, 32 bits)
           archApplyRewrite := B(0, 32 bits)
         }
@@ -2495,10 +2563,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         ic.logic.dbgPrefetchWrEn  := csr.icPfForce && !dbgRst
         ic.logic.dbgPrefetchWrVal := csr.icPfEnable
       }
-      mhIcache.foreach(_.logic.dbgMultiHotClear := mhClear)
-      stallDcache.foreach(_.logic.dbgMultiHotClear := mhClear)
-      stallItlb.foreach(_.logic.dbgMultiHotClear := mhClear)
-      stallDtlb.foreach(_.logic.dbgMultiHotClear := mhClear)
+      // Lite: nothing reads the evidence, so the producers keep their default (no clear).
+      if (!lite) {
+        mhIcache.foreach(_.logic.dbgMultiHotClear := mhClear)
+        stallDcache.foreach(_.logic.dbgMultiHotClear := mhClear)
+        stallItlb.foreach(_.logic.dbgMultiHotClear := mhClear)
+        stallDtlb.foreach(_.logic.dbgMultiHotClear := mhClear)
+      }
       dbgCommit.foreach(_.configureHaltAfter(csr.haltAfterTarget, csr.haltAfterEpoch,
         csr.haltAfterArmed && !dbgRst, csr.haltAfterInvalidate && !dbgRst))
       if (stage >= 5) {
