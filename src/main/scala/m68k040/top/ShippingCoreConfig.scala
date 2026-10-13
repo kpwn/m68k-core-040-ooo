@@ -564,6 +564,12 @@ object ShippingCoreConfig {
     * `cmdWindowPc` select, and decode's 3-uop deferral off the fused-MOVE count override.
     * Every arm carries a simulation-only oracle against the original expression. */
   val feRetime: Boolean = envFlag("CPU_FE_RETIME", true)
+  /** Aligner slot-1 zero-fill moved past the FetchAlign->Decode `raw` register
+    * (`CPU_ALIGN_MASK_NORST`, default OFF). The aligner registers unmasked slot-1 words;
+    * DecodeStage zeroes words at index >= `lenWords` (simple packets) on the registered
+    * side, so the `raw` slot-1 word flops carry no synchronous clear. Cycle-identical.
+    * Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
+  val alignMaskNoRst: Boolean = envFlag("CPU_ALIGN_MASK_NORST", false)
   /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
     * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
     * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,
