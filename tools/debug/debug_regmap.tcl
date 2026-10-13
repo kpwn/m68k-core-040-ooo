@@ -309,6 +309,8 @@ set ::dbg::FEAT_BIT(branch_ring) 24
 set ::dbg::FEAT_STAGE(branch_ring) 3
 set ::dbg::FEAT_BIT(fetch_word_check) 25
 set ::dbg::FEAT_STAGE(fetch_word_check) 5
+set ::dbg::FEAT_BIT(dbg_lite) 26
+set ::dbg::FEAT_STAGE(dbg_lite) 9
 
 set ::dbg::PORT_DIR(dbg_axi_awaddr) IN
 set ::dbg::PORT_WIDTH(dbg_axi_awaddr) 20

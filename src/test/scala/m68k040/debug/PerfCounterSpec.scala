@@ -156,13 +156,22 @@ class PerfCounterSpec extends AnyFunSuite {
       cd.waitSampling(30)
 
       val csr = dut.dbg.logic.csr
+      // CPU_DBG_LITE: counters are lazily cleared (a value register plus a `live` bit), so
+      // a seed pokes both; the I-prefetch and exception banks are not built at all.
+      def poke(c: UInt, v: BigInt): Unit =
+        if (DbgLite.on) { val (r, live) = csr.perfLazyRegs.get(c); r #= v; live #= true }
+        else c #= v
+      val liteDropped = Set("ic_pf_issued", "ic_pf_used", "ic_miss_seq", "ic_pf_late",
+        "exc_entry", "exc_aline", "exc_int", "exc_rte", "exc_busy")
+      def kept(nm: String): Boolean = !DbgLite.on || !liteDropped(nm)
 
       // ---- the control word describes the block ----------------------------
       val c0 = ctl(b, cd)
       println(s"[perf-csr] $c0")
       assertPerfFeatureWithheld(b, cd, "the producerless standalone fixture")
-      assert(c0.nCounters == 23,
-        s"OFF_PERF_CTL[15:8] says ${c0.nCounters} implemented counters, expected 23 " +
+      val wantCounters = if (DbgLite.on) 14 else 23
+      assert(c0.nCounters == wantCounters,
+        s"OFF_PERF_CTL[15:8] says ${c0.nCounters} implemented counters, expected $wantCounters " +
         "(12 + the 2 mispredict-class + the 4 I-cache prefetch + the 5 exception counters). " +
         "The host uses this to decide whether the block exists at all; a wrong value " +
         "makes it either refuse a real block or print a table for an absent one.")
@@ -194,37 +203,39 @@ class PerfCounterSpec extends AnyFunSuite {
       // Seeding is legal here precisely because the counters are frozen: nothing can
       // overwrite the seed between the poke and the read.
       val seeds: Seq[(String, Long, Long => Unit)] = Seq(
-        ("mispred",      0x11110001L, v => csr.perfMispred     #= BigInt(v)),
-        ("flush",        0x22220002L, v => csr.perfFlush       #= BigInt(v)),
-        ("branch",       0x33330003L, v => csr.perfBranch      #= BigInt(v)),
+        ("mispred",      0x11110001L, v => poke(csr.perfMispred, BigInt(v))     ),
+        ("flush",        0x22220002L, v => poke(csr.perfFlush, BigInt(v))       ),
+        ("branch",       0x33330003L, v => poke(csr.perfBranch, BigInt(v))      ),
         // Positionally zipped with `Counters32` via `seedOffsets(idx)` -- these two must
         // stay in the same place in BOTH lists or the aliasing check silently compares
         // the wrong pair.
-        ("mispred_uncond", 0xBBBB000BL, v => csr.perfMispredUncond #= BigInt(v)),
-        ("mispred_cond", 0xCCCC000CL, v => csr.perfMispredCond   #= BigInt(v)),
-        ("dc_miss",      0x44440004L, v => csr.perfDcMiss      #= BigInt(v)),
-        ("ic_miss",      0x55550005L, v => csr.perfIcMiss      #= BigInt(v)),
-        ("dtlb_walk",    0x66660006L, v => csr.perfDtlbWalk    #= BigInt(v)),
-        ("itlb_walk",    0x77770007L, v => csr.perfItlbWalk    #= BigInt(v)),
-        ("stall_retire", 0x88880008L, v => csr.perfStallRetire #= BigInt(v)),
-        ("stall_dc",     0x99990009L, v => csr.perfStallDc     #= BigInt(v)),
-        ("stall_walk",   0xAAAA000AL, v => csr.perfStallWalk   #= BigInt(v)),
-        ("ic_pf_issued", 0xBBBB000BL, v => csr.perfIcPfIssued   #= BigInt(v)),
-        ("ic_pf_used",   0xCCCC000CL, v => csr.perfIcPfUsed     #= BigInt(v)),
-        ("ic_miss_seq",  0xDDDD000DL, v => csr.perfIcMissSeq    #= BigInt(v)),
-        ("ic_pf_late",   0xEEEE000EL, v => csr.perfIcPfLate     #= BigInt(v)),
-        ("exc_entry",    0x1E1E0011L, v => csr.perfExcEntry     #= BigInt(v)),
-        ("exc_aline",    0x2E2E0012L, v => csr.perfExcAline     #= BigInt(v)),
-        ("exc_int",      0x3E3E0013L, v => csr.perfExcInt       #= BigInt(v)),
-        ("exc_rte",      0x4E4E0014L, v => csr.perfExcRte       #= BigInt(v)),
-        ("exc_busy",     0x5E5E0015L, v => csr.perfExcBusy      #= BigInt(v)))
-      val seedOffsets = Counters32.map(_._1)
+        ("mispred_uncond", 0xBBBB000BL, v => poke(csr.perfMispredUncond, BigInt(v)) ),
+        ("mispred_cond", 0xCCCC000CL, v => poke(csr.perfMispredCond, BigInt(v))   ),
+        ("dc_miss",      0x44440004L, v => poke(csr.perfDcMiss, BigInt(v))      ),
+        ("ic_miss",      0x55550005L, v => poke(csr.perfIcMiss, BigInt(v))      ),
+        ("dtlb_walk",    0x66660006L, v => poke(csr.perfDtlbWalk, BigInt(v))    ),
+        ("itlb_walk",    0x77770007L, v => poke(csr.perfItlbWalk, BigInt(v))    ),
+        ("stall_retire", 0x88880008L, v => poke(csr.perfStallRetire, BigInt(v)) ),
+        ("stall_dc",     0x99990009L, v => poke(csr.perfStallDc, BigInt(v))     ),
+        ("stall_walk",   0xAAAA000AL, v => poke(csr.perfStallWalk, BigInt(v))   ),
+        ("ic_pf_issued", 0xBBBB000BL, v => poke(csr.perfIcPfIssued, BigInt(v))   ),
+        ("ic_pf_used",   0xCCCC000CL, v => poke(csr.perfIcPfUsed, BigInt(v))     ),
+        ("ic_miss_seq",  0xDDDD000DL, v => poke(csr.perfIcMissSeq, BigInt(v))    ),
+        ("ic_pf_late",   0xEEEE000EL, v => poke(csr.perfIcPfLate, BigInt(v))     ),
+        ("exc_entry",    0x1E1E0011L, v => poke(csr.perfExcEntry, BigInt(v))     ),
+        ("exc_aline",    0x2E2E0012L, v => poke(csr.perfExcAline, BigInt(v))     ),
+        ("exc_int",      0x3E3E0013L, v => poke(csr.perfExcInt, BigInt(v))       ),
+        ("exc_rte",      0x4E4E0014L, v => poke(csr.perfExcRte, BigInt(v))       ),
+        ("exc_busy",     0x5E5E0015L, v => poke(csr.perfExcBusy, BigInt(v))      ))
       assert(seeds.map(_._1) == Counters32.map(_._2),
         s"the seed table and Counters32 have drifted apart: ${seeds.map(_._1)} vs " +
         s"${Counters32.map(_._2)}. `seedOffsets(idx)` zips them BY POSITION, so a " +
         "mismatch would seed one counter and read another and still pass.")
 
-      for (((nm, seed, poke), idx) <- seeds.zipWithIndex) {
+      // Lite: seed only the counters the build has (the drift check above stays global).
+      val liveSeeds = seeds.zip(Counters32.map(_._1)).filter { case (sd, _) => kept(sd._1) }
+      val seedOffsets = liveSeeds.map(_._2)
+      for (((nm, seed, poke), idx) <- liveSeeds.map(_._1).zipWithIndex) {
         poke(seed)
         cd.waitSampling(4)
         val got = u(DbgAxiDriver.read(b, cd, seedOffsets(idx)))
@@ -233,7 +244,7 @@ class PerfCounterSpec extends AnyFunSuite {
           f"$nm: read 0x$got%08x, seeded 0x$seed%08x. The mux arm does not reach the " +
           f"intended register -- and this counter would then read a confident number " +
           f"that belongs to something else, or a confident zero.")
-        for (((onm, _, _), oidx) <- seeds.zipWithIndex if oidx != idx) {
+        for (((onm, _, _), oidx) <- liveSeeds.map(_._1).zipWithIndex if oidx != idx) {
           val ov = u(DbgAxiDriver.read(b, cd, seedOffsets(oidx)))
           assert(ov == 0L,
             f"ALIASING: seeding $nm made $onm read 0x$ov%08x. Two offsets share a " +
@@ -249,8 +260,8 @@ class PerfCounterSpec extends AnyFunSuite {
       }
 
       // The 64-bit pair, seeded as a full 64-bit value so LO/HI cannot be swapped.
-      csr.perfCycle #= BigInt("0123456789ABCDEF", 16)
-      csr.perfInst  #= BigInt("FEDCBA9876543210", 16)
+      poke(csr.perfCycle, BigInt("0123456789ABCDEF", 16))
+      poke(csr.perfInst,  BigInt("FEDCBA9876543210", 16))
       cd.waitSampling(4)
       assert(u(DbgAxiDriver.read(b, cd, OFF_PERF_CYCLE_LO)) == 0x89ABCDEFL, "cycle LO word")
       assert(u(DbgAxiDriver.read(b, cd, OFF_PERF_CYCLE_HI)) == 0x01234567L, "cycle HI word")

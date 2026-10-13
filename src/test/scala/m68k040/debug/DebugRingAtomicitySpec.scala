@@ -66,6 +66,7 @@ class DebugRingAtomicitySpec extends AnyFunSuite {
   private def exHnd(i: Long): Long  = 0x60000000L + (i & 0xffffff) * 4
 
   test("a branch-ring entry read while the CPU keeps retiring branches is ONE event") {
+    DbgLite.skip("the branch ring")
     M68kSim().compile(new Dut).doSim(seed = 42) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       DbgAxiDriver.idle(dut.axi)
@@ -120,6 +121,7 @@ class DebugRingAtomicitySpec extends AnyFunSuite {
   }
 
   test("an exception-ring entry read while exceptions keep arriving is ONE event") {
+    DbgLite.skip("the exception ring")
     M68kSim().compile(new Dut).doSim(seed = 43) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       DbgAxiDriver.idle(dut.axi)
