@@ -789,6 +789,14 @@ object ShippingCoreConfig {
     * enables; reaches every harness via the plugin constructor defaults; echoed in SHIPPING_CONFIG. */
   val tlbVicPayloadLutram: Boolean = envFlag("CPU_TLB_VIC_PAYLOAD_LUTRAM", true)
 
+  /** Main TLB arrays (tag, FC2, payload) in per-way async-read distributed RAMs addressed by
+    * the (bank,set) row instead of flops + 8:1 row mux; valid bits stay in flops (parallel
+    * invalidateAll / purge). Separate DTLB / ITLB knobs so the fetch-cone ITLB can be held
+    * back on timing. Cycle-identical. Default OFF; reach `Tlb` via the plugin constructor
+    * defaults; echoed in SHIPPING_CONFIG. */
+  val dtlbArrayLutram: Boolean = envFlag("CPU_DTLB_ARRAY_LUTRAM", false)
+  val itlbArrayLutram: Boolean = envFlag("CPU_ITLB_ARRAY_LUTRAM", false)
+
   /** ROB: let a resolved CORRECTLY-predicted branch that ends its macro retire in slot 0
     * alongside a non-branch slot-1 uop (`RobPlugin.pairCorrectBranch`). Default OFF = every
     * branch retires alone. Default ON (gated 2026-10-09); `CPU_PAIR_CORRECT_BRANCH=0` disables; echoed in `SHIPPING_CONFIG`. */

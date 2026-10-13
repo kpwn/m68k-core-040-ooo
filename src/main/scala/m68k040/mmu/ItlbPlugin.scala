@@ -153,6 +153,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
                  victimNegativeControl: Int = ItlbPlugin.VictimNegativeControl.None,
                  /** `ShippingCoreConfig.tlbVicPayloadLutram`: victim payload in LUTRAM. */
                  victimPayloadLutram: Boolean = m68k040.top.ShippingCoreConfig.tlbVicPayloadLutram,
+                 /** `ShippingCoreConfig.itlbArrayLutram`: main TLB arrays in LUTRAM. */
+                 arrayLutram: Boolean = m68k040.top.ShippingCoreConfig.itlbArrayLutram,
                  /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME): drive `rsp.inhibitHint`. */
                  feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
                  /** `ShippingCoreConfig.umAtomic`: atomic, order-checked U drain. */
@@ -234,7 +236,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   var flushAll:      Bool = null
 
   val logic = during build new Area {
-    val tlb    = new Tlb(entries, ways, banks, reportEvictions = victimEntries > 0, inhibitHint = feRetime)
+    val tlb    = new Tlb(entries, ways, banks, reportEvictions = victimEntries > 0, inhibitHint = feRetime,
+                         arrayLutram = arrayLutram)
     // ── Multi-hot evidence plumbing (2026-09-17) ───────────────────────────────
     // `dbgMultiHotClear` is a plugin-level default-False wire so DebugCtrlPlugin can
     // override it from its write decode, and so a DUT that wires nothing still

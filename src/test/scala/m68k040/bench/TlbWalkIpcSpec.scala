@@ -141,7 +141,10 @@ class TlbWalkIpcSpec extends CoreBenchHarness {
       case None => all
     }
     val shipping = sys.env.get("IPC_SHIPPING").contains("1")
-    val compiled = M68kSim().withVerilator.compile(
+    // IPC_ZERO_INIT=1: Verilator `--x-initial 0` (see IpcBenchSpec).
+    val simCfg = if (sys.env.get("IPC_ZERO_INIT").contains("1"))
+      M68kSim().withVerilator.addSimulatorFlag("--x-initial 0") else M68kSim().withVerilator
+    val compiled = simCfg.compile(
       if (shipping) new FullCoreDut(shippingProfile = true) else new FullCoreDut)
     println(s"  TLBWALK config: walkAgeLimit=${m68k040.top.ShippingCoreConfig.walkAgeLimit} " +
       s"dtlbHitUnderWalk=${m68k040.top.ShippingCoreConfig.dtlbHitUnderWalk} " +

@@ -27,6 +27,21 @@ case class TlbEntry() extends Bundle {
   val modified   = Bool()
 }
 
+/** `arrayLutram` storage: the compared half of an entry (tag + FC2). */
+case class TlbArrTag(tagBits: Int) extends Bundle {
+  val tag = UInt(tagBits bits)
+  val sup = Bool()
+}
+
+/** `arrayLutram` storage: the payload half of an entry. */
+case class TlbArrPay() extends Bundle {
+  val ppn        = UInt(20 bits)
+  val writeProt  = Bool()
+  val supervisor = Bool()
+  val cacheMode  = CacheMode()
+  val modified   = Bool()
+}
+
 object Tlb {
   val DefaultEntries = 32
   val DefaultWays    = 4
@@ -68,11 +83,18 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
           banks: Int = Tlb.DefaultBanks,
           reportEvictions: Boolean = false,
           /** CPU_FE_RETIME (I-side only): export `io.hitInhibited`. */
-          inhibitHint: Boolean = false) extends Component {
+          inhibitHint: Boolean = false,
+          /** CPU_DTLB_ARRAY_LUTRAM / CPU_ITLB_ARRAY_LUTRAM: tag/FC2/payload arrays live in
+            * per-way async-read distributed RAMs addressed by the (bank,set) row; only the
+            * valid bits (parallel invalidateAll + purge) and the round-robin pointers stay
+            * in flops. The single write port is the registered fill (`pend`), which is
+            * already the only writer of those arrays. Cycle-identical to the flop arrays. */
+          arrayLutram: Boolean = false) extends Component {
   require(isPow2(banks), "banks must be a power of two")
   require(isPow2(ways), "ways must be a power of two")
   require(entries % (ways * banks) == 0, "entries must divide evenly into ways*banks")
   require(isPow2(entries / (ways * banks)), "sets-per-bank must be a power of two")
+  require(!arrayLutram || entries / ways >= 2, "arrayLutram needs at least two rows")
 
   val bankBits = Tlb.bankBits(banks)
   val nSets    = Tlb.setsPerBank(entries, ways, banks)
@@ -147,11 +169,13 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   // ---- storage: per [bank][way][set] ----
   // valid bits are a RegInit'd Vec so invalidateAll can clear them cheaply.
   val valids  = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
-  val tags    = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(Reg(UInt(tagBits bits)))))
-  val ppns    = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(Reg(UInt(20 bits)))))
-  val wProt   = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
-  val sup     = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
-  val cmode   = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(CacheMode.WRITETHROUGH))))
+  def flopArr[T <: Data](gen: => T): Vec[Vec[Vec[T]]] =
+    if (arrayLutram) null else Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(gen)))
+  val tags    = flopArr(Reg(UInt(tagBits bits)))
+  val ppns    = flopArr(Reg(UInt(20 bits)))
+  val wProt   = flopArr(RegInit(False))
+  val sup     = flopArr(RegInit(False))
+  val cmode   = flopArr(RegInit(CacheMode.WRITETHROUGH))
   // ---- FC2: THE ADDRESS-SPACE HALF OF THE TAG (2026-09-09) --------------------
   // NOT the same thing as `sup` above, and the distinction is the whole point:
   //   * `sup`   is the PAGE's supervisor-only PROTECTION attribute, read out of the
@@ -174,9 +198,16 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   // COST ON THE LOOKUP PATH: one extra input to an equality that already reduces
   // `tagBits` (17) bits. It widens an existing comparator by one bit; it adds no
   // level to the way-mux, no second lookup and no CAM entry.
-  val tagSup  = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
+  val tagSup  = flopArr(RegInit(False))
   // Task #210: per-entry M-bit shadow (see TlbEntry doc).
-  val modif   = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
+  val modif   = flopArr(RegInit(False))
+  // arrayLutram: one tag RAM + one payload RAM per way, row = bank ## set (bank-major,
+  // the same flat order `lookupRow` uses). Written only from `pend`.
+  val nRows   = banks * nSets
+  val tagMem  = if (arrayLutram) Seq.fill(ways)(Mem(TlbArrTag(tagBits), nRows)) else null
+  val payMem  = if (arrayLutram) Seq.fill(ways)(Mem(TlbArrPay(), nRows)) else null
+  def rowOf(bank: UInt, set: UInt): UInt =
+    if (bankBits == 0) set else if (setBits == 0) bank else (bank ## set).asUInt
   // round-robin victim per (bank,set)
   val victim  = Vec.fill(banks)(Vec.fill(nSets)(RegInit(U(0, wayBits bits))))
   // Sim-only: expose the valid bits so a test can COUNT occupancy per bank. Added
@@ -184,8 +215,13 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   // "bank 1 is never used" -- a claim only an occupancy census can settle. These are
   // already registers with real consumers, so `simPublic` adds nothing to a netlist.
   valids.foreach(_.foreach(_.foreach(_.simPublic())))
-  tags.foreach(_.foreach(_.foreach(_.simPublic())))
-  tagSup.foreach(_.foreach(_.foreach(_.simPublic())))
+  if (!arrayLutram) {
+    tags.foreach(_.foreach(_.foreach(_.simPublic())))
+    tagSup.foreach(_.foreach(_.foreach(_.simPublic())))
+  } else {
+    tagMem.foreach(_.simPublic())
+    payMem.foreach(_.simPublic())
+  }
 
   // ---- combinational lookup ----
   val lkBank = bankOf(io.lookupVpn)
@@ -208,15 +244,27 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   val entVec = Vec(TlbEntry(), ways)
   for (w <- 0 until ways) {
     val v = lookupRow(valids, w)
-    val t = lookupRow(tags, w)
-    hitVec(w) := v && (t === lkTag) && (lookupRow(tagSup, w) === io.lookupSup)
     val e = TlbEntry()
-    e.vpnTag     := t
-    e.ppn        := lookupRow(ppns, w)
-    e.writeProt  := lookupRow(wProt, w)
-    e.supervisor := lookupRow(sup, w)
-    e.cacheMode  := lookupRow(cmode, w)
-    e.modified   := lookupRow(modif, w)
+    if (!arrayLutram) {
+      val t = lookupRow(tags, w)
+      hitVec(w) := v && (t === lkTag) && (lookupRow(tagSup, w) === io.lookupSup)
+      e.vpnTag     := t
+      e.ppn        := lookupRow(ppns, w)
+      e.writeProt  := lookupRow(wProt, w)
+      e.supervisor := lookupRow(sup, w)
+      e.cacheMode  := lookupRow(cmode, w)
+      e.modified   := lookupRow(modif, w)
+    } else {
+      val tr = tagMem(w).readAsync(lkRow)
+      val pr = payMem(w).readAsync(lkRow)
+      hitVec(w) := v && (tr.tag === lkTag) && (tr.sup === io.lookupSup)
+      e.vpnTag     := tr.tag
+      e.ppn        := pr.ppn
+      e.writeProt  := pr.writeProt
+      e.supervisor := pr.supervisor
+      e.cacheMode  := pr.cacheMode
+      e.modified   := pr.modified
+    }
     entVec(w) := e
   }
   // ── MULTI-HOT FAIL-SAFE (2026-09-17) ────────────────────────────────────────
@@ -315,8 +363,13 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     // did not, a user-space fill would REPLACE the supervisor-space entry for the
     // same VPN (and vice versa) instead of allocating beside it -- which would undo
     // the tag bit above for the exact interleaving it exists to serve.
-    flResidentVec(w) := valids(flBank)(w)(flSet) && (tags(flBank)(w)(flSet) === flTag) &&
-                        (tagSup(flBank)(w)(flSet) === io.fillSup)
+    if (!arrayLutram) {
+      flResidentVec(w) := valids(flBank)(w)(flSet) && (tags(flBank)(w)(flSet) === flTag) &&
+                          (tagSup(flBank)(w)(flSet) === io.fillSup)
+    } else {
+      val tr = tagMem(w).readAsync(rowOf(flBank, flSet))
+      flResidentVec(w) := valids(flBank)(w)(flSet) && (tr.tag === flTag) && (tr.sup === io.fillSup)
+    }
   }
 
   // ── REGISTERED FILL (200 MHz, 2026-10-06) ─────────────────────────────────────
@@ -356,6 +409,8 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     val resident = Reg(Bool())
     // One registered write-enable per entry: the array CE, with no logic behind it.
     val we       = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
+    // arrayLutram: registered per-way RAM write enable (== OR of `we` over rows).
+    val wayWe    = if (arrayLutram) Vec.fill(ways)(RegInit(False)) else null
   }
   pend.valid.simPublic()
   io.fillBusy := pend.valid
@@ -387,19 +442,36 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     val setMatch  = if (setBits == 0) True else flSet === U(s, setBits bits)
     pend.we(b)(w)(s) := flCapture && bankMatch && setMatch && (flWay === U(w, wayBits bits))
   }
+  if (arrayLutram) for (w <- 0 until ways) pend.wayWe(w) := flCapture && (flWay === U(w, wayBits bits))
 
   // Write (one cycle after capture), entirely from flops.
   for (b <- 0 until banks; w <- 0 until ways; s <- 0 until nSets) {
     when(pend.we(b)(w)(s)) {
       valids(b)(w)(s) := True
-      tags(b)(w)(s)   := pend.tag
-      tagSup(b)(w)(s) := pend.sup
-      ppns(b)(w)(s)   := pend.entry.ppn
-      wProt(b)(w)(s)  := pend.entry.writeProt
-      sup(b)(w)(s)    := pend.entry.supervisor
-      cmode(b)(w)(s)  := pend.entry.cacheMode
-      modif(b)(w)(s)  := pend.entry.modified
+      if (!arrayLutram) {
+        tags(b)(w)(s)   := pend.tag
+        tagSup(b)(w)(s) := pend.sup
+        ppns(b)(w)(s)   := pend.entry.ppn
+        wProt(b)(w)(s)  := pend.entry.writeProt
+        sup(b)(w)(s)    := pend.entry.supervisor
+        cmode(b)(w)(s)  := pend.entry.cacheMode
+        modif(b)(w)(s)  := pend.entry.modified
+      }
     }
+  }
+  val pendRow = rowOf(pend.bank, pend.set)
+  if (arrayLutram) for (w <- 0 until ways) {
+    val td = TlbArrTag(tagBits)
+    td.tag := pend.tag
+    td.sup := pend.sup
+    val pd = TlbArrPay()
+    pd.ppn        := pend.entry.ppn
+    pd.writeProt  := pend.entry.writeProt
+    pd.supervisor := pend.entry.supervisor
+    pd.cacheMode  := pend.entry.cacheMode
+    pd.modified   := pend.entry.modified
+    tagMem(w).write(pendRow, td, pend.wayWe(w))
+    payMem(w).write(pendRow, pd, pend.wayWe(w))
   }
   // Only a genuine ALLOCATION advances the round-robin victim. A replace-in-place
   // must not, or an M-refresh would still churn the victim and evict a live way for
@@ -433,15 +505,30 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     val evEntVec   = Vec(TlbEntry(), ways)
     for (w <- 0 until ways) {
       evValidVec(w) := fillRow(valids, w)
-      evSupVec(w)   := fillRow(tagSup, w)
-      evTagVec(w)   := fillRow(tags, w)
       val e = TlbEntry()
-      e.vpnTag     := fillRow(tags, w)
-      e.ppn        := fillRow(ppns, w)
-      e.writeProt  := fillRow(wProt, w)
-      e.supervisor := fillRow(sup, w)
-      e.cacheMode  := fillRow(cmode, w)
-      e.modified   := fillRow(modif, w)
+      if (!arrayLutram) {
+        evSupVec(w)   := fillRow(tagSup, w)
+        evTagVec(w)   := fillRow(tags, w)
+        e.vpnTag     := fillRow(tags, w)
+        e.ppn        := fillRow(ppns, w)
+        e.writeProt  := fillRow(wProt, w)
+        e.supervisor := fillRow(sup, w)
+        e.cacheMode  := fillRow(cmode, w)
+        e.modified   := fillRow(modif, w)
+      } else {
+        // Read port at the registered pend row, in the write cycle: async read
+        // returns the pre-write contents, exactly like the flop arrays.
+        val tr = tagMem(w).readAsync(pendRow)
+        val pr = payMem(w).readAsync(pendRow)
+        evSupVec(w)   := tr.sup
+        evTagVec(w)   := tr.tag
+        e.vpnTag     := tr.tag
+        e.ppn        := pr.ppn
+        e.writeProt  := pr.writeProt
+        e.supervisor := pr.supervisor
+        e.cacheMode  := pr.cacheMode
+        e.modified   := pr.modified
+      }
       evEntVec(w) := e
     }
     io.evictValid := pend.valid && !pend.resident && evValidVec(pend.way)
