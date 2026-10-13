@@ -26,7 +26,7 @@ object Aligner {
     * already maintains this companion register for its own PC advance. */
   def align(headPc: UInt, words: Vec[Bits], preds: Vec[ChunkPredecode], avail: UInt,
             p0LiveReg: ChunkPredecode, headPcHiP1: Option[UInt] = None,
-            retime: Boolean = false): Result = {
+            retime: Boolean = false, maskNoRst: Boolean = false): Result = {
     val r = Result()
 
     // Default-assign all packet fields to don't-care first
@@ -322,6 +322,11 @@ object Aligner {
               // L0 resolves, without additionally waiting on L1.
               // i >= 1 stays masked (load-bearing zero-fill beyond L1).
               r.slot1.words(0) := words(idx)
+            } else if (maskNoRst) {
+              // CPU_ALIGN_MASK_NORST: no zero-fill here (it mapped onto the flop R pins
+              // of DecodeStage's `raw` register). Words at i >= L1 carry don't-care bits;
+              // DecodeStage applies the mask on the registered side from `lenWords`.
+              r.slot1.words(i) := words(idx)
             } else {
               when(U(i) < L1) {
                 r.slot1.words(i) := words(idx)

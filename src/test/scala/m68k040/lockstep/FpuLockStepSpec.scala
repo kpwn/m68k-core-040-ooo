@@ -640,4 +640,29 @@ class FpuLockStepSpec extends AnyFunSuite {
         }
       })
   }
+
+  // CPU_PRF_TRIM_DIVH coverage: the MEMORY-source Extended load (fpSrcKind MEMEXT) is the
+  // only FP form whose third chunk (T2, mantissa low) arrives on psrcC. Two distinct FPn
+  // loaded back to back from memory, a dyadic FADD.X from memory, then a store round trip.
+  test("lock-step FP load: FMOVE.X (An),FPn / FADD.X (d16,An),FPn -- all three chunks via T0/T1/T2",
+       VerilatorTest) {
+    val instrs = Seq("movea.l #0x3000,%a0",
+                     "move.l #0x40010000,(%a0)", "move.l #0xC0000000,4(%a0)",   // 6.0 + low bits
+                     "move.l #0x0000ABCD,8(%a0)",
+                     "move.l #0x3FFF0000,12(%a0)", "move.l #0x80000000,16(%a0)", // 1.0 + low bits
+                     "move.l #0x00001235,20(%a0)",
+                     "fmove.x (%a0),%fp1",
+                     "fmove.x 12(%a0),%fp2",
+                     "fmove.x (%a0),%fp3",
+                     "fadd.x 12(%a0),%fp3",
+                     "fmove.x %fp3,24(%a0)",
+                     "move.l 24(%a0),%d1", "move.l 28(%a0),%d2", "move.l 32(%a0),%d3")
+    h.runLockStep("fp-ld-x", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr + 24, Scr + 28, Scr + 32), checkSpan = 4,
+      afterRun = { (dut, oracle) =>
+        expectFp("fp-ld-x", 1, 2, 3)(dut, oracle)
+        FpCompare.assertFpBits(dutFp(dut, 1), "4001C00000000000ABCD", "fp-ld-x FP1")
+        FpCompare.assertFpBits(dutFp(dut, 2), "3FFF8000000000001235", "fp-ld-x FP2")
+      })
+  }
 }

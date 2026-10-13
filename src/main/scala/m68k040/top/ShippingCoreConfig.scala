@@ -564,6 +564,12 @@ object ShippingCoreConfig {
     * `cmdWindowPc` select, and decode's 3-uop deferral off the fused-MOVE count override.
     * Every arm carries a simulation-only oracle against the original expression. */
   val feRetime: Boolean = envFlag("CPU_FE_RETIME", true)
+  /** Aligner slot-1 zero-fill moved past the FetchAlign->Decode `raw` register
+    * (`CPU_ALIGN_MASK_NORST`, default OFF). The aligner registers unmasked slot-1 words;
+    * DecodeStage zeroes words at index >= `lenWords` (simple packets) on the registered
+    * side, so the `raw` slot-1 word flops carry no synchronous clear. Cycle-identical.
+    * Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
+  val alignMaskNoRst: Boolean = envFlag("CPU_ALIGN_MASK_NORST", true)
   /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
     * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
     * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,
@@ -670,6 +676,10 @@ object ShippingCoreConfig {
     *     exception FSM is idle (the A7 mirror holds that cycle).
     * Read by `Microcode` (CAS rows), `AluEuPlugin`, `DebugCtrlPlugin`, `BackendWiringPlugin`. */
   val prfReadTrim: Boolean = envFlag("CPU_PRF_READ_TRIM", true)
+  /** Int PRF read-port cut 2(b): delete DivEu's `rdH` (psrcC) port; a CPLX uop with a valid
+    * third source reads it through `rdA` in one extra issue cycle. Default OFF.
+    * Read by `DivEuPlugin`. */
+  val prfTrimDivH: Boolean = envFlag("CPU_PRF_TRIM_DIVH", true)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
@@ -772,6 +782,20 @@ object ShippingCoreConfig {
     require(n != 1, "CPU_DTLB_VICTIM must be 0 (off) or 2..64")
     n
   }
+
+  /** TLB victim buffers (ITLB + DTLB): hold the PAYLOAD half (ppn, cmode, wProt, pgSup,
+    * modif) in an async-read distributed RAM instead of per-slot flops + MuxOH. Tag half
+    * stays in flops for the CAM. Cycle-identical. Default OFF; `CPU_TLB_VIC_PAYLOAD_LUTRAM=1`
+    * enables; reaches every harness via the plugin constructor defaults; echoed in SHIPPING_CONFIG. */
+  val tlbVicPayloadLutram: Boolean = envFlag("CPU_TLB_VIC_PAYLOAD_LUTRAM", true)
+
+  /** Main TLB arrays (tag, FC2, payload) in per-way async-read distributed RAMs addressed by
+    * the (bank,set) row instead of flops + 8:1 row mux; valid bits stay in flops (parallel
+    * invalidateAll / purge). Separate DTLB / ITLB knobs so the fetch-cone ITLB can be held
+    * back on timing. Cycle-identical. Default OFF; reach `Tlb` via the plugin constructor
+    * defaults; echoed in SHIPPING_CONFIG. */
+  val dtlbArrayLutram: Boolean = envFlag("CPU_DTLB_ARRAY_LUTRAM", true)
+  val itlbArrayLutram: Boolean = envFlag("CPU_ITLB_ARRAY_LUTRAM", true)
 
   /** ROB: let a resolved CORRECTLY-predicted branch that ends its macro retire in slot 0
     * alongside a non-branch slot-1 uop (`RobPlugin.pairCorrectBranch`). Default OFF = every
@@ -896,4 +920,18 @@ object ShippingCoreConfig {
     * core through the D-cache diagnostic fault instead of the exception unit's
     * DOUBLE_FAULT (both halt). Default OFF; echoed in `SHIPPING_CONFIG`. */
   val excFramesCopyback: Boolean = envFlag("CPU_EXC_FRAMES_COPYBACK", true)
+  /** Perf-lite DebugCtrl (census 2026-10-13 item 6). A BUILD OPTION, never a shipping
+    * default: every silicon measurement depends on the full debug counter set.
+    * Read as `DebugCtrlPlugin`'s constructor DEFAULT (the `sqDepth` precedent), so the
+    * SocketTop, FullCoreSynth and every directly-built debug DUT agree with this line.
+    * Keeps halt/resume/step, PC breakpoints, the halt-on-exception mask, live register
+    * readback, arch write/apply, cache maintenance (coherent mem r/w), build id, and the
+    * board-perf core counter set (cycles, inst, mispred + class pair, flush, branch,
+    * I/D miss, D/I walks, retire/dcache/walk stall). Drops the PC/branch/exception rings,
+    * fetch-word check, multi-hot/stall-pack/MMU-probe evidence, halt-after-N, the A7-odd
+    * and PC-range halt lanes, the I-prefetch/exception/detail counter banks and the
+    * arch-shadow READBACK; dropped offsets read 0, writes are accepted and ignored.
+    * Advertised as OFF_FEATURES bit 26 (`dbg_lite`). Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val dbgLite: Boolean = envFlag("CPU_DBG_LITE", false)
 }

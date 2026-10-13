@@ -706,6 +706,7 @@ object GenSocketTopVerilog {
             s"lsSpecWakeAlu=${ShippingCoreConfig.lsSpecWakeAlu} " +
             s"lsSpecWakeAluProbe=${ShippingCoreConfig.lsSpecWakeAluProbe} " +
             s"feRetime=${ShippingCoreConfig.feRetime} " +
+            s"alignMaskNoRst=${ShippingCoreConfig.alignMaskNoRst} " +
             s"feRedirectCmd=${ShippingCoreConfig.feRedirectCmd} " +
             s"beRetime=${ShippingCoreConfig.beRetime} " +
             s"tc3Retime=${ShippingCoreConfig.tc3Retime} " +
@@ -739,6 +740,9 @@ object GenSocketTopVerilog {
             s"decodePair3p1=${ShippingCoreConfig.decodePair3p1} " +
             s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries} " +
             s"dtlbVictimEntries=${ShippingCoreConfig.dtlbVictimEntries} " +
+            s"tlbVicPayloadLutram=${ShippingCoreConfig.tlbVicPayloadLutram} " +
+            s"dtlbArrayLutram=${ShippingCoreConfig.dtlbArrayLutram} " +
+            s"itlbArrayLutram=${ShippingCoreConfig.itlbArrayLutram} " +
             // ⚠️ ADDED BY THE INTEGRATION MERGE. `perf/sq-congestion` added both knobs
             // to `ShippingCoreConfig` and neither to this line, so a `SQ_DEPTH=4` or
             // `SQ_NARROW_MERGE=1` build was indistinguishable from the default in its
@@ -765,6 +769,7 @@ object GenSocketTopVerilog {
             s"dcacheNbDynamicRelease=${ShippingCoreConfig.dcacheNbDynamicRelease} " +
             s"dcacheNbProbeMissStage=${ShippingCoreConfig.dcacheNbProbeMissStage} " +
             s"prfReadTrim=${ShippingCoreConfig.prfReadTrim} " +
+            s"prfTrimDivH=${ShippingCoreConfig.prfTrimDivH} " +
             // TLB-miss cost chain (constructor DEFAULTS of LsEuPlugin / DtlbPlugin).
             s"walkAgeLimit=${ShippingCoreConfig.walkAgeLimit} " +
             s"dtlbHitUnderWalk=${ShippingCoreConfig.dtlbHitUnderWalk} " +
@@ -773,7 +778,8 @@ object GenSocketTopVerilog {
             s"flushFromSquash=${ShippingCoreConfig.flushFromSquash} " +
             s"coldWbShare=${ShippingCoreConfig.coldWbShare} " +
             s"walkSqCheck=${ShippingCoreConfig.walkSqCheck} " +
-            s"umAtomic=${ShippingCoreConfig.umAtomic}")
+            s"umAtomic=${ShippingCoreConfig.umAtomic} " +
+            s"dbgLite=${ShippingCoreConfig.dbgLite}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

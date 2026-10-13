@@ -37,6 +37,7 @@ class DebugHistorySpec extends AnyFunSuite {
   }
 
   test("32-entry committed histories preserve dual-retire order and wrap") {
+    DbgLite.skip("the PC/branch/exception rings")
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       DbgAxiDriver.idle(dut.axi)
@@ -76,7 +77,7 @@ class DebugHistorySpec extends AnyFunSuite {
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_CAP_TRACE2) == 0x20L)
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_PC_TRACE_HEAD) == 2L)
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_BRANCH_RING_HEAD) == 2L)
-      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == 2L)
+      if (!DbgLite.on) assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == 2L)
 
       for (index <- 0 until 32) {
         val event = if (index < 2) index + 32 else index
@@ -102,6 +103,7 @@ class DebugHistorySpec extends AnyFunSuite {
   }
 
   for (width <- Seq(4, 8, 16)) test(s"$width-wide PC history compacts sparse macro boundaries and wraps every bank") {
+    DbgLite.skip("the PC trace ring")
     M68kSim().compile(new Dut(retireWidth = width)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       DbgAxiDriver.idle(dut.axi)
@@ -164,7 +166,7 @@ class DebugHistorySpec extends AnyFunSuite {
       val first = driveExceptions(dut, 20)
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_COUNT) == first.toLong,
         "OFF_EXC_COUNT must equal the number of entries driven")
-      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == first.toLong)
+      if (!DbgLite.on) assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == first.toLong)
 
       // Second batch takes the total PAST the ring wrap. The head folds to
       // (total % 32); the counter must not. This is the assertion that kills
@@ -173,7 +175,7 @@ class DebugHistorySpec extends AnyFunSuite {
       val total = first + second // 57
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_COUNT) == total.toLong,
         s"OFF_EXC_COUNT must be $total after $total entries")
-      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == (total % 32).toLong,
+      if (!DbgLite.on) assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == (total % 32).toLong,
         "ring head must have wrapped -- otherwise this test is not testing wrap")
       assert(total % 32 != total, "stimulus must cross the ring wrap to be meaningful")
 
@@ -197,13 +199,13 @@ class DebugHistorySpec extends AnyFunSuite {
       dut.history.logic.branchValid #= false; dut.history.logic.exceptionValid #= false
       cd.waitSampling(20)
 
-      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == 0L)
+      if (!DbgLite.on) assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == 0L)
       val n = driveExceptions(dut, 41)
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_COUNT) == n.toLong,
         s"OFF_EXC_COUNT must be $n with historyDepth = 0")
       // The ring genuinely is absent -- otherwise the previous assertion would
       // not be evidence for independence from it.
-      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == 0L,
+      if (!DbgLite.on) assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_RING_HEAD) == 0L,
         "historyDepth = 0 must leave the ring head tied to zero")
     }
   }

@@ -132,6 +132,7 @@ class A7OddHaltLaneSpec extends AnyFunSuite {
   }
 
   test("threshold 0: halts on the EVEN->ODD edge with reason A7_ODD, re-arms only after A7 is even, disables cleanly") {
+    DbgLite.skip("the A7-odd halt lane")
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
@@ -177,6 +178,7 @@ class A7OddHaltLaneSpec extends AnyFunSuite {
   }
 
   test("reduced debug omits PC-range hardware, ignores range writes, and preserves manual and A7 halt") {
+    DbgLite.skip("the A7-odd halt lane")
     M68kSim().compile(new Dut(pcRangeEnable = false)).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
@@ -204,6 +206,7 @@ class A7OddHaltLaneSpec extends AnyFunSuite {
   }
 
   test("PC-RANGE lane: halts on the first retirement inside the window, captures it and the two PCs before it, and is inert outside the window or when disabled") {
+    DbgLite.skip("the PC-range halt lane")
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
@@ -244,6 +247,7 @@ class A7OddHaltLaneSpec extends AnyFunSuite {
   }
 
   test("threshold 4: counts retired macros while odd and reports the PCs retired before the edge") {
+    DbgLite.skip("the A7-odd halt lane")
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)

@@ -151,6 +151,10 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
                  captureGateOnFlush: Boolean = true,
                  victimEntries: Int = 0,
                  victimNegativeControl: Int = ItlbPlugin.VictimNegativeControl.None,
+                 /** `ShippingCoreConfig.tlbVicPayloadLutram`: victim payload in LUTRAM. */
+                 victimPayloadLutram: Boolean = m68k040.top.ShippingCoreConfig.tlbVicPayloadLutram,
+                 /** `ShippingCoreConfig.itlbArrayLutram`: main TLB arrays in LUTRAM. */
+                 arrayLutram: Boolean = m68k040.top.ShippingCoreConfig.itlbArrayLutram,
                  /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME): drive `rsp.inhibitHint`. */
                  feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
                  /** `ShippingCoreConfig.umAtomic`: atomic, order-checked U drain. */
@@ -232,7 +236,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   var flushAll:      Bool = null
 
   val logic = during build new Area {
-    val tlb    = new Tlb(entries, ways, banks, reportEvictions = victimEntries > 0, inhibitHint = feRetime)
+    val tlb    = new Tlb(entries, ways, banks, reportEvictions = victimEntries > 0, inhibitHint = feRetime,
+                         arrayLutram = arrayLutram)
     // ── Multi-hot evidence plumbing (2026-09-17) ───────────────────────────────
     // `dbgMultiHotClear` is a plugin-level default-False wire so DebugCtrlPlugin can
     // override it from its write decode, and so a DUT that wires nothing still
@@ -548,11 +553,12 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       val gens    = if (enabled) Vec.fill(n)(Reg(UInt(GenBits bits)) init 0) else null
       val keys    = if (enabled) Vec.fill(n)(Reg(UInt(Tlb.VpnBits bits))) else null
       val supTag  = if (enabled) Vec.fill(n)(RegInit(False))            else null
-      val ppn     = if (enabled) Vec.fill(n)(Reg(UInt(20 bits)))        else null
-      val wProt   = if (enabled) Vec.fill(n)(RegInit(False))            else null
-      val pgSup   = if (enabled) Vec.fill(n)(RegInit(False))            else null
-      val cmode   = if (enabled) Vec.fill(n)(RegInit(CacheMode.WRITETHROUGH)) else null
-      val modif   = if (enabled) Vec.fill(n)(RegInit(False))            else null
+      val ppn     = if (enabled && !victimPayloadLutram) Vec.fill(n)(Reg(UInt(20 bits)))        else null
+      val wProt   = if (enabled && !victimPayloadLutram) Vec.fill(n)(RegInit(False))            else null
+      val pgSup   = if (enabled && !victimPayloadLutram) Vec.fill(n)(RegInit(False))            else null
+      val cmode   = if (enabled && !victimPayloadLutram) Vec.fill(n)(RegInit(CacheMode.WRITETHROUGH)) else null
+      val modif   = if (enabled && !victimPayloadLutram) Vec.fill(n)(RegInit(False))            else null
+      val payRam  = if (enabled && victimPayloadLutram) new VictimPayloadRam(n) else null
       val ptr     = if (enabled) Reg(UInt(idxW bits)) init 0            else null
       val curGen  = if (enabled) Reg(UInt(GenBits bits)) init 0         else null
 
@@ -599,7 +605,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       // payload registers cannot change between CAM and RESOLVE: no insertion can land
       // while a probe is in flight (asserted below).
       val s2Idx   = if (enabled) OHToUInt(s2Oh) else null
-      val s2Entry = if (enabled) {
+      val s2Entry = if (enabled && victimPayloadLutram) payRam.read(s2Idx)
+                    else if (enabled) {
         val e = TlbEntry()
         e.vpnTag     := 0
         e.ppn        := MuxOH(s2Oh, ppn)
@@ -1018,13 +1025,18 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
           vic.gens(i)   := vic.stGen
           vic.keys(i)   := vic.stKey
           vic.supTag(i) := vic.stSup
-          vic.ppn(i)    := vic.stEntry.ppn
-          vic.wProt(i)  := vic.stEntry.writeProt
-          vic.pgSup(i)  := vic.stEntry.supervisor
-          vic.cmode(i)  := vic.stEntry.cacheMode
-          vic.modif(i)  := vic.stEntry.modified
+          if (!victimPayloadLutram) {
+            vic.ppn(i)    := vic.stEntry.ppn
+            vic.wProt(i)  := vic.stEntry.writeProt
+            vic.pgSup(i)  := vic.stEntry.supervisor
+            vic.cmode(i)  := vic.stEntry.cacheMode
+            vic.modif(i)  := vic.stEntry.modified
+          }
         }
       }
+      if (victimPayloadLutram)
+        vic.payRam.write(vic.stSlot, vic.stValid &&
+          (if (vic.useGen) vic.stGen === vic.curGen else True), vic.stEntry)
       when(vic.stValid) { vic.insertFire := True }
       // A promote reuses its own slot, so it must not churn the ring pointer.
       when(vic.stValid && !vic.stFromPromote) { vic.ptr := vic.ptr + 1 }

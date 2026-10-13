@@ -46,7 +46,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                        /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME). Cycle-identical. */
                        feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
                        /** `ShippingCoreConfig.feRedirectCmd` (CPU_FE_REDIRECT_CMD). */
-                       feRedirectCmd: Boolean = m68k040.top.ShippingCoreConfig.feRedirectCmd)
+                       feRedirectCmd: Boolean = m68k040.top.ShippingCoreConfig.feRedirectCmd,
+                       /** `ShippingCoreConfig.alignMaskNoRst` (CPU_ALIGN_MASK_NORST). Must match
+                         * DecodeStage's `alignMaskNoRst`, which applies the slot-1 word mask. */
+                       alignMaskNoRst: Boolean = m68k040.top.ShippingCoreConfig.alignMaskNoRst)
     extends FiberPlugin with DecodeFeedService {
 
   require(ftqDepth > 0 && (ftqDepth & (ftqDepth - 1)) == 0,
@@ -1176,12 +1179,12 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // ---- Aligner: combinational decode of buffer head ----
     val res = Aligner.align(decodePc, ibuf.io.head,
       if (feRetime) ibuf.io.headPredRaw else ibuf.io.headPred, availEff, p0LiveReg,
-      headPcHiP1 = Some(decodePcHiP1), retime = feRetime)
+      headPcHiP1 = Some(decodePcHiP1), retime = feRetime, maskNoRst = alignMaskNoRst)
     // CPU_FE_RETIME differential oracle: the original aligner on the GATED head must agree
     // with the retimed one on every field a consumer reads, every cycle.
     if (feRetime) GenerationFlags.simulation {
       val ref = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, availEff, p0LiveReg,
-        headPcHiP1 = Some(decodePcHiP1))
+        headPcHiP1 = Some(decodePcHiP1), maskNoRst = alignMaskNoRst)
       assert(ref.slot0Valid === res.slot0Valid && ref.slot1Valid === res.slot1Valid &&
              ref.shiftWords === res.shiftWords && ref.stall === res.stall &&
              ref.complex === res.complex,

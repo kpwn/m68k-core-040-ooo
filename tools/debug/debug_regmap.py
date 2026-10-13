@@ -528,6 +528,7 @@ FEATURES = {
     "stop_status_v2": (23, 2),
     "branch_ring": (24, 3),
     "fetch_word_check": (25, 5),
+    "dbg_lite": (26, 9),
 }
 
 # -- socket ports: name -> (direction from the CPU, width) ----------------

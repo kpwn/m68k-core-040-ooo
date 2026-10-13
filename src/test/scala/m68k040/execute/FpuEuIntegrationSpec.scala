@@ -109,7 +109,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       val iPsrcC     = in UInt (6 bits)
       val iPdst      = in UInt (6 bits)
       val iPdstValid = in Bool ()
-      val iPNzvcDst  = in UInt (4 bits)
+      val iPNzvcDst  = in UInt (m68k040.Global.PHYS_NZVC_ID_W bits)
       val iWritesNzvc= in Bool ()
       val iSize      = in(Size())
       // Task 14b fix pass: `DecOp.FPSTORECVT` carries its 32-bit-chunk index in imm[1:0]
@@ -153,7 +153,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       uop.dstArch := 0
       uop.psrcA := iPsrcA; uop.psrcAValid := True
       uop.psrcB := iPsrcB; uop.psrcBValid := True
-      uop.psrcC := iPsrcC; uop.psrcCValid := True
+      uop.psrcC := iPsrcC; uop.psrcCValid := iFpSrcKind === FpSrcKind.MEMEXT   // decode sets a 3rd int source ONLY for the Extended memory chunk T2
       uop.pdst := iPdst; uop.pdstValid := iPdstValid; uop.pdstOld := 0
       uop.pNzvcSrc := 0; uop.readsNzvc := False
       uop.pNzvcDst := iPNzvcDst; uop.writesNzvc := iWritesNzvc; uop.pNzvcOld := 0
@@ -431,6 +431,9 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         // +1: DivEu registers its issue payload before the operand reads (200 MHz,
         // 2026-10-06), so the FS1 gateway shows this uop TWO edges after acceptance.
         tick()
+        // CPU_PRF_TRIM_DIVH: a uop with a 3rd int source (MEMEXT) reads it through rdA in
+        // one extra issue-register cycle before it moves on.
+        if (m68k040.top.ShippingCoreConfig.prfTrimDivH && cse.kind == FpSrcKind.MEMEXT) tick()
         sleep(1)
         assert(s.fpSrcObs.toBigInt == cse.src,
           f"${cse.label}: gateway produced 0x${s.fpSrcObs.toBigInt}%020X, expected 0x${cse.src}%020X")

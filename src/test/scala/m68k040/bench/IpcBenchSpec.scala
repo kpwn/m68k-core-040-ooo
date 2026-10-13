@@ -111,7 +111,12 @@ class IpcBenchSpec extends CoreBenchHarness {
     // IPC_SHIPPING=1: build through `ShippingPlugins` exactly as M68kSocketTop does (the
     // CPU_* env flags of the build under test apply), instead of the hand-listed v2 knobs.
     val shipping = sys.env.get("IPC_SHIPPING").contains("1")
-    val compiled = M68kSim().withVerilator.compile(
+    // IPC_ZERO_INIT=1: Verilator `--x-initial 0` -- every flop/memory starts at zero
+    // instead of a seed-derived random value. Random init draws from ONE stream, so an
+    // A/B that adds or removes state shifts every later value and perturbs cycles ~1%.
+    val simCfg = if (sys.env.get("IPC_ZERO_INIT").contains("1"))
+      M68kSim().withVerilator.addSimulatorFlag("--x-initial 0") else M68kSim().withVerilator
+    val compiled = simCfg.compile(
       if (shipping) new FullCoreDut(shippingProfile = true)
       else if (!v2) new FullCoreDut
       else new FullCoreDut(
