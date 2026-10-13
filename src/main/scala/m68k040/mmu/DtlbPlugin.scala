@@ -63,6 +63,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                    * miss from `missReqReg` flops. 0 elaborates NO hardware. */
                  victimEntries: Int = m68k040.top.ShippingCoreConfig.dtlbVictimEntries,
                  victimNegativeControl: Int = DtlbPlugin.VictimNegativeControl.None,
+                 /** `ShippingCoreConfig.tlbVicPayloadLutram`: victim payload in LUTRAM. */
+                 victimPayloadLutram: Boolean = m68k040.top.ShippingCoreConfig.tlbVicPayloadLutram,
                  /** `ShippingCoreConfig.beRetime`: the MOVEC/debug-apply ATC flush is a REGISTERED pulse. */
                  beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime,
                  /** `ShippingCoreConfig.umAtomic`: atomic, order-checked U/M drain. */
@@ -646,11 +648,12 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       val gens    = if (enabled) Vec.fill(n)(Reg(UInt(GenBits bits)) init 0) else null
       val keys    = if (enabled) Vec.fill(n)(Reg(UInt(Tlb.VpnBits bits))) else null
       val supTag  = if (enabled) Vec.fill(n)(RegInit(False))            else null
-      val ppn     = if (enabled) Vec.fill(n)(Reg(UInt(20 bits)))        else null
-      val wProt   = if (enabled) Vec.fill(n)(RegInit(False))            else null
-      val pgSup   = if (enabled) Vec.fill(n)(RegInit(False))            else null
-      val cmode   = if (enabled) Vec.fill(n)(RegInit(CacheMode.WRITETHROUGH)) else null
-      val modif   = if (enabled) Vec.fill(n)(RegInit(False))            else null
+      val ppn     = if (enabled && !victimPayloadLutram) Vec.fill(n)(Reg(UInt(20 bits)))        else null
+      val wProt   = if (enabled && !victimPayloadLutram) Vec.fill(n)(RegInit(False))            else null
+      val pgSup   = if (enabled && !victimPayloadLutram) Vec.fill(n)(RegInit(False))            else null
+      val cmode   = if (enabled && !victimPayloadLutram) Vec.fill(n)(RegInit(CacheMode.WRITETHROUGH)) else null
+      val modif   = if (enabled && !victimPayloadLutram) Vec.fill(n)(RegInit(False))            else null
+      val payRam  = if (enabled && victimPayloadLutram) new VictimPayloadRam(n) else null
       val ptr     = if (enabled) Reg(UInt(idxW bits)) init 0            else null
       val curGen  = if (enabled) Reg(UInt(GenBits bits)) init 0         else null
       val wrapHazard = if (enabled) RegInit(False) else null
@@ -676,7 +679,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       // Payload selected at RESOLVE from the registered one-hot. Feeds only data pins
       // (array fill data, response payload); never an enable.
       val s2Idx   = if (enabled) OHToUInt(s2Oh) else null
-      val s2Entry = if (enabled) {
+      val s2Entry = if (enabled && victimPayloadLutram) payRam.read(s2Idx)
+                    else if (enabled) {
         val e = TlbEntry()
         e.vpnTag     := 0
         e.ppn        := MuxOH(s2Oh, ppn)
@@ -1122,13 +1126,18 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
           vic.gens(i)   := vic.stGen
           vic.keys(i)   := vic.stKey
           vic.supTag(i) := vic.stSup
-          vic.ppn(i)    := vic.stEntry.ppn
-          vic.wProt(i)  := vic.stEntry.writeProt
-          vic.pgSup(i)  := vic.stEntry.supervisor
-          vic.cmode(i)  := vic.stEntry.cacheMode
-          vic.modif(i)  := vic.stEntry.modified
+          if (!victimPayloadLutram) {
+            vic.ppn(i)    := vic.stEntry.ppn
+            vic.wProt(i)  := vic.stEntry.writeProt
+            vic.pgSup(i)  := vic.stEntry.supervisor
+            vic.cmode(i)  := vic.stEntry.cacheMode
+            vic.modif(i)  := vic.stEntry.modified
+          }
         }
       }
+      if (victimPayloadLutram)
+        vic.payRam.write(vic.stSlot, vic.stValid &&
+          (if (vic.useGen) vic.stGen === vic.curGen else True), vic.stEntry)
       when(vic.stValid) { vic.insertFire := True }
       when(vic.stValid && !vic.stFromPromote) { vic.ptr := vic.ptr + 1 }
 
