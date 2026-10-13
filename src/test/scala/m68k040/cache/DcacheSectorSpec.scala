@@ -54,7 +54,14 @@ class DcacheSectorSpec extends AnyFunSuite {
     val host = db on (new PluginHost)
     val param   = new ParamPlugin(M68kParams())
     val xlate   = new DIdentityTranslationPlugin
-    val dcache  = new DcachePlugin(sectored = sectored, fillForward = fillForward)
+    // Pinned to the LEGACY blocking L1D: sectoring (`CPU_DCACHE_SECTORED`) exists only on the LEGACY L1D (`require(!nonBlocking || !sectored)`).
+    // The shipping L1D is non-blocking (`CPU_DCACHE_NONBLOCKING`, default ON with
+    // `CPU_INHIBITED_FULL_BARRIER`) and sends every cacheable refill through its MSHRs
+    // on the hot door (`CPU_AXI_DH`), where this property does not exist.
+    val dcache  = new DcachePlugin(sectored = sectored, fillForward = fillForward,
+                                 nonBlocking = false, hotDoor = false, nbEarlyResponse = false,
+                                 nbEagerAr = false, nbPreselectAr = false, nbDynamicRelease = false,
+                                 nbProbeMissStage = false)
     val probe   = new DcacheProbePlugin
     val mmuCtrl = new MmuControlPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe, mmuCtrl)) }
@@ -85,7 +92,7 @@ class DcacheSectorSpec extends AnyFunSuite {
   private def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
     dut.probe.logic.loadProbeCancelIn.valid #= false

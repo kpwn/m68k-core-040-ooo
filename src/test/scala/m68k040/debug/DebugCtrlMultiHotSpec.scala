@@ -208,7 +208,7 @@ class DebugCtrlMultiHotSpec extends AnyFunSuite {
       // stimulated here -- the evidence registers are seeded directly -- but their bus
       // still has to be well-formed.
       m68k040.cache.IcacheSim.attachMemory(dut.icache.logic.axi, cd, 0L, 0x1000)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.dbg.logic.initDoneSeen #= false
       dut.dProbe.logic.loadCmdIn.valid #= false
       dut.dProbe.logic.loadProbeIn.valid #= false

@@ -90,8 +90,8 @@ class LsEuCrossSpec extends AnyFunSuite {
   def initDut(dut: Dut, injectBusErrors: Boolean = false,
               waitCacheReady: Boolean = true): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain; cd.forkStimulus(10)
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd,
-                                     injectBusErrors = injectBusErrors)
+    val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd,
+                                     injectBusErrors = injectBusErrors))
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
@@ -383,8 +383,8 @@ class LsEuCrossSpec extends AnyFunSuite {
           if (dut.eu.logic.probeCancel.toBoolean) cancels += 1
           if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
               dut.dcache.logic.loadCmdPort.ready.toBoolean) loadCmdFires += 1
-          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-              dut.dcache.logic.axi.ar.ready.toBoolean) dataArFires += 1
+          // Both read doors (CPU_AXI_DH: cacheable refills leave on the hot door).
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) dataArFires += 1
           if (dut.src.logic.fValid.toBoolean) {
             faults += 1
             wrongOwner = wrongOwner || dut.src.logic.fRob.toInt != 5
@@ -450,8 +450,8 @@ class LsEuCrossSpec extends AnyFunSuite {
         fork {
           while (true) {
             cd.waitSampling()
-            if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-                dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+            // Both read doors (CPU_AXI_DH: cacheable refills leave on the hot door).
+            if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1
           }
         }
 

@@ -60,8 +60,8 @@ class VectorFetchAfterWordBusErrorSpec extends AnyFunSuite {
         dut.icache.logic.axi, cd, loadAddr, image.bytes,
         cfg = m68k040.sim.AxiMemModelConfig(injectBusErrors = true))
       val dsideMem = new m68k040.sim.ConstFillSparseMemory(0xff.toByte)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
-                                                   sharedMem = dsideMem, injectBusErrors = true)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
+                                                   sharedMem = dsideMem, injectBusErrors = true))
       dmem.setByteWriteObserver((addr, byte) => iAgent.mem.write(addr, byte))
       for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
       for (i <- 0 until 4) dmem.mem.write(Sentinel + i, 0.toByte)

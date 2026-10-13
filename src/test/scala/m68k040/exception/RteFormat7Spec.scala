@@ -95,8 +95,10 @@ class RteFormat7Spec extends AnyFunSuite {
   test("RTE pops format-$7 frame: restore SR + PC, SSP += 60, redirect to faulting PC", VerilatorTest) {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      // Attach memory BEFORE `init` advances the clock: the hot door's R channel must be
+      // driven from cycle 0 (an undriven R VALID is a random beat to the MSHRs).
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       init(dut, cd)
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
 
       // SSP points at a preloaded format-$7 frame. SR stays supervisor (S=1) — a $7
       // access fault was taken in supervisor; RTE returns to re-execute the access.

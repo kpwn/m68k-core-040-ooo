@@ -37,7 +37,7 @@ class ExceptionStoreDrainArbSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The two table-walker AXI memories that used to be attached here are gone:
       // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
       // writebacks are DcacheService client traffic now, so they reach memory
@@ -113,7 +113,9 @@ class ExceptionStoreDrainArbSpec extends AnyFunSuite {
           drainFires += 1
           if (excActive && !frameStarted) sawDrainFireDuringExc = true
         }
-        if (dut.dcache.logic.storeMissDiscovered.toBoolean) storeMisses += 1
+        // Only the OLDER stores' misses: under CPU_EXC_FRAMES_COPYBACK the frame push itself
+        // goes through the L1D on this COPYBACK stack page and misses its cold line too.
+        if (dut.dcache.logic.storeMissDiscovered.toBoolean && !frameStarted) storeMisses += 1
         if (dut.dcache.logic.storeAckReg.toBoolean && !frameStarted)
           olderAcksBeforeFrame += 1
         if (frameFire) {
@@ -140,8 +142,10 @@ class ExceptionStoreDrainArbSpec extends AnyFunSuite {
         s"all eight cold COPYBACK stores must exercise the slow drain barrier, saw $storeMisses misses")
       assert(olderAcksBeforeFrame == 8,
         s"frame started before all older stores terminated: acks=$olderAcksBeforeFrame")
-      assert(frameFires == 4,
-        s"format-$$0 exception entry must accept four frame words, saw $frameFires")
+      // CPU_EXC_FAST_FRAMES: a 4-aligned format-$0 frame is pushed as 2 longs, not 4 words.
+      val frameStores = if (m68k040.top.ShippingCoreConfig.excFastFrames) 2 else 4
+      assert(frameFires == frameStores,
+        s"format-$$0 exception entry must accept $frameStores frame stores, saw $frameFires")
     }
   }
 }

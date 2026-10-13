@@ -55,8 +55,8 @@ class LsEuSpec extends AnyFunSuite {
     // and a randomly-asserted B response then reaches the cache as a store acknowledgement
     // with no accepted descriptor (its tripwire kills the sim at time=170). Same ordering
     // ExceptionEntrySpec/RteSpec already document for the identical hazard.
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd,
-      injectBusErrors = injectBusErrors)
+    val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd,
+      injectBusErrors = injectBusErrors))
     cd.forkStimulus(10)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false

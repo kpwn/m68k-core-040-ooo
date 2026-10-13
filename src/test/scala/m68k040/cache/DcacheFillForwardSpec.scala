@@ -48,7 +48,14 @@ class DcacheFillForwardSpec extends AnyFunSuite {
     // different quantity. Sectored fill-forward correctness has its own coverage in
     // `DcacheSectorSpec` ("returns the DEMANDED sector's bytes, from every one of the
     // four beat positions"), which is the property that actually matters there.
-    val dcache  = new DcachePlugin(fillForward = fillForward, sectored = false)
+    // Pinned to the LEGACY blocking L1D: fill-forward (`CPU_DCACHE_FILL_FORWARD`) is a lever of the LEGACY refill FSM's REPLAY.
+    // The shipping L1D is non-blocking (`CPU_DCACHE_NONBLOCKING`, default ON with
+    // `CPU_INHIBITED_FULL_BARRIER`) and sends every cacheable refill through its MSHRs
+    // on the hot door (`CPU_AXI_DH`), where this property does not exist.
+    val dcache  = new DcachePlugin(fillForward = fillForward, sectored = false,
+                                 nonBlocking = false, hotDoor = false, nbEarlyResponse = false,
+                                 nbEagerAr = false, nbPreselectAr = false, nbDynamicRelease = false,
+                                 nbProbeMissStage = false)
     val probe   = new DcacheProbePlugin
     val mmuCtrl = new MmuControlPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe, mmuCtrl)) }
@@ -63,7 +70,7 @@ class DcacheFillForwardSpec extends AnyFunSuite {
   private def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
     dut.probe.logic.loadProbeCancelIn.valid #= false

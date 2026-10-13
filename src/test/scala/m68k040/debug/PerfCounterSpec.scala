@@ -658,7 +658,7 @@ class PerfCounterSpec extends AnyFunSuite {
       // so a single poke is overwritten by reset -- re-poke from a non-blocking fork.
       fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, 0L, 0x10000)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       val b = dut.axi
       DbgAxiDriver.idle(b)
       dut.dbg.logic.initDoneSeen #= false
@@ -684,7 +684,8 @@ class PerfCounterSpec extends AnyFunSuite {
       fork {
         while (true) {
           cd.waitSampling()
-          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) dAr += 1
+          // Both read doors: under CPU_AXI_DH every cacheable refill leaves on the hot door.
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) dAr += 1
           if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) iAr += 1
         }
       }
@@ -813,7 +814,7 @@ class PerfCounterSpec extends AnyFunSuite {
     M68kSim().compile(new CachePerfDut).doSim("perf_ic_prefetch", 1) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, 0L, 0x10000)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       val b = dut.axi
       DbgAxiDriver.idle(b)
       dut.dbg.logic.initDoneSeen #= false
@@ -1232,7 +1233,7 @@ class PerfCounterSpec extends AnyFunSuite {
     M68kSim().compile(new AllProducersDut).doSim("perf_all_producers", 1) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, 0L, 0x1000)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       val image = SparseMemory()
       new DcacheClientMemAgent(dut.dWalk, cd, image)
       new DcacheClientMemAgent(dut.iWalk, cd, image)

@@ -66,7 +66,7 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
   test("LS EU: a faulting store emits faultCompletion (VA, write, size, super); no reg write", VerilatorTest) {
     M68kSim().withVerilator.compile(new LsDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
-      new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       val s = dut.src.logic
       s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
       s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
@@ -118,7 +118,7 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
   test("LS EU: a non-faulting access does NOT assert faultCompletion", VerilatorTest) {
     M68kSim().withVerilator.compile(new LsDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
-      new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       val s = dut.src.logic
       s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
       s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false

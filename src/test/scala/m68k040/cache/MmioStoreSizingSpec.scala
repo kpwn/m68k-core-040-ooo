@@ -118,8 +118,8 @@ class MmioStoreSizingSpec extends AnyFunSuite {
     compiled.doSim("mmio-store-cover", seed = 1) { dut =>
       dut.clockDomain.forkStimulus(10)
       quiesceUnusedPorts(dut)
-      val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
-        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false))
+      val mem = m68k040.sim.HotDoorAttach.cold(dut.dcache, dut.clockDomain, AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
+        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false)))
       dut.clockDomain.waitSampling(8)
       val log = watchAw(dut)
       // Every byte the model actually commits, so a byte written TWICE is caught.
@@ -163,8 +163,8 @@ class MmioStoreSizingSpec extends AnyFunSuite {
     compiled.doSim("mmio-store-usestrb", seed = 2) { dut =>
       dut.clockDomain.forkStimulus(10)
       quiesceUnusedPorts(dut)
-      val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
-        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false))
+      val mem = m68k040.sim.HotDoorAttach.cold(dut.dcache, dut.clockDomain, AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
+        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false)))
       dut.clockDomain.waitSampling(8)
       val log = watchAw(dut)
       val writes = scala.collection.mutable.ArrayBuffer[Long]()
@@ -194,8 +194,8 @@ class MmioStoreSizingSpec extends AnyFunSuite {
     compiled.doSim("mmio-store-single-ack", seed = 3) { dut =>
       dut.clockDomain.forkStimulus(10)
       quiesceUnusedPorts(dut)
-      AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
-        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false))
+      m68k040.sim.HotDoorAttach.cold(dut.dcache, dut.clockDomain, AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
+        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false)))
       dut.clockDomain.waitSampling(8)
       var acks = 0
       var bs   = 0
@@ -220,8 +220,8 @@ class MmioStoreSizingSpec extends AnyFunSuite {
     compiled.doSim("store-cacheable-unchanged", seed = 4) { dut =>
       dut.clockDomain.forkStimulus(10)
       quiesceUnusedPorts(dut)
-      AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
-        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false))
+      m68k040.sim.HotDoorAttach.cold(dut.dcache, dut.clockDomain, AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
+        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false)))
       dut.clockDomain.waitSampling(8)
       val log = watchAw(dut)
       val p = dut.probe.logic

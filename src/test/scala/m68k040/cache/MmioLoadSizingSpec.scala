@@ -32,15 +32,19 @@ class MmioLoadSizingSpec extends AnyFunSuite {
 
   lazy val compiled = M68kSim().withVerilator.compile(new Dut)
 
-  /** Every AR the D-cache presented, as (address, AxSIZE), in issue order. */
+  /** Every AR the D-cache presented, as (address, AxSIZE), in issue order -- on BOTH read
+    * doors: under CPU_AXI_DH every cacheable refill leaves on the hot door `axiDh`. */
   private def watchAr(dut: Dut): scala.collection.mutable.ArrayBuffer[(Long, Int)] = {
     val log = scala.collection.mutable.ArrayBuffer[(Long, Int)]()
     val axi = dut.dcache.logic.axi
+    val dh  = if (dut.dcache.hotDoor) dut.dcache.logic.axiDh else null
     fork {
       while (true) {
         dut.clockDomain.waitSampling()
         if (axi.ar.valid.toBoolean && axi.ar.ready.toBoolean)
           log += ((axi.ar.payload.addr.toLong, axi.ar.payload.size.toInt))
+        if (dh != null && dh.ar.valid.toBoolean && dh.ar.ready.toBoolean)
+          log += ((dh.ar.payload.addr.toLong, dh.ar.payload.size.toInt))
       }
     }
     log
@@ -129,8 +133,8 @@ class MmioLoadSizingSpec extends AnyFunSuite {
     compiled.doSim("mmio-load-cover", seed = 1) { dut =>
       dut.clockDomain.forkStimulus(10)
       quiesceUnusedPorts(dut)
-      val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
-        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false))
+      val mem = m68k040.sim.HotDoorAttach.cold(dut.dcache, dut.clockDomain, AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
+        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false)))
       for (i <- 0 until 4096) mem.pokeByte(BASE + i, ((i * 5 + 0x23) & 0xff))
       dut.clockDomain.waitSampling(8)
       val log = watchAr(dut)
@@ -194,8 +198,8 @@ class MmioLoadSizingSpec extends AnyFunSuite {
     compiled.doSim("mmio-load-clamp", seed = 2) { dut =>
       dut.clockDomain.forkStimulus(10)
       quiesceUnusedPorts(dut)
-      val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
-        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false))
+      val mem = m68k040.sim.HotDoorAttach.cold(dut.dcache, dut.clockDomain, AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
+        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false)))
       for (i <- 0 until 8192) mem.pokeByte(BASE + i, ((i * 7 + 1) & 0xff))
       dut.clockDomain.waitSampling(8)
       val log = watchAr(dut)
@@ -225,8 +229,8 @@ class MmioLoadSizingSpec extends AnyFunSuite {
     compiled.doSim("cacheable-unchanged", seed = 3) { dut =>
       dut.clockDomain.forkStimulus(10)
       quiesceUnusedPorts(dut)
-      val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
-        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false))
+      val mem = m68k040.sim.HotDoorAttach.cold(dut.dcache, dut.clockDomain, AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
+        AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false)))
       for (i <- 0 until 4096) mem.pokeByte(BASE + i, ((i * 3 + 9) & 0xff))
       dut.clockDomain.waitSampling(8)
       val log = watchAr(dut)
@@ -244,6 +248,9 @@ class MmioLoadSizingSpec extends AnyFunSuite {
         p.loadCmdIn.valid #= false
         dut.clockDomain.waitSamplingWhere(p.loadRspOut.valid.toBoolean)
         dut.clockDomain.waitSampling(8)
+        // Non-vacuity: the first access (off=0) is a cold miss on a fresh line and MUST
+        // refill; the later offsets hit that line and emit nothing at all.
+        if (off == 0) assert(log.nonEmpty, "the cold cacheable miss emitted no AR on either door")
         if (log.nonEmpty) {                       // a hit emits nothing at all
           assert(log.length == 1, s"cacheable off=$off emitted ${log.length} transactions")
           assert(log.head._2 == 4, s"cacheable AxSIZE ${log.head._2}, wanted 4")
@@ -258,9 +265,9 @@ class MmioLoadSizingSpec extends AnyFunSuite {
       dut.clockDomain.forkStimulus(10)
       quiesceUnusedPorts(dut)
       // injectBusErrors DECERRs anything outside AxiMemModel.decoded (tasks #189/#211).
-      val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
+      val mem = m68k040.sim.HotDoorAttach.cold(dut.dcache, dut.clockDomain, AxiMemModel.attachFull(dut.dcache.logic.axi, dut.clockDomain,
         AxiMemModelConfig(crossbarSingleOutstanding = true, checkIdUnique = false,
-                          injectBusErrors = true))
+                          injectBusErrors = true)))
       dut.clockDomain.waitSampling(8)
       val p = dut.probe.logic
       val bad = 0x9000_0005L                       // top nibble 9 -> not decoded -> DECERR

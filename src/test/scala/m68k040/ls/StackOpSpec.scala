@@ -63,7 +63,7 @@ class StackOpSpec extends AnyFunSuite {
   test("stack push.l (-(A7), data=imm, A7 write) then pop.l ((A7) load) round trip", VerilatorTest) {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       val s = dut.src.logic
       s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false; s.iStkPush #= false
       s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> LEA path
