@@ -4491,6 +4491,94 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 5)
   }
 
+  // ── Indexed JMP/JSR target forms (CPU_PRF_TRIM_BRIDX coverage) ──────────────
+  // Every shape whose target needs the INDEX register: with CPU_PRF_TRIM_BRIDX=1 these
+  // crack into [T0 := EA (LS AGU)] (+ push) + [ibranch -> (T0)] (fast path) or the
+  // address-generate row of the MI_JMP/MI_JSR µcode program (memory-indirect). Run with
+  // the flag both ways; the cases must lock-step Musashi identically.
+  test("lock-step: bridx jmp (d8,An,Xn.w) sign-extends a word index", VerilatorTest) {
+    runLockStep("bridx-jmp-an-xw",
+      "move.l #0x1234FFFC,%d1 ; lea .L+4,%a0 ; jmp 0(%a0,%d1.w) ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 4)
+  }
+
+  test("lock-step: bridx jmp (d8,An,Xn.l*4) jump-table loop", VerilatorTest) {
+    // 16 iterations over a 4-entry bra.w table (index = d2 & 3): 4 take c3 (6 instr),
+    // 12 take c0..c2 (7 instr). 3 setup + 108 + 1 tail.
+    runLockStep("bridx-jmp-table-loop",
+      "moveq #0,%d0 ; moveq #15,%d2 ; lea tab,%a0 ; " +
+      "lp: move.l %d2,%d1 ; andi.l #3,%d1 ; jmp 0(%a0,%d1.l*4) ; " +
+      "tab: bra.w c0 ; bra.w c1 ; bra.w c2 ; bra.w c3 ; " +
+      "c0: addq.l #1,%d0 ; bra.w nx ; c1: addq.l #2,%d0 ; bra.w nx ; " +
+      "c2: addq.l #4,%d0 ; bra.w nx ; c3: addq.l #8,%d0 ; " +
+      "nx: dbra %d2,lp ; moveq #5,%d5",
+      nInstr = 3 + 4 * 6 + 12 * 7 + 1)
+  }
+
+  test("lock-step: bridx jmp (d8,PC,Xn.w*2) switch", VerilatorTest) {
+    runLockStep("bridx-jmp-pc-xw2",
+      "moveq #0,%d0 ; moveq #2,%d1 ; jmp tb(%pc,%d1.w*2) ; tb: bra.s ca ; bra.s cb ; bra.s cc ; " +
+      "ca: moveq #1,%d0 ; bra.s ce ; cb: moveq #2,%d0 ; bra.s ce ; cc: moveq #3,%d0 ; ce: moveq #7,%d7",
+      nInstr = 6)
+  }
+
+  test("lock-step: bridx jsr (d8,An,Xn.l) ... rts", VerilatorTest) {
+    runLockStep("bridx-jsr-an-xl",
+      "moveq #1,%d0 ; lea fn-16,%a0 ; moveq #16,%d1 ; jsr 0(%a0,%d1.l) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "fn: moveq #3,%d3 ; rts",
+      nInstr = 7)
+  }
+
+  test("lock-step: bridx jsr (d8,A7,Xn.l) reads the PRE-push A7", VerilatorTest) {
+    runLockStep("bridx-jsr-a7-xl",
+      "moveq #1,%d0 ; move.l #fn,%d1 ; sub.l %sp,%d1 ; jsr 0(%sp,%d1.l) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "fn: moveq #3,%d3 ; rts",
+      nInstr = 7)
+  }
+
+  test("lock-step: bridx jsr (d8,PC,Xn.w*8) negative index ... rts", VerilatorTest) {
+    runLockStep("bridx-jsr-pc-xw8",
+      "moveq #1,%d0 ; move.w #-1,%d1 ; jsr fn+8(%pc,%d1.w*8) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "fn: moveq #3,%d3 ; rts",
+      nInstr = 6)
+  }
+
+  test("lock-step: bridx full-format (bd,An,Xn) and base-suppressed (bd.l,Xn) jmp/jsr", VerilatorTest) {
+    // jsr 0x100(a0,d1.w*2) -> full format (bd.w); jmp (t1-4,d1.l) base suppressed:
+    // 0x4EF0 + ext 0x19B0 (D1.L*1, BS=1, bd.l, no memory indirection).
+    runLockStep("bridx-full-format",
+      "lea fn-0x108,%a0 ; moveq #4,%d1 ; jsr 0x100(%a0,%d1.w*2) ; " +
+      ".short 0x4EF0,0x19B0 ; .long t1-4 ; moveq #9,%d0 ; t1: moveq #7,%d2 ; .stop: bra .stop ; " +
+      "fn: moveq #3,%d3 ; rts",
+      nInstr = 3 + 2 + 1 + 1)
+  }
+
+  test("lock-step: bridx memory-indirect jmp/jsr, pre- and post-indexed", VerilatorTest) {
+    // ext 0x1D22 = D1.L*4, bd.w, PRE-index, od.w ; ext 0x1D26 = same, POST-index.
+    // A0=0x2000, D1=1.  pre : ptr @ (0x2000+0+4)      ; target = ptr + 8
+    //                   post: ptr @ (0x2000+0x10)      ; target = ptr + 4 + 8
+    runLockStep("bridx-memind",
+      "lea 0x2000,%a0 ; moveq #1,%d1 ; " +
+      "move.l #t1-8,0x2004 ; .short 0x4EF0,0x1D22,0x0000,0x0008 ; moveq #9,%d0 ; " +
+      "t1: move.l #t2-12,0x2010 ; .short 0x4EF0,0x1D26,0x0010,0x0008 ; moveq #9,%d0 ; " +
+      "t2: move.l #fn-8,0x2004 ; .short 0x4EB0,0x1D22,0x0000,0x0008 ; " +
+      "move.l #fn-12,0x2010 ; .short 0x4EB0,0x1D26,0x0010,0x0008 ; " +
+      "moveq #7,%d2 ; .stop: bra .stop ; " +
+      "fn: addq.l #1,%d3 ; rts",
+      nInstr = 2 + 2 + 2 + 2 + 2 + 2 + 2 + 1)
+  }
+
+  test("lock-step: bridx PC memory-indirect post-indexed jmp/jsr", VerilatorTest) {
+    // 0x4EFB/0x4EBB + ext 0x1D26 (D1.L*4, bd.w, POST-index, od.w); bd = p - ext addr.
+    runLockStep("bridx-pc-memind",
+      "moveq #1,%d1 ; " +
+      ".short 0x4EFB ; e1: .short 0x1D26,p1-e1,0x0008 ; moveq #9,%d0 ; " +
+      "t1: .short 0x4EBB ; e2: .short 0x1D26,p2-e2,0x0008 ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "fn: addq.l #1,%d3 ; rts ; " +
+      ".align 4 ; p1: .long t1-12 ; p2: .long fn-12",
+      nInstr = 1 + 1 + 1 + 2 + 1, seedDside = true)
+  }
+
   // ── real-ROM-bytes repro (Part 19 follow-up, 2026-08-28): the EXACT byte-for-byte
   // ROM encoding of the fault-site JSR+BSRW pair at their REAL absolute PCs, per the
   // task recommendation "build a directed sim repro using the ACTUAL real ROM bytes

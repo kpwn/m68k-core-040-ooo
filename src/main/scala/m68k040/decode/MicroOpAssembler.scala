@@ -3781,7 +3781,15 @@ object MicroOpAssembler {
     //
     // The snapshot carries the base only; the branch still adds its own displacement
     // and index term, so (d16,A7) and (d8,A7,Xn) are covered by the same path.
-    val jsrNeedsSnap = isJsrOp && !jsrBad && srcEa.baseValid &&
+    // CPU_PRF_TRIM_BRIDX: an INDEXED control EA (brief or full-format, non-memind) is
+    // cracked as [T0 := EA (LS AGU, leaGenUop)] + ... + [ibranch -> (T0)], so the branch EU
+    // needs no index read port. The address µop reads the PRE-push A7 for JSR, so it also
+    // subsumes the JSR (A7) snapshot for indexed forms.
+    val brIdxCrack: Bool =
+      if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx)
+        ((isJmpOp && !jmpBad) || (isJsrOp && !jsrBad)) && srcEa.indexValid
+      else False
+    val jsrNeedsSnap = isJsrOp && !jsrBad && srcEa.baseValid && !brIdxCrack &&
                        (srcEa.base === U(15, 5 bits))   // 15 = A7
     val ibrUop = DecodedUop()
     ibrUop.debugBreakValid := False; ibrUop.debugBreakSlot := 0
@@ -3794,16 +3802,17 @@ object MicroOpAssembler {
     ibrUop.size          := Size.LONG
     ibrUop.memOp         := MemOp.NONE
     // base An -- or the pre-push snapshot temp for JSR (A7), see jsrNeedsSnap above
-    ibrUop.srcAReg       := Mux(jsrNeedsSnap, U(T0, 5 bits), srcEa.base)
-    ibrUop.srcAValid     := srcEa.baseValid
+    ibrUop.srcAReg       := Mux(jsrNeedsSnap || brIdxCrack, U(T0, 5 bits), srcEa.base)
+    ibrUop.srcAValid     := srcEa.baseValid || brIdxCrack
     ibrUop.srcBReg       := 0;          ibrUop.srcBValid := False
     // Brief-indexed control EA (task #187): the index register Xn rides srcC, exactly like
     // the LS-EU AGU / LEA's leaGenUop. Non-indexed JMP/JSR leaves indexValid=False -> the
     // branch EU's index term is forced to zero (mirrors the LS EU's psrcCValid gating).
-    ibrUop.srcCReg       := srcEa.indexReg; ibrUop.srcCValid := srcEa.indexValid
+    ibrUop.srcCReg       := srcEa.indexReg
+    ibrUop.srcCValid     := (if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx) False else srcEa.indexValid)
     ibrUop.dstReg        := 0;          ibrUop.dstValid  := False
     ibrUop.useImm        := True
-    ibrUop.imm           := Mux(srcEa.pcRel, ctrlPcRelAddr, srcEa.disp)
+    ibrUop.imm           := Mux(brIdxCrack, B(0, 32 bits), Mux(srcEa.pcRel, ctrlPcRelAddr, srcEa.disp))
     ibrUop.readsNzvc     := False; ibrUop.readsX := False
     ibrUop.writesNzvc    := False; ibrUop.writesX := False
     ibrUop.isBranch      := True;  ibrUop.ibranch := True
@@ -3825,7 +3834,7 @@ object MicroOpAssembler {
     ibrUop.casForm := 0
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
-    ibrUop.firstOfInstr  := !isJsrOp
+    ibrUop.firstOfInstr  := !isJsrOp && !brIdxCrack
     ibrUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // A JMP/JSR with a non-control EA -> illegal (vector 4), like the `bad` path.
@@ -3954,7 +3963,7 @@ object MicroOpAssembler {
     // to the EA effective ADDRESS (psrcA = base An + imm = disp/folded), exactly like
     // JMP's target. (No An postinc — JSR does not pop.)
     // With the JSR (A7) snapshot prepended, the SNAPSHOT is the instruction's first uop.
-    val jsrPush = pushUop(A7, nextPc.asBits, first = !jsrNeedsSnap)
+    val jsrPush = pushUop(A7, nextPc.asBits, first = !jsrNeedsSnap && !brIdxCrack)
     val jsrSnap = movemSnapUop(
       dst = U(T0, 5 bits), src = U(A7, 5 bits), valid = pkt.valid,
       pc = pkt.pc, lenWords = pkt.lenWords)
@@ -4165,6 +4174,8 @@ object MicroOpAssembler {
     // one path instead of a carve-out per mode. Aliased rather than re-instantiated so the
     // EA datapath is not duplicated.
     val fsvAddrUop  = peaAddr
+    // CPU_PRF_TRIM_BRIDX: the indexed JMP/JSR target address µop is the same T0 address-gen.
+    val brIdxAddr   = peaAddr
     val fsvIsSysOp  = (spec.sysKind === SysKind.FSAVE) || (spec.sysKind === SysKind.FRESTORE)
     // Cracks whenever the address must be COMPUTED -- the same EA property as
     val fsvCracks = fsvIsSysOp && !srcEa.baseDirect
@@ -4371,8 +4382,9 @@ object MicroOpAssembler {
       }
     } elsewhen(isJmpOp) {
       // JMP -> a single indirect branch to the EA address (bad EA forced illegal above).
-      cnt   := 1
-      out.uops(0) := Mux(jmpBad, opUop, ibrUop)
+      // CPU_PRF_TRIM_BRIDX indexed EA: [T0 := EA] + [ibranch -> (T0)].
+      cnt   := Mux(brIdxCrack, U(2, 2 bits), U(1, 2 bits))
+      out.uops(0) := Mux(jmpBad, opUop, Mux(brIdxCrack, brIdxAddr, ibrUop))
       out.uops(1) := Mux(jmpBad, opUop, ibrUop)
     } elsewhen(fsvCracks) {
       // FSAVE/FRESTORE <computed ea> -> [T0 := EA] + [the sysOp reading T0].
@@ -4383,10 +4395,11 @@ object MicroOpAssembler {
       // JSR -> [push.l retPC -> -(A7)] + [ibranch -> EA addr]. Bad EA -> illegal.
       // JSR (A7) additionally prepends [T0 := A7] so the branch sees the PRE-push
       // base (see jsrNeedsSnap). Only that degenerate form pays the third uop.
+      // CPU_PRF_TRIM_BRIDX indexed EA: [T0 := EA] + [push] + [ibranch -> (T0)].
       cnt   := Mux(jsrBad, U(1, 2 bits),
-                     Mux(jsrNeedsSnap, U(3, 2 bits), U(2, 2 bits)))
-      out.uops(0) := Mux(jsrBad, opUop, Mux(jsrNeedsSnap, jsrSnap, jsrPush))
-      out.uops(1) := Mux(jsrBad, opUop, Mux(jsrNeedsSnap, jsrPush, ibrUop))
+                     Mux(jsrNeedsSnap || brIdxCrack, U(3, 2 bits), U(2, 2 bits)))
+      out.uops(0) := Mux(jsrBad, opUop, Mux(brIdxCrack, brIdxAddr, Mux(jsrNeedsSnap, jsrSnap, jsrPush)))
+      out.uops(1) := Mux(jsrBad, opUop, Mux(jsrNeedsSnap || brIdxCrack, jsrPush, ibrUop))
       out.uops(2) := ibrUop
     } elsewhen(isBsr) {
       // BSR -> [push.l retPC -> -(A7)] + [bra pc+2+disp].

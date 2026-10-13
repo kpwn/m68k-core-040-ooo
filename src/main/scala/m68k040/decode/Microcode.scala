@@ -1574,6 +1574,8 @@ object Microcode {
     Desc(UMiPushFinal, mem = MStore, srcA = SA7, srcB = ST1, dst = SA7,
          sz = SzLong, keepCommit = true, isLast = true),                        // µPC195
 
+    // CPU_PRF_TRIM_BRIDX swaps rows 196..200 for `romP6JmpJsrTrim` (same row count).
+  ) ++ (if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx) romP6JmpJsrTrim else Vector(
     // MI_JMP_ENTRY @196 (rows 196,197): ptr-load -> T0, ibranch to T0+od(+post-idx).
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
          sz = SzLong, miPtrIndex = true, isFirst = true),                       // µPC196
@@ -1589,7 +1591,25 @@ object Microcode {
          sz = SzLong, miPtrIndex = true),                                       // µPC199
     Desc(UMiBranchFinal, srcA = ST0, useImm = true, imm = SMiOd,
          sz = SzLong, miHostIndex = true, isLast = true)                        // µPC200
+  ))
+  /** CPU_PRF_TRIM_BRIDX layout of rows 196..200: the branch EU has no index read port, so
+    * the final address (T0+od(+post-idx)) is formed by an LS address-generate row into T0
+    * and the ibranch jumps to (T0). JSR enters at 196 (the push), JMP one row later at 197;
+    * DecodeStage marks row 197 firstOfInstr for JMP (`miJmpTrimFirstRow`). Row 200 is an
+    * unreachable copy of row 199. */
+  private def romP6JmpJsrTrim: Vector[Desc] = Vector(
+    Desc(UMiPushFinal, mem = MStore, srcA = SA7, useImm = true, imm = SRetPc, dst = SA7,
+         sz = SzLong, isFirst = true),                                          // µPC196 (JSR entry)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true),                                       // µPC197 (JMP entry)
+    Desc(UMiLeaFinal, srcA = ST0, dst = ST0, useImm = true, imm = SMiOd,
+         sz = SzLong, miHostIndex = true),                                      // µPC198
+    Desc(UMiBranchFinal, srcA = ST0, sz = SzLong, isLast = true),               // µPC199
+    Desc(UMiBranchFinal, srcA = ST0, sz = SzLong, isLast = true)                // µPC200 (unreachable)
   )
+  /** Row 197 with firstOfInstr set: substituted by DecodeStage when the program is a JMP. */
+  val miJmpTrimFirstRow: Desc = Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true,
+    imm = SEaDispLo, sz = SzLong, miPtrIndex = true, isFirst = true)
   private def romP7(): Vector[Desc] = Vector(
     // ════════════════════════════════════════════════════════════════════════
     // Bit-field MEMORY-INDIRECT, DYNAMIC offset (Do=1) RMW/INS + the BFINS static-offset
@@ -2481,8 +2501,8 @@ object Microcode {
   val UNPK_MEM_ENTRY = 172 // rows 172..177 (load Ay/predec, UNPK compute, store lo, shift, store hi)
   val MI_LEA_ENTRY = 191 // rows 191,192 (ptr-load, T0+od(+post-idx) -> An)
   val MI_PEA_ENTRY = 193 // rows 193..195 (ptr-load, T0+od(+post-idx) -> T1, push T1 -> -(A7))
-  val MI_JMP_ENTRY = 196 // rows 196,197 (ptr-load, ibranch T0+od(+post-idx))
-  val MI_JSR_ENTRY = 198 // rows 198..200 (push retPC -> -(A7), ptr-load, ibranch T0+od(+post-idx))
+  val MI_JMP_ENTRY = if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx) 197 else 196 // rows 196,197 (ptr-load, ibranch T0+od(+post-idx))
+  val MI_JSR_ENTRY = if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx) 196 else 198 // rows 198..200 (push retPC -> -(A7), ptr-load, ibranch T0+od(+post-idx))
   def romSize: Int = rom.size
 
   // LUT-reduction Task A2: the real `Mem(DescBits(), romSize)` (built from `descToBits`,
