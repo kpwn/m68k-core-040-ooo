@@ -38,7 +38,10 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
                   // that builds a DecodeStage sees the same value as SHIPPING_CONFIG prints.
                   pair3p1: Boolean = m68k040.top.ShippingCoreConfig.decodePair3p1,
                   /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME). Cycle-identical. */
-                  feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
+                  feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
+                  /** `ShippingCoreConfig.alignMaskNoRst` (CPU_ALIGN_MASK_NORST): apply the
+                    * aligner's slot-1 zero-fill on the registered side of `raw`. */
+                  alignMaskNoRst: Boolean = m68k040.top.ShippingCoreConfig.alignMaskNoRst) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
                                        with FpImmTableService with FpTrapImmediateService
                                        with m68k040.services.DecodeRasSnapService {
 
@@ -266,9 +269,21 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `df.feed.payload(i)` / `df.slot1Valid` (combinational aligner output) to
     // `raw.payload.*` (the registered copy of those exact bits, one cycle later).
     val fedIn = Stream(FedPacket())
+    // CPU_ALIGN_MASK_NORST: the aligner registers slot-1 words unmasked; zero words at
+    // index >= lenWords of a simple packet here (one LUT on the raw->fedIn/computeOffload
+    // side) instead of a synchronous clear on the `raw` word flops.
+    val rawPkt1 = if (!alignMaskNoRst) raw.payload.packets(1) else {
+      val m = CombInit(raw.payload.packets(1))
+      for (i <- 1 until m.words.length) {
+        when(raw.payload.packets(1).simple && (raw.payload.packets(1).lenWords <= U(i))) {
+          m.words(i) := 0
+        }
+      }
+      m
+    }
     fedIn.valid              := raw.valid
     fedIn.payload.packets(0) := raw.payload.packets(0)
-    fedIn.payload.packets(1) := raw.payload.packets(1)
+    fedIn.payload.packets(1) := rawPkt1
     fedIn.payload.slot1Valid := raw.payload.slot1Valid
     // ANGLE E + LEVER 2 offload: compute the per-slot Offload (OpSpec + srcEa/dstEa EAs)
     // on the pre-`fed` packet (now the `raw` register's output rather than the raw aligner
@@ -278,7 +293,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // one cycle later is bit-identical — this lever is a pure LATENCY change, no computed
     // value differs.
     fedIn.payload.specs(0)   := MicroOpAssembler.computeOffload(raw.payload.packets(0))
-    fedIn.payload.specs(1)   := MicroOpAssembler.computeOffload(raw.payload.packets(1))
+    fedIn.payload.specs(1)   := MicroOpAssembler.computeOffload(rawPkt1)
     raw.ready := fedIn.ready
 
     // LEVER C, design §8 Q4: `packets` IS re-registered into `fed` (rather than letting
