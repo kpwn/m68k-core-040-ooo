@@ -679,7 +679,7 @@ object ShippingCoreConfig {
   /** Int PRF read-port cut 2(b): delete DivEu's `rdH` (psrcC) port; a CPLX uop with a valid
     * third source reads it through `rdA` in one extra issue cycle. Default OFF.
     * Read by `DivEuPlugin`. */
-  val prfTrimDivH: Boolean = envFlag("CPU_PRF_TRIM_DIVH", false)
+  val prfTrimDivH: Boolean = envFlag("CPU_PRF_TRIM_DIVH", true)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
