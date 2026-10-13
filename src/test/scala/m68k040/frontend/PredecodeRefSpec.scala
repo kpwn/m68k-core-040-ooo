@@ -294,16 +294,22 @@ class PredecodeRefSpec extends AnyFunSuite {
         f"static bit-op tt=$tt pcReg=$pcReg op=0x$op%04x")
     }
   }
-  test("NBCD register partition is exactly 0x4800-0x4807; memory forms stay deferred") {
+  test("NBCD register partition is exactly 0x4800-0x4807; memory forms are the RMW framing") {
     for (dn <- 0 until 8) {
       val op = 0x4800 | dn
       assert(classify(op) == cp(true, 1), f"NBCD D$dn op=0x$op%04x")
     }
-    // Mode 001 at 0x4808-0x480f is LINK.L on 020+, not NBCD. The actual NBCD
-    // memory-EA modes 2..7 are a separate unimplemented RMW/microcode slice.
-    for (mode <- 2 until 8) {
-      val op = 0x4800 | (mode << 3)
-      assert(classify(op) == cp(false, 0), f"deferred NBCD memory mode=$mode op=0x$op%04x")
+    // Mode 001 at 0x4808-0x480f is LINK.L on 020+, not NBCD. NBCD <ea> memory modes
+    // take the TAS-style memory-alterable RMW framing (opword + EA ext words).
+    for ((mode, reg, len) <- Seq((2, 0, 1), (3, 0, 1), (4, 0, 1), (5, 0, 2), (6, 0, 2),
+                                 (7, 0, 2), (7, 1, 3))) {
+      val op = 0x4800 | (mode << 3) | reg
+      assert(classify(op) == cp(true, len), f"NBCD memory mode=$mode reg=$reg op=0x$op%04x")
+    }
+    // Not memory-alterable: PC-relative, #imm and the reserved mode-7 registers.
+    for (reg <- 2 until 8) {
+      val op = 0x4838 | reg
+      assert(classify(op) == cp(false, 0), f"NBCD mode=7 reg=$reg op=0x$op%04x")
     }
   }
   test("LINK.L partition is exactly 0x4808-0x480f and carries disp32") {
@@ -312,9 +318,9 @@ class PredecodeRefSpec extends AnyFunSuite {
       assert(classify(op) == cp(true, 3), f"LINK.L A$an,#disp32 op=0x$op%04x")
     }
     // Pin both partition boundaries: the preceding eight words are NBCD Dn and the
-    // following word starts the still-deferred NBCD memory-EA partition.
+    // following word starts the NBCD memory-EA partition ((A0): opword only).
     assert(classify(0x4807) == cp(true, 1))
-    assert(classify(0x4810) == cp(false, 0))
+    assert(classify(0x4810) == cp(true, 1))
   }
   test("68020+ TST An partition admits WORD/LONG only and no write-capable unary op") {
     for {

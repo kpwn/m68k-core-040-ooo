@@ -321,6 +321,13 @@ object PredecodeWord {
               // so the aligner's `avail < L0` stall always terminates.
               r.lenWords := (U(1, 3 bits) +^ immWords +^ mext).resized
               r.ambiguousLine := mamb
+            } elsewhen(opmode === 6 && mode === 7 && (reg === 2 || reg === 3)) {
+              // CMPI #imm,(d16,PC) / (d8,PC,Xn) (68020+): read-only, so PC-relative is legal.
+              val (pok, pext, pamb) = eaExt(mode, reg, False, allowImm = false, immDstEaW, immDstEaKnown)
+              when(pok) {
+                r.lenWords := (U(1, 3 bits) +^ immWords +^ pext).resized
+                r.ambiguousLine := pamb
+              }
             }
           }
           // SR dest (mode7/reg4 .W) / out-of-scope EAs -> COMPLEX (deferred)
@@ -745,6 +752,15 @@ object PredecodeWord {
           when(mok) {
             r.lenWords := (U(1, 3 bits) + mext).resized
             r.ambiguousLine := mamb
+          } elsewhen(u4o === U(0xA, 4 bits) && u4mode === U(7, 3 bits) &&
+                     ((op(2 downto 0) === B"3'b010") || (op(2 downto 0) === B"3'b011"))) {
+            // TST (d16,PC) / (d8,PC,Xn) (68020+): TST never writes its operand.
+            val (tok, text, tamb) = eaExt(u4mode, op(2 downto 0).asUInt, u4ss === U(2, 2 bits),
+                                          allowImm = false, extW, extWKnown)
+            when(tok) {
+              r.lenWords := (U(1, 3 bits) + text).resized
+              r.ambiguousLine := tamb
+            }
           }
         }
         // TST.W/TST.L An (68020+, task #170-cluster10): mode=001 (An-direct) is a
@@ -764,7 +780,9 @@ object PredecodeWord {
         // isUnaryMem but keyed off the full fixed opcode (not o4/ss, which collide with
         // TST at mode=000 only -- irrelevant here since mode is forced non-zero).
         val isTasMem = (op(15 downto 6) === B"10'b0100101011") && (u4mode =/= U(0, 3 bits))
-        when(isTasMem) {
+        // NBCD <ea> memory RMW: same framing as TAS-mem (mode >= 2; mode 1 = LINK.L).
+        val isNbcdMem = (op(15 downto 6) === B"10'b0100100000") && (u4mode >= U(2, 3 bits))
+        when(isTasMem || isNbcdMem) {
           val (mok, mext, mamb) = memDestExt(u4mode, op(2 downto 0).asUInt, extW, extWKnown)   // EA is op+1
           when(mok) {
             r.lenWords := (U(1, 3 bits) + mext).resized

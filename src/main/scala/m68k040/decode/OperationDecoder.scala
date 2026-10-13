@@ -432,7 +432,10 @@ object OperationDecoder {
         // is the .B-merge upper-24 source (sizeMerged always reads s1Src1), srcB supplies
         // the byte operand for AluEuPlugin's dedicated NBCD correction. Its oracle
         // flags are not identical to SBCD(0,Dn,X), especially in the no-change case.
-        when(opword(15 downto 3) === B"13'b0100100000000") {
+        // NBCD <ea> (mode >= 2; mode 1 is LINK.L): the same generic load-op-store RMW
+        // crack as TAS <ea> (srcA=srcB=EASRC both read the loaded byte T0).
+        when((opword(15 downto 3) === B"13'b0100100000000") ||
+             ((opword(15 downto 6) === B"10'b0100100000") && (opword(5 downto 3).asUInt >= 2))) {
           o.illegal := False
           o.op := DecOp.NBCD; o.size := Size.BYTE
           o.srcA := easrc; o.srcB := easrc; o.dst := easrc; o.dstWrites := True
@@ -567,9 +570,15 @@ object OperationDecoder {
         // can even emit those encodings -- tracked, not fixed here.
         val mmMode4 = opword(5 downto 3)
         val mmReg4  = opword(2 downto 0)
-        val movemEaOk = (mmMode4.asUInt >= 2 && mmMode4.asUInt <= 5) ||
-                        (mmMode4 === B"3'b111" && mmReg4.asUInt <= 2) ||
-                        (mmMode4 === B"3'b111" && mmReg4 === B"3'b011") ||  // (d8,PC,Xn), .W and .L
+        // Direction-aware (opword(10): 1 = memory-to-register): (An)+ is load-only, -(An)
+        // store-only, and the PC-relative modes are load-only; anything else stays
+        // illegal (vector 4), as on the 68040.
+        val mmLoad  = opword(10)
+        val movemEaOk = (mmMode4 === B"3'b010") || (mmMode4 === B"3'b101") ||
+                        (mmMode4 === B"3'b011" && mmLoad) ||
+                        (mmMode4 === B"3'b100" && !mmLoad) ||
+                        (mmMode4 === B"3'b111" && mmReg4.asUInt <= 1) ||
+                        (mmMode4 === B"3'b111" && (mmReg4 === B"3'b010" || mmReg4 === B"3'b011") && mmLoad) ||
                         (mmMode4 === B"3'b110")                             // (d8,An,Xn) LOAD+STORE, .W and .L
         when(opword(11) && (opword(9 downto 7) === B"001") && movemEaOk) {
           o.illegal := False

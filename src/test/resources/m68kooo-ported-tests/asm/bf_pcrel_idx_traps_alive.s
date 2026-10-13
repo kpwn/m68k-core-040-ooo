@@ -1,24 +1,18 @@
 | bf_pcrel_idx_traps_alive.s — PC-indexed / full-format-PC bitfield
-| reads: fail-SAFE contract.
+| reads.
 |
-| Companion to bf_pcrel_read.s (which covers the now-implemented plain
-| (d16,PC) read shapes and the architecturally-illegal RMW × PC-rel
-| trap).  The shapes here are ARCHITECTURALLY LEGAL read EAs that the
-| decoder does not implement yet:
+| Companion to bf_pcrel_read.s (which covers the plain (d16,PC) read
+| shapes and the architecturally-illegal RMW x PC-rel trap).  The shapes
+| here are ARCHITECTURALLY LEGAL read EAs:
 |
-|   1. brief-format (d8,PC,Xn)
-|   2. full-format (bd,PC,Xn) no-memind
-|   3. full-format ([bd,PC,Xn],od) memind pre-indexed
+|   1. brief-format (d8,PC,Xn)                  -- implemented: value check
+|   2. full-format (bd,PC,Xn) no-memind         -- implemented: value check
+|   3. full-format ([bd,PC,Xn],od) memind pre-indexed, STATIC offset
+|      -- not implemented: must raise a precise, recoverable vec-4 trap
+|      (never wedge) and execution continues.
 |
-| The contract this test pins is fail-SAFE, not fail-correct: each must
-| raise a precise, recoverable vec-4 ILLEGAL trap — the core must NOT
-| wedge (a hang is unrecoverable; a trap the OS can catch and report).
-| The isa_status.md TODO(bf-pcrel) note claimed these shapes "wedge the
-| core"; this test is the standing evidence that they trap cleanly and
-| execution continues.
-|
-| When real support for a shape lands, WIDEN this test: replace its
-| trap-expect with a value check (never delete the case).
+| When real support for case 3 lands, WIDEN it: replace its trap-expect
+| with a value check (never delete the case).
 |
 | PASS sentinel: 0xC0FFEE00 -> 0xFFFF0000.  FAIL: 0xDEADBEEF.
 
@@ -29,33 +23,42 @@ _start:
     lea     0x00010000, %a7
     move.l  #_ill_handler, 0x00000010
     moveq   #0, %d6              | vec-4 trap counter
-    moveq   #0, %d3              | index reg for the encoded shapes
+    moveq   #0, %d3              | index reg
 
-    | ---- Case 1: brief-format (d8,PC,Xn) read -> vec 4, continue ----
+    | ---- Case 1: brief-format (d8,PC,Xn) read -> 0x81 ----
     lea     _c1(%pc), %a5
+    moveq   #0, %d0
     bfextu  _bfdat(%pc,%d3.l){#0:#8}, %d0
 _c1:
-    cmp.l   #1, %d6
+    tst.l   %d6
+    bne     _fail
+    cmp.l   #0x81, %d0
     bne     _fail
 
-    | ---- Case 2: full-format (bd.w,PC,Xn.w) no-memind -> vec 4 ----
-    | ext: 0x3120 = D3, Xn.W, x1, full-format, BS=0, IS=0, bd.w,
-    | I/IS=000.  Descriptor 0x0008 = static {0:8}.
+    | ---- Case 2: full-format (0x100,PC,D3.W) no-memind -> 0x81 ----
+    | D3 = _bfdat - (_e2 + 0x100), so the EA lands exactly on _bfdat.
+    lea     _bfdat, %a1
+    lea     _e2+0x100, %a2
+    sub.l   %a2, %a1
+    move.l  %a1, %d3
     lea     _c2(%pc), %a5
-    .word   0xE9FB, 0x0008, 0x3120, 0x0100
+    moveq   #0, %d0
+    .word   0xE9FB, 0x0008
+_e2:
+    .word   0x3120, 0x0100
 _c2:
-    cmp.l   #2, %d6
+    tst.l   %d6
+    bne     _fail
+    cmp.l   #0x81, %d0
     bne     _fail
 
-    | ---- Case 3: full-format ([bd.w,PC,Xn.w]) memind pre-idx -> vec 4 ----
-    | ext: 0x3121 = same but I/IS=001 (pre-indexed memind, od=null).
+    | ---- Case 3: full-format memind pre-indexed, static offset -> vec 4 ----
     lea     _c3(%pc), %a5
     .word   0xE9FB, 0x0008, 0x3121, 0x0100
 _c3:
-    cmp.l   #3, %d6
+    cmp.l   #1, %d6
     bne     _fail
 
-    | ---- Still alive: a plain (d16,PC) read executes correctly ----
     bfextu  _bfdat(%pc){#4:#8}, %d0
     cmp.l   #0x12, %d0
     bne     _fail

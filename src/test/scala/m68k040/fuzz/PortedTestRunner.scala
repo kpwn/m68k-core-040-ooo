@@ -76,7 +76,9 @@ object PortedTestRunner {
         probe: PostureProbe = null, allowBkptCompletion: Boolean = true,
         dcfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig(),
         onDut: FuzzCoreDut => Unit = null,
-        liveness: Boolean = LsLivenessMonitor.enabledByEnv): PortedOutcome = {
+        liveness: Boolean = LsLivenessMonitor.enabledByEnv,
+        onFinish: (Long => Int) => Unit = null,
+        stallWatch: (Long, Long) = null): PortedOutcome = {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
       case Left(err) => return PortedGenFail(s"assemble: ${err.reason}")
@@ -854,10 +856,18 @@ object PortedTestRunner {
       var cyc = 0L
       var word = 0L
       val progressAddress = sys.env.get("PORTED_PROGRESS_ADDR").map(java.lang.Long.decode(_).longValue)
-      while (word == 0 && !bkptFired && cyc < timeoutCycles &&
+      // Optional stall watch (addr, cycles): stop early when the 32-bit word at `addr`
+      // has not changed for `cycles` cycles (a program that publishes its progress there).
+      var stallVal = -1L; var stallSince = 0L; var stalled = false
+      while (word == 0 && !bkptFired && cyc < timeoutCycles && !stalled &&
              (liveMon == null || liveMon.failure.isEmpty)) {
         cd.waitSampling()
         cyc += 1
+        if (stallWatch != null && (cyc & 0xffL) == 0L) {
+          val v = (0 until 4).foldLeft(0L)((acc, o) => (acc << 8) | (dmem.mem.read(stallWatch._1 + o).toLong & 0xffL))
+          if (v != stallVal) { stallVal = v; stallSince = cyc }
+          else if (cyc - stallSince >= stallWatch._2) stalled = true
+        }
         val b0 = dmem.mem.read(SentinelAddr).toLong & 0xffL
         val b1 = dmem.mem.read(SentinelAddr + 1).toLong & 0xffL
         val b2 = dmem.mem.read(SentinelAddr + 2).toLong & 0xffL
@@ -877,6 +887,9 @@ object PortedTestRunner {
         }
       }
       if (liveMon != null) liveMon.failure.foreach { f => println(f); lastLivenessFailure = Some(f) }
+      // Optional post-run D-side memory readback (byte reader), for programs that leave a
+      // result table in memory. Default null => unchanged.
+      if (onFinish != null) onFinish(a => dmem.mem.read(a).toInt & 0xff)
       flushWalkHoles()
       if (d4Mon != null) println(d4Mon.summary + d4Mon.details(2).replace("\n", " ||"))
       // Opt-in cycle report for A/B timing of directed programs (no effect on the outcome).

@@ -3,13 +3,16 @@
 | load).  Pinned by the 2026-07-15 v2_cc2_ea_ok_f3 fire-gate fix:
 |   PRM-illegal modes  : Dn, An, (An)+, -(An), #imm  (Musashi also
 |                        ILLEGALs these — §4.39 control class only)
-|   fail-safe follow-up: brief-indexed, memind, PC-indexed brief,
-|                        full-format no-memind — legal 68020+ EAs whose
-|                        EA-compute crack is not yet implemented; the
-|                        old gate admitted them with a WRONG EA.
+|   fail-safe          : memory-indirect ([bd,An]) — a legal 68020+ EA
+|                        the CMP2 crack does not implement.
+|   LEGAL (2026-10-13) : brief-indexed, PC-indexed brief, full-format
+|                        no-memind now execute (the bound loads carry
+|                        the index and the full-format bd); they must
+|                        NOT trap — values are lock-stepped in
+|                        ExecuteLockStepSpec "decl CMP2/CHK2 indexed".
 | Each case arms a continuation label in A5; the vec-4 handler counts
 | the trap in D5 and resumes there.  Reaching the instruction after a
-| case without trapping means the decoder executed it — FAIL.
+| trapping case without trapping means the decoder executed it — FAIL.
 |
 | PASS: 0xC0FFEE00.  FAIL: 0xDEADBEEF.
 
@@ -45,22 +48,20 @@ _c5:
     bra     _fail
 _c6:
     lea     _c7, %a5
-    cmp2.l  (0,%a0,%d0.l), %d1        | brief indexed
-    bra     _fail
+    cmp2.l  (0,%a0,%d0.l), %d1        | brief indexed: LEGAL, executes (no trap)
 _c7:
     lea     _c8, %a5
     cmp2.l  ([0,%a0]), %d1            | full-format memind
     bra     _fail
 _c8:
     lea     _c9, %a5
-    .word   0x04FB, 0x1000, 0x0000    | cmp2.l (0,%pc,%d0.w), %d1 (PC-idx)
-    bra     _fail
+    .word   0x04FB, 0x1000, 0x0000    | cmp2.l (0,%pc,%d0.w), %d1 (PC-idx): LEGAL
 _c9:
     lea     _c10, %a5
-    .word   0x04F0, 0x1000, 0x0160, 0x0010  | cmp2.l (16,%a0) full-format
-    bra     _fail                            | (ext[8]=1, IS=1, bd.W)
+    .word   0x04F0, 0x1000, 0x0160, 0x0010  | cmp2.l (16,%a0) full-format: LEGAL
+                                             | (ext[8]=1, IS=1, bd.W)
 _c10:
-    cmp.l   #9, %d5                   | all nine must have trapped
+    cmp.l   #6, %d5                   | the six non-control / memory-indirect shapes trap
     bne     _fail
 
     | PASS

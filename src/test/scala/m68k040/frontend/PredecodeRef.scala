@@ -103,6 +103,9 @@ object PredecodeRef {
           else if (mode == 0) CP(simple = true, lenWords = 1 + immWords)  // data-reg dest
           else memDestExt(mode, reg) match {                      // mem-dest RMW (imm + EA ext)
             case Some(e) => CP(simple = true, lenWords = 1 + immWords + e)
+            // CMPI #imm,(d16,PC)/(d8,PC,Xn): read-only, legal on the 68020+ (brief model)
+            case None if opmode == 6 && mode == 7 && (reg == 2 || reg == 3) =>
+              CP(simple = true, lenWords = 1 + immWords + 1)
             case None    => COMPLEX                               // SR / out-of-scope -> deferred
           }
         } else if (isDynBit || isStatBit) {
@@ -264,6 +267,8 @@ object PredecodeRef {
         val isUnaryMem = ((op >> 8) & 1) == 0 && u4ss != 3 && u4mode != 0 &&
                          (u4o == 0 || u4o == 2 || u4o == 4 || u4o == 6 || u4o == 0xA)
         val isTasMem = ((op >> 6) & 0x3ff) == 0x12b && u4mode != 0
+        // NBCD <ea> memory RMW (mode >= 2; mode 1 is LINK.L 0x4808-0x480F)
+        val isNbcdMem = ((op >> 6) & 0x3ff) == 0x120 && u4mode >= 2
         // LINK An,#disp16 (op[15:4]==0x4E5, op[3]=0): opword + disp16 -> simple len 2.
         // UNLK An (op[3]=1): single word -> simple len 1. (bit6=1 here -> not isChk.)
         val isLink = (op & 0xfff8) == 0x4e50
@@ -276,8 +281,14 @@ object PredecodeRef {
         else if (isUnlk) CP(simple = true, lenWords = 1)
         else if (isTrap || isTrapv || isRts || isRtr || isNop) CP(simple = true, lenWords = 1)
         else if (isUnary) CP(simple = true, lenWords = 1)
-        else if (isUnaryMem || isTasMem) memDestExt(u4mode, op & 7) match {
+        else if (isUnaryMem || isTasMem || isNbcdMem) memDestExt(u4mode, op & 7) match {
           case Some(e) => CP(simple = true, lenWords = 1 + e)
+          // TST (d16,PC)/(d8,PC,Xn) (68020+): read-only
+          case None if isUnaryMem && ((op >> 8) & 0xf) == 0xA && u4mode == 7 && ((op & 7) == 2 || (op & 7) == 3) =>
+            eaExt(u4mode, op & 7, ((op >> 6) & 3) == 2, allowImm = false) match {
+              case Some(e) => CP(simple = true, lenWords = 1 + e)
+              case None    => COMPLEX
+            }
           case None    => COMPLEX
         }
         else if (isChk) {

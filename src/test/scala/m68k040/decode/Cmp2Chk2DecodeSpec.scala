@@ -156,29 +156,29 @@ class Cmp2Chk2DecodeSpec extends AnyFunSuite {
     }
   }
 
-  // ── Fail-safe: architecturally LEGAL control EAs the crack does not implement ──
-  // `b9d0781` forces mode 6 ((d8,An,Xn), brief AND full-format) and mode 7/reg 3
-  // ((d8,PC,Xn)) illegal via `MicroOpAssembler.c2IndexedShape`. Both are §4.39-legal
-  // CMP2/CHK2 control EAs; `EaDecoder` classifies them MEMSIMPLE (they are supported
-  // for the GENERIC ALU/MOVE crackLoad AGU), so without this gate the crack would
-  // admit them and compute a WRONG address for the full-format shapes. A clean vec-4
-  // is the fail-safe. These two cases pin that contract at decode level — the ported
-  // `chk2_cmp2_illegal_ea_traps.s` (`_c6`, `_c8`) pins the same thing end-to-end, and
-  // the contradicting `ExecuteLockStepSpec` "CMP2.W (d8,An,Xn) indexed bounds pointer"
-  // case (written against the PRE-b9d0781 contract, failing ever since) was removed
-  // in favour of these. DELETE these two when task #257 implements the EA compute.
-  test("assembler: CMP2 with (d8,An,Xn) EA (mode 6) -> illegal (fail-safe, not implemented)", VerilatorTest) {
-    // 0x02F0 = ss=01 (.W), mode 6, reg 0 -> (d8,A0,Xn). w2 = brief-format ext word.
+  // ── Indexed control EAs: (d8,An,Xn) / (d8,PC,Xn) are LEGAL CMP2/CHK2 bounds EAs ──
+  // The two bound loads carry the index on srcC (indexLong/indexScale from the decoded
+  // EA) and fold the displacement (PC-relative: pc+4+d8) into imm, like every other
+  // indexed load; values are checked end-to-end by the ExecuteLockStepSpec
+  // "decl CMP2/CHK2 indexed" case.
+  test("assembler: CMP2 with (d8,An,Xn) EA (mode 6) -> 3-uop crack, index on srcC", VerilatorTest) {
+    // 0x02F0 = ss=01 (.W), mode 6, reg 0 -> (d8,A0,Xn). w2 = brief ext: D2.W*1, d8=0.
     runAsm { dut => drive(dut, 0x02F0, ext(0, 1, 0), w2 = 0x2000, len = 3); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean && dut.uop0.faulted.toBoolean &&
-             dut.uop0.faultVector.toInt == 4, "(d8,An,Xn) -> fail-safe illegal vec4")
+      assert(!dut.uop0.unimplemented.toBoolean && !dut.uop0.faulted.toBoolean, "(d8,An,Xn) is legal")
+      assert(dut.count.toInt == 3, "3-uop crack")
+      assert(dut.uop0.srcAValid.toBoolean && dut.uop0.srcCValid.toBoolean && dut.uop0.srcCReg.toInt == 2,
+             "lower load: base A0 + index D2")
+      assert(dut.uop1.srcCValid.toBoolean && dut.uop1.srcCReg.toInt == 2, "upper load carries the index too")
     }
   }
-  test("assembler: CMP2 with (d8,PC,Xn) EA (mode 7 reg 3) -> illegal (fail-safe, not implemented)", VerilatorTest) {
-    // 0x02FB = ss=01 (.W), mode 7, reg 3 -> (d8,PC,Xn). w2 = brief-format ext word.
-    runAsm { dut => drive(dut, 0x02FB, ext(0, 1, 0), w2 = 0x2000, len = 3); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean && dut.uop0.faulted.toBoolean &&
-             dut.uop0.faultVector.toInt == 4, "(d8,PC,Xn) -> fail-safe illegal vec4")
+  test("assembler: CMP2 with (d8,PC,Xn) EA (mode 7 reg 3) -> pc+4+d8 + index", VerilatorTest) {
+    // 0x02FB = ss=01 (.W), mode 7, reg 3 -> (d8,PC,Xn). w2 = brief ext: D2.W*1, d8=0x10.
+    runAsm { dut => drive(dut, 0x02FB, ext(0, 1, 0), w2 = 0x2010, len = 3); sleep(1)
+      assert(!dut.uop0.unimplemented.toBoolean && !dut.uop0.faulted.toBoolean, "(d8,PC,Xn) is legal")
+      assert(!dut.uop0.srcAValid.toBoolean, "PC base folded into imm")
+      assert((dut.uop0.imm.toLong & 0xffffffffL) == 0x2014L, "lower = pc+4+d8")
+      assert((dut.uop1.imm.toLong & 0xffffffffL) == 0x2016L, "upper = lower + 2")
+      assert(dut.uop0.srcCValid.toBoolean && dut.uop0.srcCReg.toInt == 2, "index D2")
     }
   }
   // The NON-indexed control modes next to them must stay LEGAL — otherwise the gate

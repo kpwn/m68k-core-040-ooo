@@ -1044,12 +1044,17 @@ object MicroOpAssembler {
     val l0EaIsIdx  = op(5 downto 3) === B"3'b110"
     val l0ExtW     = Mux(immIsLong, pkt.words(3), pkt.words(2))   // the EA's REAL ext word
     val l0IsMemInd = l0ExtW(8) && (l0ExtW(2 downto 0) =/= B"3'b000")
-    val l0Fixup    = opIsLineImm && l0EaIsIdx
+    // CMPI #imm,(d8,PC,Xn)/(bd,PC,Xn) (read-only, 68020+) has the same hazard: its
+    // brief/full format and BS bit must come from the real ext word, not the immediate.
+    val l0EaIsPcIdx = op(5 downto 0) === B"6'b111011"
+    val l0Fixup    = opIsLineImm && (l0EaIsIdx || l0EaIsPcIdx)
     // For mode 6 `EaDecoder` yields MEMSIMPLE or MEMINDIRECT and nothing else, so
     // "is MEMSIMPLE" is exactly "is not memory-indirect".
     val srcEaIsMemSimpleEff = Mux(l0Fixup, !l0IsMemInd, srcEa.klass === EaClass.MEMSIMPLE)
     // Full-format BS=1 suppresses the An base; brief format always has one.
-    val srcEaBaseValidEff   = Mux(l0Fixup, !(l0ExtW(8) && l0ExtW(7)), srcEa.baseValid)
+    val srcEaBaseValidEff   = Mux(l0Fixup, l0EaIsIdx && !(l0ExtW(8) && l0ExtW(7)), srcEa.baseValid)
+    // PC-relative unless a full-format ext word suppresses the base (BS=1).
+    val srcEaPcRelEff       = Mux(opIsLineImm && l0EaIsPcIdx, !(l0ExtW(8) && l0ExtW(7)), srcEa.pcRel)
     // Task #199 (btst_pcrel_src static-bit-number sub-case): the (d16,PC)/(d8,PC,Xn)
     // PC-relative reference point is the ADDRESS OF THE EA's OWN EXTENSION WORD, not
     // unconditionally op+2 — for an `opIsLineImm` shape (static BTST/BCHG/BCLR/BSET
@@ -1077,7 +1082,7 @@ object MicroOpAssembler {
     // a memory EA is the deferred RMW/store form (illegal), never a leading-load crack.
     val isLine4Unary = spec.op === DecOp.CLR || spec.op === DecOp.NEG || spec.op === DecOp.NEGX ||
                        spec.op === DecOp.NOT || spec.op === DecOp.TST || spec.op === DecOp.SWAP ||
-                       spec.op === DecOp.EXT || spec.op === DecOp.TAS
+                       spec.op === DecOp.EXT || spec.op === DecOp.TAS || spec.op === DecOp.NBCD
 
     // ── Memory-destination RMW (MEMSIMPLE EAs) ─────────────────────────────────
     // For ADD/SUB/AND/OR/EOR Dn,<ea> + ADDI/.../EORI #imm,<ea> + ADDQ/SUBQ #n,<ea> +
@@ -1118,7 +1123,10 @@ object MicroOpAssembler {
     // destination (the 68k forbids writes to PC-space). They are SOURCE-only. Excluding
     // pcRel here keeps an indexed/displaced PC-rel RMW-dest on the illegal path (the
     // mem-dest gates only checked `=/= MEMSIMPLE`, which a pcRel MEMSIMPLE would pass).
-    val memDest       = srcIsMem && eaIsDst && rmwOpInScope && !srcEa.pcRel
+    // TST / CMPI never write the operand, so a PC-relative EA is legal for them (68020+):
+    // they take the load-only crack (crackLoadOnly) like any other memory TST/CMPI.
+    val pcRelReadOnlyOk = !spec.dstWrites && ((spec.op === DecOp.TST) || (spec.op === DecOp.CMP))
+    val memDest       = srcIsMem && eaIsDst && rmwOpInScope && (!srcEaPcRelEff || pcRelReadOnlyOk)
     val crackClr      = memDest && (spec.op === DecOp.CLR)
     val crackLoadOnly = memDest && !spec.dstWrites                       // TST / CMPI / CMP-mem (no store)
     val crackRmw      = memDest && spec.dstWrites && !crackClr           // load-op-store
@@ -1665,7 +1673,7 @@ object MicroOpAssembler {
     // the imm word(s)).
     val pcRelAddr = (pkt.pc + U(2, 32 bits) + (pcRelImmShiftWords << 1).resize(32 bits) +
                       rmwEaDisp.asUInt).asBits
-    ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, rmwEaDisp)
+    ldUop.imm           := Mux(srcEaPcRelEff, pcRelAddr, rmwEaDisp)
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
     ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.isReturn := False; ldUop.isCall := False; ldUop.ccrRestore := False; ldUop.toCcr := False; ldUop.cond := 0
@@ -2073,7 +2081,9 @@ object MicroOpAssembler {
     // unimplemented" from this comment/gate alone without also checking DecodeStage.scala's
     // early-routing gates — that is what Part 69 of the doc above did, and it produced a
     // false-positive "real cpu040 bug" finding for a case actually fixed 6 weeks earlier.
-    val ctrlEaOk = srcIsMem
+    // Control addressing only: (An)+ / -(An) are MEMSIMPLE in EaDecoder (auto-update
+    // load/store crack) but are NOT control modes -- JMP/JSR with them is vector 4.
+    val ctrlEaOk = srcIsMem && (srcEa.autoMode === EaAuto.NONE)
     // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
     // LINK An,#disp16 (0100 1110 0101 0aaa) / UNLK An (0100 1110 0101 1aaa): line-4
     // stack-frame ops cracked below (NOT illegal). op[15:4]==0x4E5, op[3] selects.
@@ -3155,7 +3165,7 @@ object MicroOpAssembler {
     // The DIV.L divisor is 32-bit -> re-decode the source EA at LONG size (so an
     // immediate divisor consumes 2 extension words / is the full 32-bit value). The
     // ext word is words(1); the EA's own extension words follow at words(2..).
-    val divlSrcEa = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    val divlSrcEa = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3), pkt.words(4)))
     // Divisor EA reuses divlSrcEa (op[5:0]); reg/imm/memSimple.
     val divlDivisorIsImm = divlSrcEa.klass === EaClass.IMM
     val divlDivisorIsReg = (divlSrcEa.klass === EaClass.DATAREG) || (divlSrcEa.klass === EaClass.ADDRREG)
@@ -3342,7 +3352,7 @@ object MicroOpAssembler {
     // The MUL.L multiplier is 32-bit -> re-decode the source EA at LONG size (reuses
     // the same EaDecoder call shape as DIV.L; the ext word is words(1), the EA's own
     // extension words follow at words(2..)).
-    val mullSrcEa = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    val mullSrcEa = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3), pkt.words(4)))
     val mullMulIsImm = mullSrcEa.klass === EaClass.IMM
     val mullMulIsReg = (mullSrcEa.klass === EaClass.DATAREG) || (mullSrcEa.klass === EaClass.ADDRREG)
     val mullMulIsMem = mullSrcEa.klass === EaClass.MEMSIMPLE
@@ -3477,7 +3487,7 @@ object MicroOpAssembler {
     // The funnel + datapath run on the ALU EU (the slow BITFIELD pipe). DYNAMIC offset/
     // width on mem forms is deferred (the OperationDecoder mem arm gates Do/Dw out by only
     // naming the op; here bfMem ignores Do/Dw — slice 3a is STATIC only).
-    val bfmEaDec = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    val bfmEaDec = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3), pkt.words(4)))
     // CONTROL modes only (MEMSIMPLE, no auto-update). (An)+/-(An) (autoMode != NONE) and
     // reg-direct/#imm are rejected -> illegal (vector 4).
     // Task #199 (bf_pcrel_idx_traps_alive): an INDEXED PC-relative EA — brief-format
@@ -3492,8 +3502,9 @@ object MicroOpAssembler {
     // which explicitly anticipates a FUTURE widening to a real value check once someone
     // does that verification work). Reject it here (same fail-safe illegal trap as
     // memory-indirect, autoMode, etc.) rather than let it silently execute.
-    val bfmEaOk  = (bfmEaDec.klass === EaClass.MEMSIMPLE) && (bfmEaDec.autoMode === EaAuto.NONE) &&
-                   !(bfmEaDec.pcRel && bfmEaDec.indexValid)
+    // (d8,PC,Xn) / (bd,PC,Xn): the loads fold pc+4+disp into the absolute displacement and
+    // the LS-EU AGU adds the index (srcC), the same as for (d8,An,Xn) -- admitted.
+    val bfmEaOk  = (bfmEaDec.klass === EaClass.MEMSIMPLE) && (bfmEaDec.autoMode === EaAuto.NONE)
     val bfmOffset5 = bfExt(10 downto 6).asUInt              // static offset 0..31
     val bfmWidthRaw= bfExt(4 downto 0).asUInt               // raw width (0->32)
     val bfmWidth   = (((bfmWidthRaw - 1) & U(31, 5 bits)) + 1)   // 1..32
@@ -3640,23 +3651,11 @@ object MicroOpAssembler {
     // from the right offset (the same shape as the DIV.L/MUL.L re-decode). The bounds EA
     // is a CONTROL mode -> EaDecoder classifies (An)/(d16,An)/(xxx)/(d16,PC) (+ indexed)
     // as MEMSIMPLE; reg-direct/imm/(An)+/-(An) are NOT control. pcRel folds pc.
-    val c2SrcEa = EaDecoder.decode(op(5 downto 0), c2Size, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
-    // mode 6 ((d8,An,Xn), brief or full-format) and mode 7/reg 3 ((d8,PC,Xn), brief or
-    // full-format) are architecturally LEGAL CMP2/CHK2 control EAs (§4.39), but this
-    // 2-load+compare crack only forms a straight base+disp address (it never reads an
-    // index register, walks a full-format bd/od chain, or follows memory-indirection) --
-    // EaDecoder still classifies the brief-indexed and full-format-no-memind shapes as
-    // MEMSIMPLE (they're supported for the GENERIC ALU/MOVE crackLoad's AGU), which used
-    // to let CMP2/CHK2 silently admit them with a WRONG (index-less-if-full/garbage)
-    // address. Force them illegal here as a fail-safe until the crack actually implements
-    // index/full-format EA compute (chk2_cmp2_illegal_ea_traps.s's fail-safe-follow-up
-    // set). Memory-indirect (klass MEMINDIRECT) is already excluded by the klass check
-    // below; this adds the indexed/full-format MEMSIMPLE shapes on top of it.
-    val c2Mode = op(5 downto 3)
-    val c2Reg  = op(2 downto 0)
-    val c2IndexedShape = (c2Mode === B"110") || ((c2Mode === B"111") && (c2Reg === B"011"))
-    val c2EaOk  = (c2SrcEa.klass === EaClass.MEMSIMPLE) && (c2SrcEa.autoMode === EaAuto.NONE) &&
-                  !c2IndexedShape
+    val c2SrcEa = EaDecoder.decode(op(5 downto 0), c2Size, Vec(pkt.words(0), pkt.words(2), pkt.words(3), pkt.words(4)))
+    // The loads DO carry the index (srcC/indexLong/indexScale from c2SrcEa) and a full-
+    // format bd (c2SrcEa.disp, BS via baseValid/pcRel), exactly like the bit-field and
+    // generic indexed loads, so the indexed control modes are admitted (68040: legal).
+    val c2EaOk  = (c2SrcEa.klass === EaClass.MEMSIMPLE) && (c2SrcEa.autoMode === EaAuto.NONE)
     // CMP2/CHK2 has 2 ext words: [opword][cmp2_ext][ea_ext]. The EA ext word lives at
     // pc+4, so (d16,PC)/(d8,PC,Xn) PC-relative accesses must use pc+4 as the base
     // (= address of the EA extension word), NOT pc+2 (which would be the cmp2_ext word).
@@ -3753,7 +3752,9 @@ object MicroOpAssembler {
       u
     }
     // A CMP2/CHK2 with a non-control EA -> illegal (vector 4).
-    val c2Bad = isCmp2Chk2Op && !c2EaOk
+    // op[10:9]=11 is not CMP2/CHK2 (OperationDecoder leaves it illegal but still names the
+    // form): CALLM/RTM, which the 68040 does not implement -> vector 4.
+    val c2Bad = isCmp2Chk2Op && (!c2EaOk || (c2ssReal === B"11"))
     when(c2Bad) {
       inertTrap(4)
     }
@@ -3828,7 +3829,11 @@ object MicroOpAssembler {
     ibrUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // A JMP/JSR with a non-control EA -> illegal (vector 4), like the `bad` path.
-    when(jmpBad || jsrBad) {
+    // LEA/PEA with a non-control EA ((An)+, -(An), #imm, mode-7 reg 5..7) too: their crack
+    // below selects opUop for these, so it must be the vector-4 trap (it used to be the
+    // untrapped default opUop, which retired as a no-op or wedged). Folded into the SAME
+    // `when` so the opUop priority chain gains no level.
+    when(jmpBad || jsrBad || leaBad || peaBad) {
       inertTrap(4)
     }
 

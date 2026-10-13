@@ -2618,7 +2618,15 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // the "other" side as a REGISTER (wrong for an immediate source — see the dedicated
     // MI_MOVE_DST_IMM_ENTRY comment in Microcode.scala for the full root-cause story).
     val ucMoveDstMiImmEarly = ucMoveDstMi && ucMoveSrcIsImm
+    // A PC-relative memory-indirect EA is not alterable: as the destination of a MOVE, or
+    // as the operand of any op that writes it (the MI_RMW family, Scc, BCHG/BCLR/BSET,
+    // ADDQ/SUBQ, ALU Dn,<ea>), it is vector 4. Only the read-only families keep it.
+    val ucMiDstFieldPc = ucMoveDstMi && (ucEopw(8 downto 6) === B"111")
+    val ucMiSrcFieldPc = !ucIsMove && (ucEopw(5 downto 3) === B"111")
+    val ucMiPcReadOnly = ucAluSrcMi || ucLeaMi || ucPeaMi || ucJmpMi || ucJsrMi || ucMiFlagsOnly
+    val ucMiPcDstBad   = ucMiDstFieldPc || (ucMiSrcFieldPc && !ucMiPcReadOnly)
     val ucMiEntry =
+      Mux(ucMiPcDstBad, U(Microcode.MI_UNSUPPORTED_ENTRY, ew bits),
       // task #204: ucMoveBothMiOk (both-MI, dst NOT post-indexed) is a strict subset of
       // ucMoveBothMi — checked FIRST so it wins over the illegal fallback; a post-indexed
       // dst (or any other both-MI shape ucMoveBothMiOk excludes) still falls through to the
@@ -2640,7 +2648,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       Mux(ucPeaMi, U(Microcode.MI_PEA_ENTRY, ew bits),
       Mux(ucJmpMi, U(Microcode.MI_JMP_ENTRY, ew bits),
       Mux(ucJsrMi, U(Microcode.MI_JSR_ENTRY, ew bits),
-                         U(Microcode.MI_RMW_ENTRY,    ew bits)))))))))))))))
+                         U(Microcode.MI_RMW_ENTRY,    ew bits))))))))))))))))
     // ---- debug-only observability (task #139 mechanism #2 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     ucMiEntry.simPublic()
@@ -2769,6 +2777,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     ucEntryCtx.miOtherEaAutoDelta  := ucMiOtherEa.autoDelta
     // Pointer-load EA fields (reuse the bit-field EA infra). disp = bd (the EaSpec disp);
     // pcRel mem-indirect is rejected at decode (read-only EA), so no pc fold needed here.
+    val ucMiPcBase = ucEntryPkt.pc + U(2, 32 bits) +
+      Mux(ucImmDstMi && !ucIsMove, (ucImmWords << 1).resize(32), U(0, 32 bits))
     when(ucIsMemInd) {
       ucEntryCtx.eaBase       := ucMiEa.base
       ucEntryCtx.eaBaseValid  := ucMiEa.baseValid
@@ -2776,7 +2786,10 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       ucEntryCtx.eaIndexValid := ucMiEa.indexValid
       ucEntryCtx.eaIndexLong  := ucMiEa.indexLong
       ucEntryCtx.eaIndexScale := ucMiEa.indexScale
-      ucEntryCtx.eaDispLo     := ucMiEa.disp
+      // ([bd,PC],...): the pointer address is bd + the address of the EA's own first
+      // extension word -- op+2, or past the immediate for a line-0 #imm,<ea> (CMPI).
+      // (Was bd alone: the pointer was read from absolute address bd.)
+      ucEntryCtx.eaDispLo     := Mux(ucMiEa.pcRel, (ucMiEa.disp.asUInt + ucMiPcBase).asBits, ucMiEa.disp)
     }
     // CAS (single address): the LOAD/STORE address is the memory-alterable EA. Override the
     // shared EA group with the CAS EA decode (mutually exclusive with bit-field/mem-indirect,

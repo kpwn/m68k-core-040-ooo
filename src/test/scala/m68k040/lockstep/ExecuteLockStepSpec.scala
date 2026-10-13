@@ -827,7 +827,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                   // Physical synonyms require the oracle to translate too. The
                   // existing checkMem helper compares virtual-address write maps;
                   // use register/CCR observations with this explicit mapping.
-                  oracleMmu: Option[Musashi.MmuConfig] = None): Unit = {
+                  oracleMmu: Option[Musashi.MmuConfig] = None,
+                  // Mirror the program image into the D-side memory too, so PC-relative
+                  // DATA reads (d16,PC)/([bd,PC]) see the program bytes (Musashi has one
+                  // unified memory). Default false => every existing call site unchanged.
+                  seedDside: Boolean = false): Unit = {
     require(oracleMmu.isEmpty || checkMem.isEmpty,
       "oracleMmu uses register checks; checkMem currently assumes an untranslated oracle write map")
     val loadAddr = ProgramAssembler.DefaultLoadAddress
@@ -1010,6 +1014,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // a default config (see BehavioralMem.scala), so passing the default `dcfg`
       // is byte-for-byte the previous behaviour.
       val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dcfg))
+      if (seedDside) for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
       // Attach a behavioral memory to the DTLB walker AXI (the page table lives here
       // when the MMU is enabled; idle for MMU-disabled programs). MMU disabled by
       // default -> identity passthrough, so existing programs are unchanged.
@@ -7443,34 +7448,22 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "loop: bra loop", nInstr = 7)
   }
 
-  // CMP2.W via (d8,An,Xn) indexed — REMOVED as a lock-step case, deliberately.
-  //
-  // This test was written with the original CMP2/CHK2 crack (`3e16f31`), when an
-  // indexed bounds EA was admitted and executed. `b9d0781` (2026-08-19,
-  // "fix(decode): force CMP2/CHK2 indexed/full-format EA to illegal (fail-safe)")
-  // CHANGED THAT CONTRACT: `MicroOpAssembler`'s `c2IndexedShape` now forces mode 6
-  // ((d8,An,Xn), brief or full-format) and mode 7/reg 3 ((d8,PC,Xn)) to a clean
-  // vector-4 ILLEGAL, because the crack never walks a full-format bd/od chain and
-  // `EaDecoder` cannot tell the two sub-shapes apart at that point. That commit
-  // updated the ported corpus (`chk2_cmp2_illegal_ea_traps.s` case `_c6` asserts
-  // exactly this trap) but MISSED this lock-step case, leaving the tree with two
-  // tests demanding OPPOSITE behaviour from the same encoding. This one has failed
-  // ever since — it is task #257's `Divergence(7, pc: dut=0x6a19e51c
-  // oracle=0x40800020)`, whose wild DUT PC is just the harness's uninitialised
-  // vector table after the (correct, intended) vec-4 trap, not a decode defect.
-  //
-  // A lock-step case CANNOT express the current contract: Musashi executes the
-  // instruction, so any faithful oracle comparison must diverge. The contract is
-  // therefore asserted where it belongs — at decode level, in
-  // `Cmp2Chk2DecodeSpec` ("assembler: CMP2 with (d8,An,Xn) …"), added alongside
-  // this removal — and end-to-end by the ported `chk2_cmp2_illegal_ea_traps.s`.
-  //
-  // Restore a value-checking case here only when the crack actually implements
-  // indexed/full-format EA compute (task #257). NOTE for whoever does: the
-  // fail-safe's own in-code rationale is over-broad — `c2LoadUop` DOES wire
-  // `srcCReg`/`indexLong`/`indexScale` from the decoded EA, so the BRIEF-format
-  // sub-case looks implementable on its own; it is the full-format bd/od chain
-  // (and the 2-word `words(2..3)` window the crack re-decodes from) that is not.
+  // CMP2/CHK2 with INDEXED bounds EAs (legal 68040 control modes): brief (d8,An,Xn),
+  // full-format (bd.W,An,Xn) and (bd.L,An) -- the long bd needs the 4-word shifted EA
+  // window -- brief (d8,PC,Xn), and an in-bounds CHK2 through (d8,An,Xn).
+  test("lock-step: decl CMP2/CHK2 indexed bounds EAs ((d8,An,Xn), full-format, (d8,PC,Xn))", VerilatorTest) {
+    runLockStep("decl-cmp2-idx",
+      "move.l #0x3000,%a0 ; moveq #8,%d2 ; " +
+      "move.w #20,0x3008 ; move.w #40,0x300a ; move.l #-5,0x3010 ; move.l #5,0x3014 ; " +
+      "move.w #30,%d1 ; cmp2.w (0,%a0,%d2.w),%d1 ; " +                 // 20<=30<=40
+      "move.w #41,%d1 ; .short 0x02F0,0x1000,0x2120,0x0000 ; " +         // cmp2.w (0.w,a0,d2.w),d1: above
+      "moveq #-5,%d3 ; .short 0x04F0,0x3000,0x0170,0x0000,0x0010 ; " +   // cmp2.l (0x10.l,a0),d3: == lower
+      "moveq #0,%d4 ; cmp2.l bnd0(%pc,%d2.w),%d4 ; " +                 // PC-indexed: -1<=0<=1
+      "move.w #33,%d1 ; chk2.w (0,%a0,%d2.w),%d1 ; " +                 // in bounds: no trap
+      "moveq #3,%d5 ; loop: bra loop ; " +
+      ".align 4 ; bnd0: .long 0,0 ; .long -1,1",
+      nInstr = 2 + 4 + 2 + 2 + 2 + 2 + 2 + 2, seedDside = true)
+  }
 
   // CHK2.W in-bounds -> no trap (straight-line).
   test("lock-step: CHK2.W in-bounds (no trap)", VerilatorTest) {
@@ -7553,6 +7546,105 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     runLockStep("mul-l64-s",
       "move.l #-100000,%d0 ; move.l #100000,%d1 ; muls.l %d1,%d2:%d0 ; " + // -(10^10) signed
       "move.l %d2,%d6 ; loop: bra loop", nInstr = 5)
+  }
+
+  // ── Decoder EA legality (DecodeLegalityEnumSpec findings) ───────────────────────
+  // Each vector-4 case arms a resume slot (0x3000) first; the handler resumes there, so
+  // the trapping instruction's length never matters. Musashi (68040) decides legality.
+  test("lock-step: decl JMP/JSR/LEA/PEA (An)+ and -(An) take vector 4; control modes still work", VerilatorTest) {
+    runLockStep("decl-jmp-auto",
+      "move.l #h4,%d0 ; move.l %d0,0x10 ; lea sub,%a0 ; lea sub+4,%a1 ; " +
+      "move.l #r1,0x3000 ; .short 0x4ED8 ; r1: " +                    // jmp (a0)+
+      "move.l #r2,0x3000 ; .short 0x4EA1 ; r2: " +                    // jsr -(a1)
+      "move.l #r3,0x3000 ; .short 0x4ED9 ; r3: " +                    // jmp (a1)+
+      "move.l #r4,0x3000 ; .short 0x4EA0 ; r4: " +                    // jsr -(a0)
+      "move.l #r5,0x3000 ; .short 0x43D8 ; r5: " +                    // lea (a0)+,a1
+      "move.l #r6,0x3000 ; .short 0x4860 ; r6: " +                    // pea -(a0)
+      "move.l %a0,%d3 ; move.l %a1,%d4 ; jsr (%a0) ; jsr 0(%a0) ; jsr sub(%pc) ; " +
+      "lea t3,%a2 ; jmp (%a2) ; nop ; t3: move.l %d5,%d6 ; loop: bra loop ; " +
+      "sub: addq.l #1,%d5 ; rts ; " +
+      "h4: move.l 0x3000,2(%sp) ; rte", nInstr = 2 + 2 + 6 * 4 + 2 + 3 * 3 + 2 + 2)
+  }
+
+  test("lock-step: decl illegal encodings that used to wedge take vector 4 (CALLM, MOVEM, LEA/PEA #imm, PC-MI dst)", VerilatorTest) {
+    val cases = Seq(
+      ".short 0x06D0,0x0000",                 // callm #0,(a0)
+      ".short 0x06E8,0x0000,0x0010",          // callm #0,(16,a0)
+      ".short 0x48D8,0x0003",                 // movem.l d0-d1,(a0)+
+      ".short 0x4CE0,0x0003",                 // movem.l -(a0),d0-d1
+      ".short 0x48BA,0x0001,0x0010",          // movem.w d0,(16,pc)
+      ".short 0x48BC,0x0001",                 // movem.w d0,#imm
+      ".short 0x43FC,0x0000,0x0010",          // lea #imm,a1
+      ".short 0x487C,0x0000,0x0010",          // pea #imm
+      ".short 0x43FD",                        // lea mode7/reg5,a1
+      ".short 0x003B,0x0001,0x0161,0x0010",   // ori.b #1,([16,pc])
+      ".short 0x27C0,0x0161,0x0010")          // move.l d0,([16,pc])
+    val body = cases.zipWithIndex.map { case (c, i) => s"move.l #r$i,0x3000 ; $c ; r$i: " }.mkString
+    runLockStep("decl-illegal-wedge",
+      "move.l #h4,%d0 ; move.l %d0,0x10 ; lea 0x2000,%a0 ; " + body +
+      "move.l %a0,%d6 ; loop: bra loop ; h4: move.l 0x3000,2(%sp) ; rte",
+      nInstr = 3 + cases.size * 4 + 2)
+  }
+
+  // PC-relative MEMORY-INDIRECT source reads: TST/CMPI (020+ allow PC-relative), MOVE,
+  // ADD, and the JMP/JSR target fetch. Word and long base displacement.
+  test("lock-step: decl PC memory-indirect source EAs ([bd,PC]) read the right pointer", VerilatorTest) {
+    runLockStep("decl-pc-memind",
+      "move.l #0x80000001,0x2000 ; move.l #0x00000007,0x2010 ; moveq #3,%d3 ; " +
+      ".short 0x4ABB ; e1: .short 0x0161,p1-e1 ; " +                  // tst.l ([p1.w,pc])
+      ".short 0x4ABB ; e2: .short 0x0171 ; .long p2-e2 ; " +          // tst.l ([p2.l,pc])
+      ".short 0x0CBB,0x8000,0x0001 ; e3: .short 0x0161,p1-e3 ; " +    // cmpi.l #$80000001,([p1,pc])
+      ".short 0x243B ; e4: .short 0x0161,p1-e4 ; " +                  // move.l ([p1,pc]),d2
+      ".short 0xD6BB ; e5: .short 0x0171 ; .long p2-e5 ; " +          // add.l ([p2.l,pc]),d3
+      ".short 0x4EBB ; e6: .short 0x0161,p3-e6 ; " +                  // jsr ([p3,pc])
+      ".short 0x4EFB ; e7: .short 0x0171 ; .long p4-e7 ; " +          // jmp ([p4.l,pc])
+      "nop ; t4: move.l %d2,%d4 ; loop: bra loop ; " +
+      "sub: addq.l #1,%d5 ; rts ; " +
+      ".align 4 ; p1: .long 0x2000 ; p2: .long 0x2010 ; p3: .long sub ; p4: .long t4",
+      nInstr = 3 + 5 + 3 + 1 + 2, seedDside = true)
+  }
+
+  // TST/CMPI accept PC-relative EAs on the 68020+ (read-only operands).
+  test("lock-step: decl TST/CMPI (d16,PC) and (d8,PC,Xn)", VerilatorTest) {
+    runLockStep("decl-tst-pcrel",
+      "moveq #4,%d1 ; moveq #3,%d2 ; " +
+      "tst.l v1(%pc) ; tst.w v1(%pc,%d1.w) ; tst.b v1+1(%pc,%d1.l*2) ; " +
+      ".short 0x0CBA,0x1234,0x5678 ; e1: .short v1-e1 ; " +            // cmpi.l #$12345678,(v1,pc)
+      "cmpi.w #0x8001,v1(%pc,%d1.l) ; " +
+      "tst.b v1+3(%pc) ; " +
+      "move.l %d1,%d6 ; loop: bra loop ; " +
+      ".align 4 ; v1: .long 0x12345678 ; .long 0x80010000 ; .long 0x00ff00ff",
+      nInstr = 2 + 3 + 2 + 1 + 2, seedDside = true)
+  }
+
+  // NBCD <ea> memory RMW (every alterable memory mode; X in and out, Z sticky).
+  test("lock-step: decl NBCD <mem> (An), (An)+, -(An), (d16,An), (d8,An,Xn), abs", VerilatorTest) {
+    runLockStep("decl-nbcd-mem",
+      "move.l #0x3000,%a0 ; move.l #0x3010,%a1 ; moveq #2,%d2 ; " +
+      "move.l #0x45990001,0x3000 ; move.l #0x00120034,0x3010 ; " +
+      "move.w #4,%ccr ; nbcd (%a0) ; nbcd (%a0)+ ; nbcd -(%a0) ; " +    // 0x45 -> 0x55, X=1
+      "nbcd 1(%a0) ; nbcd (-1,%a1,%d2.w) ; nbcd 0x3012 ; " +
+      "move.w #0x14,%ccr ; nbcd 0x3003 ; " +                              // X=1 in
+      "move.l 0x3000,%d3 ; move.l 0x3010,%d4 ; move.l %a0,%d5 ; loop: bra loop",
+      nInstr = 5 + 4 + 3 + 2 + 4)
+  }
+
+  // Static bit-field reads through (d8,PC,Xn) / (bd,PC,Xn) (legal control modes), and a
+  // full-format LONG base displacement through the shifted-EA cracks (BFTST, MULU.L,
+  // DIVU.L): the long bd's low word is the 4th word of the shifted EA window.
+  test("lock-step: decl BF (d8,PC,Xn)/(bd,PC,Xn) and full-format bd.L for BF/MUL.L/DIV.L", VerilatorTest) {
+    runLockStep("decl-bf-pcidx",
+      "move.l #0x3000,%a0 ; move.l #0x12345678,0x3010 ; move.l #7,0x3014 ; " +
+      "move.l #1000,%d5 ; moveq #4,%d3 ; moveq #3,%d4 ; " +
+      "bfextu dat(%pc,%d3.l){#4:#8},%d0 ; " +
+      ".short 0xEBFB,0x1010 ; e1: .short 0x3920,dat-e1 ; " +            // bfexts (dat.w,pc,d3.l){#0:#16},d1
+      ".short 0xE8F0,0x0108,0x0170 ; .long 0x10 ; " +                   // bftst (0x10.l,a0){#4:#8}
+      "bfffo dat(%pc,%d3.l){#0:#32},%d2 ; " +
+      ".short 0x4C30,0x4000,0x0170 ; .long 0x10 ; " +                   // mulu.l (0x10.l,a0),d4
+      ".short 0x4C70,0x5005,0x0170 ; .long 0x14 ; " +                   // divu.l (0x14.l,a0),d5
+      "move.l %d0,%d6 ; loop: bra loop ; " +
+      ".align 4 ; dat: .long 0x0F0F0F0F ; .long 0x00801234",
+      nInstr = 6 + 6 + 2, seedDside = true)
   }
 
   // ── MULx.L / DIVx.L with an AUTO-UPDATE source EA, (An)+ and -(An) ──────────────
