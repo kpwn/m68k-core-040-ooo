@@ -569,7 +569,7 @@ object ShippingCoreConfig {
     * DecodeStage zeroes words at index >= `lenWords` (simple packets) on the registered
     * side, so the `raw` slot-1 word flops carry no synchronous clear. Cycle-identical.
     * Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
-  val alignMaskNoRst: Boolean = envFlag("CPU_ALIGN_MASK_NORST", false)
+  val alignMaskNoRst: Boolean = envFlag("CPU_ALIGN_MASK_NORST", true)
   /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
     * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
     * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,
