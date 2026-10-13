@@ -739,6 +739,7 @@ object GenSocketTopVerilog {
             s"decodePair3p1=${ShippingCoreConfig.decodePair3p1} " +
             s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries} " +
             s"dtlbVictimEntries=${ShippingCoreConfig.dtlbVictimEntries} " +
+            s"tlbVicPayloadLutram=${ShippingCoreConfig.tlbVicPayloadLutram} " +
             // ⚠️ ADDED BY THE INTEGRATION MERGE. `perf/sq-congestion` added both knobs
             // to `ShippingCoreConfig` and neither to this line, so a `SQ_DEPTH=4` or
             // `SQ_NARROW_MERGE=1` build was indistinguishable from the default in its
