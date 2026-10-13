@@ -794,8 +794,8 @@ object ShippingCoreConfig {
     * invalidateAll / purge). Separate DTLB / ITLB knobs so the fetch-cone ITLB can be held
     * back on timing. Cycle-identical. Default OFF; reach `Tlb` via the plugin constructor
     * defaults; echoed in SHIPPING_CONFIG. */
-  val dtlbArrayLutram: Boolean = envFlag("CPU_DTLB_ARRAY_LUTRAM", false)
-  val itlbArrayLutram: Boolean = envFlag("CPU_ITLB_ARRAY_LUTRAM", false)
+  val dtlbArrayLutram: Boolean = envFlag("CPU_DTLB_ARRAY_LUTRAM", true)
+  val itlbArrayLutram: Boolean = envFlag("CPU_ITLB_ARRAY_LUTRAM", true)
 
   /** ROB: let a resolved CORRECTLY-predicted branch that ends its macro retire in slot 0
     * alongside a non-branch slot-1 uop (`RobPlugin.pairCorrectBranch`). Default OFF = every
