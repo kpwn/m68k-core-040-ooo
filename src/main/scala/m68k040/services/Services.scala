@@ -749,6 +749,11 @@ trait WalkerDcacheClient {
     * already holding the SQ, every store accepted before (or on) the arming cycle has
     * then landed, so the re-read cannot see a pre-store byte. */
   def umRmwReadOk: Bool = null
+  /** `CPU_UM_LOAD_ORDER` (client -> LsEu; null when OFF): this client has a COMMITTED
+    * U/M descriptor write still waiting to drain. `LsEuPlugin` withholds new core-LS
+    * load admission meanwhile, so no program-younger load reads the descriptor's
+    * pre-update byte. */
+  def umCommittedPending: Bool = null
 }
 
 /** The I-side walker's client port (`ItlbPlugin`). A SEPARATE trait from the D-side
@@ -768,6 +773,11 @@ trait DtlbWalkerDcacheClient extends WalkerDcacheClient {
   def walkOrderAddr: UInt = null
   def walkOrderLive: Bool = null
   def walkOrderHold: Bool = null
+  /** `CPU_UM_LOAD_ORDER` (DtlbPlugin -> LsEu; null when OFF): pulses with the robId of
+    * the access whose walk just queued a U/M write. `LsEuPlugin` forwards it on its
+    * `orderViolation` port, so the ROB flushes everything younger than the owner's macro
+    * at its retirement (`RobPlugin.orderRedirect`). */
+  def umOwnerMark: Flow[UInt] = null
 }
 
 /** Produced by the fetch/align stage; consumed by the (future) decode stage.

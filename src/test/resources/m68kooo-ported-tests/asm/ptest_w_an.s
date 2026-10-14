@@ -24,6 +24,16 @@
 _start:
     lea     0x00020000, %a7
 
+    | The expected MMUSR values below (PA | R, T = 0) are the answer for
+    | "MMU disabled, no transparent translation".  A PTEST whose address
+    | matches a DTTn correctly reports T = 1 instead, so state the data-side
+    | TTR precondition explicitly rather than inherit it from reset: a
+    | harness posture that maps RAM through DTT0 (the copyback sweep) must
+    | not turn a correct MMUSR into a FAIL.  No-op under the reset state.
+    moveq   #0, %d0
+    movec   %d0, %dtt0
+    movec   %d0, %dtt1
+
     | Set up An regs.
     move.l  #0x00010000, %a0
     move.l  #0x00011000, %a1

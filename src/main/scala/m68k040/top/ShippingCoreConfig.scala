@@ -799,6 +799,27 @@ object ShippingCoreConfig {
     * Default OFF; `CPU_UM_ATOMIC=1` enables; echoed in `SHIPPING_CONFIG`. */
   val umAtomic: Boolean = envFlag("CPU_UM_ATOMIC", true)
 
+  /** U/M descriptor update visible to program-younger LOADS (`DtlbPlugin`/`ItlbPlugin`
+    * + `LsEuPlugin`). On a 68040 the U/M update is part of the access's own table search,
+    * so a later `move.l desc,Dn` sees U/M set (MC68040UM 3.3: a write that hits an ATC
+    * entry with M clear re-searches to set M "in both the page descriptor in memory and
+    * in the ATC"; Mac OS VM decides page-out from that bit). Here the update is DEFERRED
+    * to a post-commit drain, and a younger load of the descriptor could read the stale
+    * byte (`mmu_atc_write_hit_sets_modified`, 0xDEAD0903). With this ON:
+    *  (1) DETECT: the DTLB marks the walk OWNER's robId through `LsEuPlugin`'s existing
+    *      `orderViolation` port when it queues a U/M write, so the owner's macro retires
+    *      and EVERYTHING younger is flushed and refetched (the LS order-violation
+    *      recovery, `orderRedirect`) -- a younger load that already read the stale byte
+    *      is discarded. Needs `LS_OOO_ISSUE` (the ROB recovery exists only there).
+    *  (2) HOLD: while either TLB has a COMMITTED U/M write still waiting to drain, new
+    *      core-LS loads are not admitted to the D-cache (one registered term on the
+    *      registered `coreLsGrant`). Released while a quiesce/exception/D4 fence is up,
+    *      exactly when the drain itself yields, so the hold cannot deadlock a fence.
+    * Cold path only: a U/M write is queued only by a walk whose leaf lacks U (first
+    * touch) or M (first write) -- zero cycles on any TLB hit or U/M-set walk.
+    * Default OFF; `CPU_UM_LOAD_ORDER=1` enables; echoed in `SHIPPING_CONFIG`. */
+  val umLoadOrder: Boolean = envFlag("CPU_UM_LOAD_ORDER", false)
+
   /** DTLB victim buffer depth (`CPU_DTLB_VICTIM`), 0 = OFF and elaborates NO hardware.
     * Same registered design as the ITLB's (`ITLB_VICTIM`): a fully associative buffer of
     * the array's evictions, probed one cycle after a PRIMARY miss from `missReqReg`
