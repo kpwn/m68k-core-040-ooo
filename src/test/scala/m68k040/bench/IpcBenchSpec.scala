@@ -67,6 +67,19 @@ class IpcBenchSpec extends CoreBenchHarness {
     Kernel("trap-rte", src, setup.size + (iters - 2) * 4, warmupInstrs = setup.size, copybackDtt = true)
   }
 
+  /** Divide-heavy loop (CPU_DIV_EARLY_OUT A/B): per iteration a DIVU.W #10 digit split
+    * (the NumToString shape), a DIVU.L #1000 32/32 and a DIVS.L 64/32 with remainder,
+    * each feeding an accumulator, plus loop/ALU glue. 15 macros/iter. */
+  def kDivMix(iters: Int): Kernel = {
+    val setup = Seq(s"move.l #$iters,%d7", "move.l #0x12345,%d5", "moveq #0,%d6")
+    val body = Seq(".Ldv: move.l %d5,%d0", "andi.l #0x7FFFF,%d0", "divu.w #10,%d0", "swap %d0", "add.w %d0,%d6",
+      "move.l %d5,%d1", "divu.l #1000,%d1", "add.l %d1,%d6",
+      "move.l %d5,%d2", "moveq #0,%d3", "divs.l #-7,%d3:%d2", "add.l %d3,%d6",
+      "addi.l #12347,%d5", "subq.l #1,%d7", "bne.s .Ldv").mkString(" ; ")
+    val src = (setup ++ Seq(body, ".Ldvend: bra.s .Ldvend")).mkString(" ; ")
+    Kernel("div-mix", src, setup.size + iters * 15, warmupInstrs = setup.size)
+  }
+
   test("IPC microbenchmark suite", VerilatorTest) {
     val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream,
       kStoreStream, kSameLineCopyback, kShiftStream, kShiftMixed, kBranchy, kDeepBacklog,
@@ -98,7 +111,9 @@ class IpcBenchSpec extends CoreBenchHarness {
       (if (sys.env.get("IPC_TRAP_KERNEL").contains("1")) Seq(kTrapRte(100)) else Nil) ++
       // IPC_JTAB_KERNEL=1 appends the indexed jump-table probes (CPU_PRF_TRIM_BRIDX A/B).
       (if (sys.env.get("IPC_JTAB_KERNEL").contains("1")) Seq(
-        kBrJumpTable(), kBrJumpTable(call = true, label = "br-jtab-jsr")) else Nil)
+        kBrJumpTable(), kBrJumpTable(call = true, label = "br-jtab-jsr")) else Nil) ++
+      // IPC_DIV_KERNEL=1 appends the divide-heavy loop (opt-in; default aggregate unchanged).
+      (if (sys.env.get("IPC_DIV_KERNEL").contains("1")) Seq(kDivMix(200)) else Nil)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))

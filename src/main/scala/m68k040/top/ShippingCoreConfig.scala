@@ -685,6 +685,10 @@ object ShippingCoreConfig {
     * `leaGenUop`; memory-indirect µcode: MI_JMP/MI_JSR rows), and the branch jumps to (T0).
     * Default OFF. Read by `BranchEuPlugin`, `MicroOpAssembler`, `Microcode`, `DecodeStage`. */
   val prfTrimBrIdx: Boolean = envFlag("CPU_PRF_TRIM_BRIDX", true)
+  /** Integer divider early-out: a PREP cycle skips the leading zero-quotient steps
+    * (16 steps for a typical DIVx.W, 32 for DIVx.L 32/32) instead of always running 64.
+    * Default OFF. Read by `DivCore`/`DivUnit` (constructor default). */
+  val divEarlyOut: Boolean = envFlag("CPU_DIV_EARLY_OUT", true)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")

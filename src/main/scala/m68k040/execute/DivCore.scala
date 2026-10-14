@@ -27,7 +27,7 @@ import spinal.lib._
   *              64-bit result; the EU picks the low bits + checks overflow. (Restoring
   *              over the full width is exact for every form.)
   */
-class DivCore extends Component {
+class DivCore(earlyOut: Boolean = m68k040.top.ShippingCoreConfig.divEarlyOut) extends Component {
   val io = new Bundle {
     val start     = in Bool ()
     val dividend  = in UInt (64 bits)   // unsigned magnitude
@@ -61,6 +61,11 @@ class DivCore extends Component {
   val running = RegInit(False)
   val dz   = RegInit(False)
   val donePulse = RegInit(False)
+  // CPU_DIV_EARLY_OUT: one PREP cycle after `start` jumps the iterator straight to the
+  // state it would reach after j in {32,40,48,56} steps, picking the largest j whose
+  // top-j dividend bits are < the divisor (so those j steps produce only zero quotient
+  // bits and leave rem = the top-j bits). Exact by the restoring-division invariant.
+  val prep = RegInit(False)
 
   io.busy      := running
   io.done      := donePulse
@@ -70,33 +75,85 @@ class DivCore extends Component {
 
   donePulse := False
 
-  when(io.start && !running) {
-    // Latch operands; divide-by-zero short-circuits (no iteration).
-    when(io.divisor === 0) {
-      dz        := True
-      qd        := 0
-      rem       := 0
-      donePulse := True
-      running   := False
-    } otherwise {
-      dz      := False
-      rem     := 0
-      qd      := io.dividend
-      dvsr    := io.divisor
-      cnt     := 0
-      running := True
+  if (earlyOut) {
+    // The skip is folded into the SAME load leg `start` already uses, so every
+    // register's D input stays {load ? loadVal : iterate} -- the iteration path keeps
+    // its depth; the compares only feed loadVal from registered qd/dvsr.
+    val startNow = io.start && !running
+    val dvsrZero = io.divisor === 0
+    val c32 = qd(63 downto 32) < dvsr
+    val c40 = qd(63 downto 56) === 0 && qd(55 downto 24) < dvsr
+    val c48 = qd(63 downto 48) === 0 && qd(47 downto 16) < dvsr
+    val c56 = qd(63 downto 40) === 0 && qd(39 downto  8) < dvsr
+    val skipRem = UInt(33 bits); val skipQd = UInt(64 bits); val skipCnt = UInt(7 bits)
+    when(c56)      { skipRem := qd(39 downto  8).resized; skipQd := qd |<< 56; skipCnt := 56 }
+      .elsewhen(c48) { skipRem := qd(47 downto 16).resized; skipQd := qd |<< 48; skipCnt := 48 }
+      .elsewhen(c40) { skipRem := qd(55 downto 24).resized; skipQd := qd |<< 40; skipCnt := 40 }
+      .elsewhen(c32) { skipRem := qd(63 downto 32).resized; skipQd := qd |<< 32; skipCnt := 32 }
+      .otherwise     { skipRem := 0; skipQd := qd; skipCnt := 0 }  // L64 top32 >= dvsr: always overflow, full 64 steps
+    val load = startNow || prep
+    val shifted = (rem(31 downto 0) ## qd(63)).asUInt
+    val sub     = shifted - (False ## dvsr).asUInt
+    val fits    = !sub(32)
+    // `keep`: the load values must stay ONE net per bit so the final per-bit LUT is
+    // exactly {load, loadVal, fits, sub, shifted} with `fits` last -- without it Vivado
+    // folded the skip mux into the LUT after the borrow (+2 levels on rem->rem).
+    val loadRem = Mux(prep, skipRem, U(0, 33 bits)).addAttribute("keep")
+    val loadQd  = Mux(prep, skipQd, Mux(dvsrZero, U(0, 64 bits), io.dividend)).addAttribute("keep")
+    val loadCnt = Mux(prep, skipCnt, U(0, 7 bits)).addAttribute("keep")
+    when(load) {
+      rem := loadRem
+      qd  := loadQd
+      cnt := loadCnt
+    } elsewhen(running) {
+      rem := Mux(fits, sub, shifted)
+      qd  := (qd(62 downto 0) ## fits).asUInt
+      cnt := cnt + 1
     }
-  } elsewhen(running) {
-    // One restoring step: shift the next dividend MSB into rem, trial-subtract dvsr.
-    val shifted = (rem(31 downto 0) ## qd(63)).asUInt          // 33 bits
-    val sub     = shifted - (False ## dvsr).asUInt             // 33-bit subtract
-    val fits    = !sub(32)                                     // no borrow -> divisor fits
-    rem := Mux(fits, sub, shifted)
-    qd  := (qd(62 downto 0) ## fits).asUInt                    // shift dividend out / quotient bit in
-    cnt := cnt + 1
-    when(cnt === U(63)) {
+    prep := False
+    when(startNow) {
+      dz := dvsrZero
+      when(dvsrZero) {
+        donePulse := True
+        running   := False
+      } otherwise {
+        dvsr    := io.divisor
+        running := True
+        prep    := True
+      }
+    } elsewhen(running && !prep && cnt === U(63)) {
       running   := False
       donePulse := True
+    }
+  } else {
+    when(io.start && !running) {
+      // Latch operands; divide-by-zero short-circuits (no iteration).
+      when(io.divisor === 0) {
+        dz        := True
+        qd        := 0
+        rem       := 0
+        donePulse := True
+        running   := False
+      } otherwise {
+        dz      := False
+        rem     := 0
+        qd      := io.dividend
+        dvsr    := io.divisor
+        cnt     := 0
+        running := True
+      }
+    } elsewhen(running) {
+      // One restoring step: shift the next dividend MSB into rem, trial-subtract dvsr.
+      val shifted = (rem(31 downto 0) ## qd(63)).asUInt          // 33 bits
+      val sub     = shifted - (False ## dvsr).asUInt             // 33-bit subtract
+      val fits    = !sub(32)                                     // no borrow -> divisor fits
+      rem := Mux(fits, sub, shifted)
+      qd  := (qd(62 downto 0) ## fits).asUInt                    // shift dividend out / quotient bit in
+      cnt := cnt + 1
+      when(cnt === U(63)) {
+        running   := False
+        donePulse := True
+      }
     }
   }
 }

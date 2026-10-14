@@ -26,7 +26,7 @@ object DivForm extends SpinalEnum {
   * 32-bit dividend s/z-ext to 64; .L64: full 64-bit dividend), so here they are the
   * full 64/32 operands and we only take |.| when signed.
   */
-class DivUnit extends Component {
+class DivUnit(earlyOut: Boolean = m68k040.top.ShippingCoreConfig.divEarlyOut) extends Component {
   val io = new Bundle {
     val start     = in Bool ()
     val dividend  = in UInt (64 bits)   // pre-extended by the EU (sext for signed)
@@ -41,7 +41,7 @@ class DivUnit extends Component {
     val divByZero = out Bool ()
   }
 
-  val core = new DivCore
+  val core = new DivCore(earlyOut)
 
   // ── sign capture (latched at start, used at done for the fix-up) ──
   val signDividend = RegInit(False)

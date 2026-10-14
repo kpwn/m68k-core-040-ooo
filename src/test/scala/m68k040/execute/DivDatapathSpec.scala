@@ -31,8 +31,8 @@ class DivDatapathSpec extends AnyFunSuite {
     (q, r, dz)
   }
 
-  def runSuite(seed: Long): Unit = {
-    M68kSim().withVerilator.compile(new DivCore).doSim { dut =>
+  def runSuite(seed: Long, earlyOut: Boolean = false): Unit = {
+    M68kSim().withVerilator.compile(new DivCore(earlyOut)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.io.start #= false; dut.io.dividend #= 0; dut.io.divisor #= 0
       cd.waitSampling(5)
@@ -152,6 +152,9 @@ class DivDatapathSpec extends AnyFunSuite {
     ((q & qmask), (r & rmask), overflow, false)
   }
 
+  /** start->done latency (cycles) of the last `runUnit`. */
+  var lastCycles = 0
+
   /** Drive DivUnit with architectural operands; the EU-level extension is mirrored
     * here (sign/zero-extend the dividend to 64, divisor to 32). */
   def runUnit(dut: DivUnit, cd: ClockDomain, form: Form, signed: Boolean,
@@ -171,6 +174,7 @@ class DivDatapathSpec extends AnyFunSuite {
     dut.io.start #= false
     var guard = 0
     while (!dut.io.done.toBoolean && guard < 200) { cd.waitSampling(); guard += 1 }
+    lastCycles = guard + 1
     assert(dut.io.done.toBoolean, s"DivUnit never done: $form signed=$signed $dividendArch / $divisorArch")
     val q = dut.io.quotient.toBigInt
     val r = dut.io.remainder.toBigInt
@@ -180,8 +184,8 @@ class DivDatapathSpec extends AnyFunSuite {
     (q, r, ov, dz)
   }
 
-  def runUnitSuite(seed: Long): Unit = {
-    M68kSim().withVerilator.compile(new DivUnit).doSim { dut =>
+  def runUnitSuite(seed: Long, earlyOut: Boolean = false): Unit = {
+    M68kSim().withVerilator.compile(new DivUnit(earlyOut)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.io.start #= false; dut.io.dividend #= 0; dut.io.divisor #= 0
       dut.io.signed #= false; dut.io.form #= DivForm.W
@@ -245,5 +249,77 @@ class DivDatapathSpec extends AnyFunSuite {
   }
   test("DivUnit signed/unsigned + overflow + sign fix-up vs reference (seed B)", VerilatorTest) {
     runUnitSuite(0x5A5A5A5L)
+  }
+
+  test("DivCore unsigned with CPU_DIV_EARLY_OUT (seed A)", VerilatorTest) {
+    runSuite(0xD112345L, earlyOut = true)
+  }
+  test("DivUnit with CPU_DIV_EARLY_OUT (seed A)", VerilatorTest) {
+    runUnitSuite(0xABCDEF1L, earlyOut = true)
+  }
+
+  /** CPU_DIV_EARLY_OUT sweep: >= 2000 operand pairs per (form, signedness), biased so
+    * every skip point (j = 56/48/40/32/none) and every sign/overflow/erratum corner is
+    * hit, run on BOTH the early-out and the fixed-64 unit; results must match the
+    * reference AND each other. Also reports start->done cycles per form. */
+  def sweep(earlyOut: Boolean, seed: Long): Map[(Form, Boolean), (Long, Int, Int)] = {
+    val stats = scala.collection.mutable.Map[(Form, Boolean), (Long, Int, Int)]()
+    M68kSim().withVerilator.compile(new DivUnit(earlyOut)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      dut.io.start #= false; dut.io.dividend #= 0; dut.io.divisor #= 0
+      dut.io.signed #= false; dut.io.form #= DivForm.W
+      cd.waitSampling(5)
+      val rnd = new Random(seed)
+      def rbits(w: Int): BigInt = {
+        // bit-length-biased: uniform width 0..w, then random bits under it, plus specials
+        rnd.nextInt(10) match {
+          case 0 => (BigInt(1) << w) - 1                       // all ones (-1 / max)
+          case 1 => BigInt(1) << (w - 1)                       // INT_MIN / 2^(w-1)
+          case 2 => ((BigInt(1) << (w - 1)) - 1)               // INT_MAX
+          case 3 => BigInt(rnd.nextInt(4))                     // 0..3
+          case 4 => ((BigInt(1) << w) - 1) - BigInt(rnd.nextInt(300)) // small negative
+          case _ => val n = rnd.nextInt(w + 1); if (n == 0) BigInt(0) else BigInt(n, rnd)
+        }
+      }
+      for (form <- Seq(FW, FL32, FL64); signed <- Seq(false, true)) {
+        val dw = if (form == FL64) 64 else 32
+        val vw = if (form == FW) 16 else 32
+        var sum = 0L; var nn = 0; var mn = Int.MaxValue; var mx = 0
+        for (i <- 0 until 2200) {
+          val a = rbits(dw)
+          val b = if (i % 97 == 0) BigInt(0) else rbits(vw)
+          val (q, r, ov, dz) = runUnit(dut, cd, form, signed, a, b)
+          val (rq, rr, rov, rdz) = ref(form, signed, a, b)
+          val qmask = if (form == FW) (P16 - 1) else (P32 - 1)
+          val tag = f"$form s=$signed eo=$earlyOut $a%x/$b%x"
+          assert(dz == rdz, s"$tag dz=$dz ref=$rdz")
+          if (!rdz) {
+            // FW erratum: ref() models none; the RTL suppresses V for 0x80000000/-1 and
+            // packs q=r=0 (Musashi). Accept exactly that one documented divergence.
+            val fwErr = form == FW && signed && (a & (P32 - 1)) == BigInt(0x80000000L) && b == (P16 - 1)
+            if (fwErr) { assert(!ov && (q & qmask) == 0 && (r & qmask) == 0, s"$tag FW erratum") }
+            else {
+              assert(ov == rov, s"$tag ov=$ov ref=$rov")
+              if (!rov) {
+                assert((q & qmask) == rq, f"$tag q=$q%x ref=$rq%x")
+                assert((r & qmask) == rr, f"$tag r=$r%x ref=$rr%x")
+              }
+            }
+            sum += lastCycles; nn += 1; mn = mn min lastCycles; mx = mx max lastCycles
+          }
+        }
+        stats((form, signed)) = (sum * 1000 / nn, mn, mx)
+      }
+    }
+    stats.toMap
+  }
+
+  test("DivUnit CPU_DIV_EARLY_OUT sweep: 2200 pairs/form vs reference, cycles before/after", VerilatorTest) {
+    val off = sweep(earlyOut = false, 0x1234567L)
+    val on  = sweep(earlyOut = true,  0x1234567L)
+    for (k <- on.keys.toSeq.sortBy(k => (k._1.toString, k._2))) {
+      val (so, mno, mxo) = off(k); val (sn, mnn, mxn) = on(k)
+      println(f"DIVCYC ${k._1}%-4s signed=${k._2}%-5s off: avg ${so / 1000.0}%.2f [$mno..$mxo]  on: avg ${sn / 1000.0}%.2f [$mnn..$mxn]")
+    }
   }
 }
