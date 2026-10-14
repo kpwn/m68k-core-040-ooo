@@ -71,6 +71,9 @@ class StackOpSpec extends AnyFunSuite {
       s.iPsrcA #= 0; s.iPsrcB #= 0; s.iImm #= 0; s.iPdst #= 0; s.iPdstValid #= false; s.iRobId #= 0
       dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
       cd.waitSampling(80)
+      // L1D reset sweep: 256 cycles at the shipping 16 KiB (0ed36ef5); no access is
+      // accepted until it ends, which the 60-cycle completion budget below cannot absorb.
+      cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
 
       def seed(preg: Int, value: Long): Unit = {
         s.seedValid #= true; s.seedAddr #= preg; s.seedData #= BigInt(value & 0xffffffffL)

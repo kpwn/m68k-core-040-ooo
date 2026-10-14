@@ -1428,7 +1428,13 @@ class ExceptionUnit(
       // 44-byte one. Reserved as far as this core is concerned -- see the field table
       // above for why zero is the CORRECT content here and not a placeholder.
       is(U(6,  5 bits)) { out := fpTag(src) ## B(0, 13 bits) }                // $0C STAG  [31:29]
-      is(U(8,  5 bits)) { out := fpuCtrl.uiCmdReg1B }                         // $10 CMDREG1B [31:16]
+      is(U(8,  5 bits)) {                                                     // $10 CMDREG1B [31:16]
+        // CPU_FSAVE_CLEAN_IDLE_CMD: mask like ETEMP/FPTEMP/E1 -- `uiCmdReg1B` is never
+        // cleared by the consume, so unmasked it leaks a stale, already-handled command.
+        out := (if (m68k040.top.ShippingCoreConfig.fsaveCleanIdleCmd)
+                  Mux(fsIsUnimp, fpuCtrl.uiCmdReg1B, B(0, 16 bits))
+                else fpuCtrl.uiCmdReg1B)
+      }
       is(U(10, 5 bits)) { out := fpTag(dst) ## B(0, 13 bits) }                // $14 DTAG  [31:29]
       is(U(12, 5 bits)) { out := B(0, 5 bits) ## unimpPacked ## B(0, 10 bits) } // $18 E1
       is(U(14, 5 bits)) { out := dst(79 downto 64) }                          // $1C FPTS|FPTE

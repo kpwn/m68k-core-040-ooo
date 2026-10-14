@@ -699,6 +699,17 @@ object ShippingCoreConfig {
     * from user mode, USP is restored. Cold path only: no branch/LSU/ROB-retire logic.
     * Default OFF. Read by `BranchEuPlugin`, `ExceptionUnit`. */
   val oddTargetPrecise: Boolean = envFlag("CPU_ODD_TARGET_PRECISE", true)
+  /** FSAVE frames with NO pending unimplemented instruction carry a ZERO CMDREG1B
+    * ($10 [31:16]). Every FSAVE emits the 52-byte version-$41/length-$30 frame (v1
+    * parity, faf5a15c), whose operands and E1 are already masked by `fsIsUnimp`, but
+    * CMDREG1B was written unmasked from `uiCmdReg1B` -- a register FSAVE's consume never
+    * clears -- so every FSAVE after the first vector-11 episode stamps the STALE command
+    * word of an already-handled instruction into a frame whose header is
+    * indistinguishable from a genuine unimplemented-instruction frame. Found by
+    * FsaveFrestoreSpec "FSAVE CONSUMES ..." (second frame word $10 = $BEEF). Cold path
+    * only: one 16-bit mux on the exception sequencer's frame-word data.
+    * Default OFF. Read by `ExceptionUnit`. */
+  val fsaveCleanIdleCmd: Boolean = envFlag("CPU_FSAVE_CLEAN_IDLE_CMD", false)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")

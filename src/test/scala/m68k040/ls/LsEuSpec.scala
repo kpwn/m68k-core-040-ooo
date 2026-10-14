@@ -77,6 +77,11 @@ class LsEuSpec extends AnyFunSuite {
     // Make the fixture's advertised "hit" tests real: without a CacheControlService
     // the LS EU correctly forces every access INHIBITED, so no first load can allocate.
     cd.waitSampling(80) // PRF init sweep
+    // The L1D's reset sweep clears one set per cycle and refuses every load/store until
+    // it finishes. Since 0ed36ef5 (CPU_DCACHE_KB default 16) that is 256 cycles, not 128,
+    // so the old fixed 80-cycle settle plus a 120-cycle completion budget expired before
+    // the cache accepted the first access. Wait for the sweep itself, not a cycle count.
+    cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
     // Apply after reset/PRF initialization; poking a RegInit while reset is still
     // asserted would be overwritten back to the architectural DE=0 reset value.
     dut.cacheCtrl.logic.dcacheEnabled #= true

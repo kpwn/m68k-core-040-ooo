@@ -83,6 +83,9 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
       // documented gotcha -- undriven ports/regs randomize per seed).
       dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
       cd.waitSampling(80)
+      // L1D reset sweep: 256 cycles at the shipping 16 KiB (0ed36ef5); no access is
+      // accepted until it ends, which the 60-cycle completion budget below cannot absorb.
+      cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
       // Fault VA 0x2000 -> VPN 0x2.
       dut.xlate.logic.faultEn  #= true
       dut.xlate.logic.faultVpn #= 0x2
@@ -126,6 +129,9 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
       s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> LEA path
       dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
       cd.waitSampling(80)
+      // L1D reset sweep: 256 cycles at the shipping 16 KiB (0ed36ef5); no access is
+      // accepted until it ends, which the 60-cycle completion budget below cannot absorb.
+      cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
       dut.xlate.logic.faultEn #= false   // no faults
       s.seedValid #= true; s.seedAddr #= 10; s.seedData #= BigInt(0x3000L); cd.waitSampling()
       s.seedAddr #= 11; s.seedData #= BigInt(0xAAAAL); cd.waitSampling()

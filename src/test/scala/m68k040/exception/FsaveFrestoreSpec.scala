@@ -60,7 +60,11 @@ class FsaveFrestoreSpec extends AnyFunSuite {
                          // raises, so `sawVector` cannot see one (the pre-existing
                          // vector-14 format-error and vector-3 odd-PC re-entries are
                          // invisible to it for the same reason).
-                         dblVec: Int)
+                         dblVec: Int,
+                         // `FpuControlPlugin.everExecuted` at the end of the run. Since every
+                         // FSAVE emits the same 52-byte frame (faf5a15c), this register is
+                         // the only remaining observable of the FRESTORE reset semantics.
+                         fpuEver: Boolean = false)
 
   /** Boot a FuzzCoreDut in supervisor mode, run `src`, and return observations.
     *
@@ -215,7 +219,8 @@ class FsaveFrestoreSpec extends AnyFunSuite {
         i += 1
       }
       val a7 = dut.rob.logic.exc.ss.a7.toLong & 0xffffffffL
-      out = Run(dmem, a7, xlateReqs, halted, vec, fsFault, dblF, dblVec)
+      out = Run(dmem, a7, xlateReqs, halted, vec, fsFault, dblF, dblVec,
+                dut.fpuCtl.logic.everExecuted.toBoolean)
     }
     out
   }
@@ -229,24 +234,42 @@ class FsaveFrestoreSpec extends AnyFunSuite {
 
   // ── Frame emission ────────────────────────────────────────────────────────────
 
-  test("FSAVE -(A7) with no FP op ever executed emits the 4-byte NULL frame", VerilatorTest) {
-    val r = run(s"$fsaveA7 ; done: bra.s done", everExecuted = false, name = "fsave-null")
-    val base = StackTop - 4
-    // Figure 9-7's null frame: [31:24] = $00 (the version is FORCED to zero -- that is what
-    // identifies a null frame), [23:16] undefined (we emit $00), 4 bytes total.
-    assert(frameByte(r, base, 0) == 0x00,
-      f"null frame version byte must be 0x00, got 0x${frameByte(r, base, 0)}%02X")
-    assert(frameByte(r, base, 1) == 0x00, "null frame length indicator")
-    assert(r.a7 == base, f"FSAVE -(A7) of a 4-byte frame must leave A7 = 0x$base%08X, got 0x${r.a7}%08X")
+  // ⚠ FRAME SIZE (re-pinned 2026-10-14). faf5a15c made FSAVE ALWAYS emit the 52-byte
+  // version-0x41 / length-0x30 frame -- v1 parity, owner-confirmed -- because the Q700 ROM
+  // FPSP does `linkw %fp,#-192 ; fsave %sp@-` and then addresses the frame at FIXED
+  // A6-relative offsets: a 4-byte NULL/IDLE frame leaves SP 48 bytes high and the FPSP's
+  // own BSR chain then clobbers a live return slot (Sad Mac 02 on v1 hardware). The two
+  // tests below predate that and still expected the MC68040 UM's 4-byte NULL/IDLE frames.
+  // This is a DELIBERATE, documented deviation from the UM in the RTL
+  // (`ExceptionUnit` FSAVE: `size = U(52)`, `hdr = 0x4130`), so they now pin what the
+  // shipping core emits: the 52-byte header, a ZERO body (nothing pending), and A7 moved
+  // by exactly 52 -- independent of `everExecuted`.
+  private def assertZeroBody52(r: Run, base: Long, what: String,
+                               skipCmd: Boolean = false): Unit = {
+    assert(r.a7 == base, f"$what: FSAVE -(A7) must leave A7 = 0x$base%08X (52-byte frame), got 0x${r.a7}%08X")
+    assert(frameByte(r, base, 0) == 0x41,
+      f"$what: version byte must be 0x41 (ExceptionUnit.FPU_FRAME_VERSION); got 0x${frameByte(r, base, 0)}%02X")
+    assert(frameByte(r, base, 1) == 0x30,
+      f"$what: length byte must be 0x30 (52-byte frame); got 0x${frameByte(r, base, 1)}%02X")
+    // With nothing pending the OPERANDS are zero-filled, and STAG ($0C [31:29]) / DTAG
+    // ($14 [31:29]) are computed from them (`fpTag`), so they read 001 = Zero -- the tag
+    // consistent with the zero ETEMP/FPTEMP. Every other word is zero.
+    for (off <- 2 until 52 by 2 if !(skipCmd && off == 0x10)) {
+      val want = if (off == 0x0C || off == 0x14) 0x2000 else 0
+      assert(frameWord(r, base, off) == want,
+        f"$what: with nothing pending the body is zero operands (STAG/DTAG = Zero); " +
+        f"word at 0x$off%02X = 0x${frameWord(r, base, off)}%04X, want 0x$want%04X")
+    }
   }
 
-  test("FSAVE -(A7) after an FP op emits the 4-byte IDLE frame, version 0x41", VerilatorTest) {
+  test("FSAVE -(A7) with no FP op ever executed emits the 52-byte zero-body frame (v1 parity)", VerilatorTest) {
+    val r = run(s"$fsaveA7 ; done: bra.s done", everExecuted = false, name = "fsave-null")
+    assertZeroBody52(r, StackTop - 52, "never-used FPU")
+  }
+
+  test("FSAVE -(A7) after an FP op emits the same 52-byte zero-body frame, version 0x41", VerilatorTest) {
     val r = run(s"$fsaveA7 ; done: bra.s done", everExecuted = true, name = "fsave-idle")
-    val base = StackTop - 4
-    assert(frameByte(r, base, 0) == 0x41,
-      f"idle frame version byte (ExceptionUnit.FPU_FRAME_VERSION); got 0x${frameByte(r, base, 0)}%02X")
-    assert(frameByte(r, base, 1) == 0x00, "idle frame carries 0 extra bytes")
-    assert(r.a7 == base, f"A7 must be 0x$base%08X, got 0x${r.a7}%08X")
+    assertZeroBody52(r, StackTop - 52, "used FPU, nothing pending")
   }
 
   test("FSAVE pending unimplemented E1 distinguishes packed from binary sources", VerilatorTest) {
@@ -319,17 +342,33 @@ class FsaveFrestoreSpec extends AnyFunSuite {
     assert(frameWord(r, base, 0x12) == 0x0000, "reserved word at 0x12")
   }
 
-  test("FSAVE CONSUMES the pending unimplemented state (a second FSAVE emits IDLE)", VerilatorTest) {
+  test("FSAVE CONSUMES the pending unimplemented state (a second FSAVE emits a zero-body frame)", VerilatorTest) {
     val src80 = (BigInt(0x4001) << 64) | BigInt(0x1234)
     val r = run(s"$fsaveA7 ; $fsaveA7 ; done: bra.s done", everExecuted = true,
                 unimp = Some((0xBEEF, src80, BigInt(0))), name = "fsave-consume")
-    // First FSAVE pushes 52 bytes; the SECOND must be a 4-byte IDLE frame directly below it.
-    val second = StackTop - 52 - 4
-    assert(r.a7 == second,
-      f"after 52-byte + 4-byte frames A7 must be 0x$second%08X, got 0x${r.a7}%08X -- " +
-      "a second 52-byte frame means the pending state was never consumed")
-    assert(frameByte(r, second, 0) == 0x41 && frameByte(r, second, 1) == 0x00,
-      "the second FSAVE must emit an IDLE frame -- the first one consumed the pending state")
+    // Every FSAVE frame is 52 bytes now (see the frame-size note above), so consumption
+    // is no longer visible in A7. It IS visible in the frame BODY: the first frame carries
+    // the pending CMDREG1B/ETEMP, the second -- if the first consumed the state -- is
+    // zero-filled. A second frame that still carried 0xBEEF means nothing was consumed.
+    val first  = StackTop - 52
+    val second = StackTop - 52 - 52
+    assert(frameWord(r, first, 0x10) == 0xBEEF,
+      f"first FSAVE must carry the pending CMDREG1B; got 0x${frameWord(r, first, 0x10)}%04X")
+    assert(frameWord(r, first, 0x28) == 0x4001,
+      f"first FSAVE must carry the pending ETEMP exponent; got 0x${frameWord(r, first, 0x28)}%04X")
+    // Consumption is proven by ETEMP (0x4001 above) reading zero here: the operands are
+    // masked by the pending flag the first FSAVE cleared. CMDREG1B is the exception: the
+    // RTL writes `uiCmdReg1B` unmasked and the consume never clears it, so without
+    // CPU_FSAVE_CLEAN_IDLE_CMD the second frame still says 0xBEEF -- a real (cold-path)
+    // RTL defect, fixed behind that flag. With the flag ON the whole body must be clean.
+    val clean = m68k040.top.ShippingCoreConfig.fsaveCleanIdleCmd
+    assertZeroBody52(r, second,
+      "second FSAVE (the first one must have consumed the pending unimplemented state)",
+      skipCmd = !clean)
+    if (!clean)
+      assert(frameWord(r, second, 0x10) == 0xBEEF,
+        "known defect (CPU_FSAVE_CLEAN_IDLE_CMD=0): stale CMDREG1B expected in the second frame; " +
+        f"got 0x${frameWord(r, second, 0x10)}%04X -- if this changed, re-pin this test")
   }
 
   // ── FRESTORE ──────────────────────────────────────────────────────────────────
@@ -426,27 +465,28 @@ class FsaveFrestoreSpec extends AnyFunSuite {
     }
   }
 
-  test("FRESTORE of a NULL frame resets the FPU: a following FSAVE emits NULL again", VerilatorTest) {
+  // These two predate faf5a15c, when FSAVE chose NULL vs IDLE from `everExecuted`, so
+  // they observed the FRESTORE reset semantics through the next FSAVE's 4-byte header at
+  // StackTop-4. Every FSAVE now emits the same 52-byte zero-body frame, which made the
+  // first test pass VACUOUSLY (StackTop-4 is a zero body word of the 52-byte frame) and
+  // the second fail. The FRESTORE semantics themselves are unchanged in the RTL
+  // (`everExecuted` cleared by a null-frame FRESTORE, set by a non-null one), so they are
+  // now asserted on that register directly -- this spec is whitebox by design -- plus the
+  // frame the following FSAVE really emits.
+  test("FRESTORE of a NULL frame resets the FPU ('never used' again)", VerilatorTest) {
     // "When an FRESTORE of a null state frame is performed, all FPU operations are
-    // aborted, and the FPU enters the reset state" (MC68040 UM 1989 1st ed., p.9-30) --
-    // the one FRESTORE behavior real hardware unconditionally requires. Proved through
-    // the observable consequence: everExecuted is cleared, so the next FSAVE emits NULL.
+    // aborted, and the FPU enters the reset state" (MC68040 UM 1989 1st ed., p.9-30).
     val r = run(f"lea 0x$RestoreBuf%08x,%%a0 ; $frestoreA0 ; $fsaveA7 ; done: bra.s done",
                 everExecuted = true, restoreHeader = Some(0x00000000L), name = "frestore-null-reset")
-    val base = StackTop - 4
-    assert(frameByte(r, base, 0) == 0x00,
-      f"after a null-frame FRESTORE the FPU is 'never used' again -> the next FSAVE must " +
-      f"emit NULL; got version 0x${frameByte(r, base, 0)}%02X")
+    assert(!r.fpuEver, "a null-frame FRESTORE must return the FPU to its reset ('never used') state")
+    assertZeroBody52(r, StackTop - 52, "FSAVE after a null FRESTORE")
   }
 
-  test("FRESTORE of a NON-null frame leaves the FPU 'has state': a following FSAVE emits IDLE",
-       VerilatorTest) {
+  test("FRESTORE of a NON-null frame leaves the FPU 'has state'", VerilatorTest) {
     val r = run(f"lea 0x$RestoreBuf%08x,%%a0 ; $frestoreA0 ; $fsaveA7 ; done: bra.s done",
                 everExecuted = false, restoreHeader = Some(0x41000000L), name = "frestore-idle-set")
-    val base = StackTop - 4
-    assert(frameByte(r, base, 0) == 0x41,
-      f"a non-null FRESTORE means the FPU had state -> the next FSAVE must emit IDLE; " +
-      f"got version 0x${frameByte(r, base, 0)}%02X")
+    assert(r.fpuEver, "a non-null FRESTORE means the FPU had state -> everExecuted must be set")
+    assertZeroBody52(r, StackTop - 52, "FSAVE after a non-null FRESTORE")
   }
 
   // ── Privilege ─────────────────────────────────────────────────────────────────

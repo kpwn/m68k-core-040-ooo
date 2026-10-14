@@ -43,8 +43,14 @@ class Cmp2HangTraceSpec extends AnyFunSuite {
           val deR = dut.divEu.issuePort.ready.toBoolean
           val deBusy = dut.divEu.logic.busy.toBoolean
           val deS1V  = dut.divEu.logic.s1Valid.toBoolean
-          val deRid  = dut.divEu.issuePort.payload.robId.toInt
-          val deOp   = dut.divEu.issuePort.payload.uop.op.toEnum.toString
+          // 1f9b27b9 registered the DivEu issue (`ip = issuePort.m2sPipe(...)`) and moved
+          // the payload taps to that stage: `issuePort.payload` is no longer simPublic, so
+          // reading it killed this trace at t=4650 with UNACCESSIBLE SIGNAL. Read the
+          // registered stage S0 actually consumes (its valid/ready are traced as well).
+          val ipV    = dut.divEu.logic.ip.valid.toBoolean
+          val ipR    = dut.divEu.logic.ip.ready.toBoolean
+          val deRid  = dut.divEu.logic.ip.payload.robId.toInt
+          val deOp   = dut.divEu.logic.ip.payload.uop.op.toEnum.toString
           val iqSlots = dut.iq.logic.slots.zipWithIndex.filter(_._1.sel.toBoolean).map { case (s, i) =>
             f"s$i(rid=${s.hot.robId.toInt},op=${s.hot.op.toEnum},lsWait=${s.lsWait.toBoolean},cplxWait=${s.cplxWait.toBoolean},pA=${s.hot.psrcA.toInt}(v=${s.hot.psrcAValid.toBoolean}),pB=${s.hot.psrcB.toInt}(v=${s.hot.psrcBValid.toBoolean}))"
           }.mkString(" ")
@@ -53,7 +59,7 @@ class Cmp2HangTraceSpec extends AnyFunSuite {
           val lsBusyHex = dut.iq.logic.lsBusy.toBigInt.toString(16)
           val lsWakeV = dut.iq.lsWakeupPort.valid.toBoolean
           val lsWakeP = dut.iq.lsWakeupPort.payload.toInt
-          val line = f"deIssueV=$deV deIssueR=$deR deBusy=$deBusy deS1V=$deS1V deRid=$deRid deOp=$deOp robHead=$robH robTail=$robT lsBusy=0x$lsBusyHex iqSlots=[$iqSlots]"
+          val line = f"deIssueV=$deV deIssueR=$deR ipV=$ipV ipR=$ipR deBusy=$deBusy deS1V=$deS1V deRid=$deRid deOp=$deOp robHead=$robH robTail=$robT lsBusy=0x$lsBusyHex iqSlots=[$iqSlots]"
           if (line != lastLine || lsWakeV) {
             println(f"[cmp2hang] cyc=$cycleCount%4d rawCommits=$rawCommits lsWakeV=$lsWakeV lsWakeP=$lsWakeP $line")
             lastLine = line
@@ -111,6 +117,12 @@ class Cmp2HangTraceSpec extends AnyFunSuite {
 
       cd.waitSampling(6300)
       println(f"[cmp2hang] DONE rawCommits=$rawCommits cyc=$cycleCount")
+      // The repro is 42 straight-line instructions ahead of `Lend: bra.s Lend`; the task
+      // #139 hang stalled commit at ~37 (the CMP2.B crack). This trace had no assertion,
+      // so it could only ever fail by crashing; pin the regression it exists for: commit
+      // must get past the CMP2.B and keep going (the self-loop commits forever).
+      assert(rawCommits > 42,
+        s"CMP2.B repro stopped committing at rawCommits=$rawCommits (task #139 hang shape)")
     }
   }
 }

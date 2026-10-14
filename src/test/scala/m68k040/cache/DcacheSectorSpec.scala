@@ -461,9 +461,12 @@ class DcacheSectorSpec extends AnyFunSuite {
        "ones untouched in memory", VerilatorTest) {
     sectoredDut.doSim("eviction-walk-pushes-only-dirty-sectors") { dut =>
       val (cd, mem) = initDut(dut)
-      // 32 sets of 64 bytes => the set stride is 2 KB, and there are 4 ways. Five lines
-      // 2 KB apart therefore map to ONE set and the fifth forces a replacement.
-      val stride = 2048L
+      // The set stride is capacity / ways (4 ways): 2 KB at 8 KiB, 4 KB at the shipping
+      // 16 KiB (`CPU_DCACHE_KB`, default 16 since 0ed36ef5 -- this Dut takes the shipping
+      // default). A hard-coded 2 KB stride at 16 KiB alternates between TWO sets, so five
+      // lines never force a replacement and nothing is evicted. Five lines one stride
+      // apart map to ONE set and the fifth forces a replacement.
+      val stride = (dut.dcache.cacheKB * 1024 / 4).toLong
       val victim = 0x50000L
       for (i <- 0 until 5) fillMem(mem, victim + i * stride, LINE)
 
