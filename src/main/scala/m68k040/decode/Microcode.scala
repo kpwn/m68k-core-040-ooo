@@ -2399,9 +2399,9 @@ object Microcode {
   // truncate an entry address and dispatch a valid instruction into the middle of some
   // other program -- the worst possible failure mode for a decoder. Fail elaboration
   // instead; the fix is to widen those three declarations together.
-  require(rom.size <= 512,
-    s"Microcode ROM has ${rom.size} rows but the 9-bit microcode PC addresses only 512. " +
-      "Widen OpSpec.ucEntry, DecodeStage's ucPc and ucNextPc together.")
+  require(rom.size <= upcRows,
+    s"Microcode ROM has ${rom.size} rows but the ${upcBits}-bit microcode PC addresses only ${upcRows}. " +
+      "Set CPU_UPC10 (10-bit µPC) or widen Microcode.upcBits.")
 
   /** `fpMemFormats` index for an ext[12:10] format code, or -1 for the two Packed codes
     * (011 static-k / 111 dynamic-k), which are out of hardware scope entirely. */
@@ -2490,6 +2490,10 @@ object Microcode {
   val MI_JSR_ENTRY = 196 // rows 196..199 (ptr-load, T0 := T0+od(+post-idx), push retPC, ibranch (T0))
   val MI_JMPJSR_PUSH_ROW = 198 // the JSR push row; DecodeStage swaps in `miJmpNopRow` for JMP
   def romSize: Int = rom.size
+  /** Width of the microcode PC (`OpSpec.ucEntry`, DecodeStage `ucPc`/`ucNextPc`): 9 bits,
+    * or 10 with CPU_UPC10. Every µPC / entry declaration takes its width from here. */
+  def upcBits: Int = if (m68k040.top.ShippingCoreConfig.upc10) 10 else 9
+  def upcRows: Int = 1 << upcBits
 
   // LUT-reduction Task A2: the real `Mem(DescBits(), romSize)` (built from `descToBits`,
   // Task A1) does NOT live here. `Microcode` is a plain Scala singleton `object` — its

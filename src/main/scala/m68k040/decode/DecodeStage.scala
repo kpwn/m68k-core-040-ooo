@@ -1775,7 +1775,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // current 130). Task 6b's FP-generic memory-source load family pushes romSize from
     // 252 to 310, overflowing 8 bits (0..255) the same way -- widened to 9 bits (0..511),
     // mirroring `OpSpec.ucEntry`'s identical widening (DecodeContracts.scala).
-    val ucPc     = Reg(UInt(9 bits))
+    val ucPc     = Reg(UInt(Microcode.upcBits bits))
     ucPc.simPublic()
     val ucCtx    = Reg(Microcode.Ctx())
     ucCtx.miOther.simPublic(); ucCtx.miOtherValid.simPublic()  // debug-only (task #144)
@@ -3104,7 +3104,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     //   ucCurLast -> ucNextPc` crosses the Mem's output register.
     // `ucCtx` needs NO such adjustment: it is a Reg latched on ucBegin and constant for the
     // whole chain, so reading it live (as before) is correct — the old code read the same Reg.
-    val ucNextPc  = UInt(9 bits)   // task 6b: widened 8->9 bits alongside ucPc/OpSpec.ucEntry
+    val ucNextPc  = UInt(Microcode.upcBits bits)   // 9 bits, 10 with CPU_UPC10 (Microcode.upcBits)
     val ucRowBitsRom = ucReadRow(ucNextPc.resize(log2Up(Microcode.romSize)))
     // MULx.L/DIVx.L memory-indirect (ctx.mdMi): rows 0/1 of the MULDIV program are replaced
     // by the pointer-chain loads (Microcode.mdMiRow0/1). The select is off REGISTERED state
@@ -3737,7 +3737,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // are mutually exclusive anyway.
     ucNextPc := ucPc                                              // (c) hold
     when(ucBegin) {
-      ucNextPc := ucRealEntry.resize(9)                           // (a) entry
+      ucNextPc := ucRealEntry.resize(Microcode.upcBits)                         // (a) entry
     } elsewhen(ucActive) {
       when(pushProduced.ready && !ucCurLast) { ucNextPc := ucPc + 1 }   // (b) advance
     }
@@ -3755,7 +3755,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `ucBegin || ucActive` because `ucPc` has no reset value — while the engine is idle it
     // holds an arbitrary (in sim, randomized) value that is never used as a live row.
     GenerationFlags.simulation {
-      assert(!((ucBegin || ucActive) && ucNextPc >= U(Microcode.romSize, 9 bits)),
+      assert(!((ucBegin || ucActive) && ucNextPc >= U(Microcode.romSize, Microcode.upcBits + 1 bits)),
         s"DecodeStage: the microcode µPC left the ROM (ucNextPc >= romSize=${Microcode.romSize}) while the µcode engine was entering or running -- either a ucEntry constant is stale/out of range, or a ROM chain ran past its last row without an isLast descriptor. The Mem rows at/above romSize are UNINITIALIZED, so continuing would execute undefined microcode.",
         FAILURE)
     }
