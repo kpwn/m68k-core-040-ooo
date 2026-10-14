@@ -1574,22 +1574,27 @@ object Microcode {
     Desc(UMiPushFinal, mem = MStore, srcA = SA7, srcB = ST1, dst = SA7,
          sz = SzLong, keepCommit = true, isLast = true),                        // µPC195
 
-    // MI_JMP_ENTRY @196 (rows 196,197): ptr-load -> T0, ibranch to T0+od(+post-idx).
+    // MI_JMP_ENTRY = MI_JSR_ENTRY @196 (rows 196..199; 200 is an unreachable filler):
+    // a SHARED JMP/JSR program. The pointer load and the final-address generate come
+    // BEFORE the JSR's return-address push, so every EA register read (base An, pre- and
+    // post-index Xn -- A7 included) sees the PRE-push A7 (68040 / Musashi semantics), and a
+    // faulting pointer load leaves no stack write and no A7 update behind (it is the
+    // macro's first uop, so the fault restarts the instruction cleanly). The final target
+    // lives in T0 and the ibranch jumps to (T0), so the branch EU needs no index term
+    // (CPU_PRF_TRIM_BRIDX or not). For JMP, DecodeStage replaces the push row 198 with
+    // `miJmpNopRow` (same isLast=false, so the sequencer is untouched).
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
-         sz = SzLong, miPtrIndex = true, isFirst = true),                       // µPC196
-    Desc(UMiBranchFinal, srcA = ST0, useImm = true, imm = SMiOd,
-         sz = SzLong, miHostIndex = true, isLast = true),                       // µPC197
-
-    // MI_JSR_ENTRY @198 (rows 198,199,200): push retPC -> -(A7) (mirrors the fast-path
-    // `jsrPush`, NOT keepCommit — the trailing ibranch is the macro's real oracle step,
-    // exactly like the non-memind JSR crack), ptr-load -> T0, ibranch to T0+od(+post-idx).
+         sz = SzLong, miPtrIndex = true, isFirst = true),                       // µPC196 (JMP/JSR entry)
+    Desc(UMiLeaFinal, srcA = ST0, dst = ST0, useImm = true, imm = SMiOd,
+         sz = SzLong, miHostIndex = true),                                      // µPC197
     Desc(UMiPushFinal, mem = MStore, srcA = SA7, useImm = true, imm = SRetPc, dst = SA7,
-         sz = SzLong, isFirst = true),                                          // µPC198
-    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
-         sz = SzLong, miPtrIndex = true),                                       // µPC199
-    Desc(UMiBranchFinal, srcA = ST0, useImm = true, imm = SMiOd,
-         sz = SzLong, miHostIndex = true, isLast = true)                        // µPC200
+         sz = SzLong),                                                          // µPC198 (JSR push)
+    Desc(UMiBranchFinal, srcA = ST0, sz = SzLong, isLast = true),               // µPC199
+    Desc(UMiBranchFinal, srcA = ST0, sz = SzLong, isLast = true)                // µPC200 (unreachable)
   )
+  /** Row 198 for a memory-indirect JMP: T0 := T0 + 0 (no push), substituted by DecodeStage. */
+  val miJmpNopRow: Desc = Desc(UMiLeaFinal, srcA = ST0, dst = ST0, useImm = true, imm = SFpStIdx0,
+    sz = SzLong)
   private def romP7(): Vector[Desc] = Vector(
     // ════════════════════════════════════════════════════════════════════════
     // Bit-field MEMORY-INDIRECT, DYNAMIC offset (Do=1) RMW/INS + the BFINS static-offset
@@ -2481,8 +2486,9 @@ object Microcode {
   val UNPK_MEM_ENTRY = 172 // rows 172..177 (load Ay/predec, UNPK compute, store lo, shift, store hi)
   val MI_LEA_ENTRY = 191 // rows 191,192 (ptr-load, T0+od(+post-idx) -> An)
   val MI_PEA_ENTRY = 193 // rows 193..195 (ptr-load, T0+od(+post-idx) -> T1, push T1 -> -(A7))
-  val MI_JMP_ENTRY = 196 // rows 196,197 (ptr-load, ibranch T0+od(+post-idx))
-  val MI_JSR_ENTRY = 198 // rows 198..200 (push retPC -> -(A7), ptr-load, ibranch T0+od(+post-idx))
+  val MI_JMP_ENTRY = 196 // rows 196..199 (ptr-load, T0 := T0+od(+post-idx), [JMP: nop], ibranch (T0))
+  val MI_JSR_ENTRY = 196 // rows 196..199 (ptr-load, T0 := T0+od(+post-idx), push retPC, ibranch (T0))
+  val MI_JMPJSR_PUSH_ROW = 198 // the JSR push row; DecodeStage swaps in `miJmpNopRow` for JMP
   def romSize: Int = rom.size
 
   // LUT-reduction Task A2: the real `Mem(DescBits(), romSize)` (built from `descToBits`,

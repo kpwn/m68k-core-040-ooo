@@ -118,6 +118,9 @@ class BranchEuPlugin(val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRe
   // psrcCValid=False so the read is architecturally a don't-care (the S1 term is forced
   // to zero, exactly like the LS EU's `idxTerm0` gating).
   var idxRd: RegFileReadPort = null
+  // CPU_PRF_TRIM_BRIDX: no `idxRd` port. Decode/µcode never issue an ibranch with a valid
+  // psrcC (indexed JMP/JSR targets are pre-computed into T0 by an LS address-generate µop).
+  private val prfTrimBrIdx: Boolean = m68k040.top.ShippingCoreConfig.prfTrimBrIdx
   // FPCC read port for the FP conditional branches (FBcc). The 4-bit renamed FPCC is
   // {NaN, I, Z, N} = bit3..bit0 (FpAddPipe.scala's "Internal FPCC order" note). An FBcc
   // declares `readsFpcc`, which is all the IQ needs: `trigInit`'s FPCC dep and the
@@ -152,7 +155,7 @@ class BranchEuPlugin(val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRe
     // asserts on it in simulation rather than silently dropping the loser.
     anW   = host[IntRegFileService].newWrite(latency = 1, sharingKey = BranchEuPlugin.IntWbKey, priority = 1)
     anByp = host[IntRegFileService].newBypass()
-    idxRd = host[IntRegFileService].newRead(forceNoBypass = false)
+    if (!prfTrimBrIdx) idxRd = host[IntRegFileService].newRead(forceNoBypass = false)
     fpccRd = host[FpccRegFileService].newRead(forceNoBypass = true)
   }
 
@@ -170,12 +173,22 @@ class BranchEuPlugin(val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRe
     // adds nothing extra. Read in S0 (off the regfile, possibly bypassed); the scaled
     // term is REGISTERED into s1Index at the S0->S1 boundary so the target adder stays a
     // shallow stage off flops, mirroring `s1TgtBase` (no deep ALU-bypass cone).
-    idxRd.addr := u0.psrcC
     fpccRd.addr := u0.pFpccSrc
-    val idxRaw0   = Mux(u0.indexLong, idxRd.data.asUInt,
-                        idxRd.data(15 downto 0).asSInt.resize(32).asUInt)
-    val idxScaled = ((idxRaw0 << u0.indexScale).resize(32))
-    val idxTerm0  = Mux(u0.psrcCValid, idxScaled, U(0, 32 bits))
+    val idxTerm0 = UInt(32 bits)
+    if (prfTrimBrIdx) {
+      idxTerm0 := U(0, 32 bits)
+      GenerationFlags.simulation {
+        assert(!(issuePort.valid && u0.psrcCValid),
+          "BranchEu: CPU_PRF_TRIM_BRIDX has no index read port, but a branch-class uop issued with psrcCValid",
+          FAILURE)
+      }
+    } else {
+      idxRd.addr := u0.psrcC
+      val idxRaw0   = Mux(u0.indexLong, idxRd.data.asUInt,
+                          idxRd.data(15 downto 0).asSInt.resize(32).asUInt)
+      val idxScaled = ((idxRaw0 << u0.indexScale).resize(32))
+      idxTerm0 := Mux(u0.psrcCValid, idxScaled, U(0, 32 bits))
+    }
 
     // ---- S0 -> S1 register (M2S) ----
     val s1Valid = RegNext(issuePort.valid) init False

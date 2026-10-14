@@ -3116,6 +3116,10 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     ucRowBits := ucRowBitsRom
     when(ucMdMiRow0) { ucRowBits := Microcode.descToBits(Microcode.mdMiRow0) }
     when(ucMdMiRow1) { ucRowBits := Microcode.descToBits(Microcode.mdMiRow1) }
+    // Memory-indirect JMP/JSR share one program; a JMP (opword bit 6: JMP 0x4EC0 vs JSR
+    // 0x4E80) replaces the JSR's push row with a no-op address row (both non-last).
+    val ucMiJmpNoPush = (ucPc === U(Microcode.MI_JMPJSR_PUSH_ROW, ucPc.getWidth bits)) && ucCtx.opword(6)
+    when(ucMiJmpNoPush) { ucRowBits := Microcode.descToBits(Microcode.miJmpNopRow) }
     val ucCurUop  = Microcode.resolveFromBits(ucRowBits, ucCtx, True)
     // isLast straight off the ROM: the two substituted rows and the rows they replace are
     // all non-last, so the sequencing loop (isLast -> ucNextPc -> ROM address) gains no mux.

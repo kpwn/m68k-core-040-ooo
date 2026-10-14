@@ -3734,6 +3734,33 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       verifyRetirement = brProbeExpect(0 -> iters.toLong))
   }
 
+  /** INDEXED JUMP-TABLE probe (CPU_PRF_TRIM_BRIDX): the Mac/C `switch` shape,
+    * `jmp tab(pc,Dn.w*4)` (or `jsr`) into a table of `bra.w` stubs, index cycling with
+    * period `handlers`. Measures the cost of cracking an indexed JMP/JSR target into an
+    * LS address-generate µop + an ibranch through T0.
+    * Per iteration: move, addq, and, jmp/jsr, bra.w, add, bra.w/rts, subq, bne = 9. */
+  def kBrJumpTable(handlers: Int = 8, iters: Int = 1024, call: Boolean = false,
+                   label: String = "br-jtab"): Kernel = {
+    require(handlers >= 2 && (handlers & (handlers - 1)) == 0, "handlers must be a power of two")
+    val setup = Seq("lea 0x00300000,%sp", "moveq #0,%d2", s"moveq #${handlers - 1},%d3",
+                    "moveq #1,%d1", "moveq #0,%d0", s"move.l #$iters,%d7")
+    val op = if (call) "jsr" else "jmp"
+    val body = Seq("move.l %d2,%d4", "addq.l #1,%d2", "and.l %d3,%d2",
+                   s"$op .Ljt(%pc,%d4.w*4)")
+    val tab  = (0 until handlers).map(i => s"bra.w .Ljh$i")
+    val back = if (call) "rts" else "bra.w .Ljnx"
+    val handlerCode = (0 until handlers).map(i => s".Ljh$i: add.l %d1,%d0 ; $back")
+    val tail = Seq(".Ljnx: subq.l #1,%d7", "bne.s .Ljtl")
+    val src = (setup ++ Seq(".Ljtl: " + body.mkString(" ; ")) ++
+      (if (call) Seq("bra.s .Ljnx") else Nil) ++
+      Seq(".Ljt: " + tab.mkString(" ; ")) ++ handlerCode ++ tail ++
+      Seq(".Ljtend: bra.s .Ljtend")).mkString(" ; ")
+    // jsr variant: the rts returns to `bra.s .Ljnx` (one extra macro per iteration).
+    Kernel(label, src, setup.size + iters * (if (call) 10 else 9),
+      warmupInstrs = setup.size,
+      verifyRetirement = brProbeExpect(0 -> iters.toLong))
+  }
+
   /** DBcc SLOT-1 COVERAGE probe: the canonical 68k counted loop, `add ; dbra`.
     *
     * `add.l %d1,%d0` is 2 bytes and `dbra %d7,.L` is 4, so the two emit as slot0 +

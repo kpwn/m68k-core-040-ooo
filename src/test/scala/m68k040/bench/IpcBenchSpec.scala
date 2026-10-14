@@ -95,7 +95,10 @@ class IpcBenchSpec extends CoreBenchHarness {
         kBrIndirect(handlers = 32, iters = 1024), kBrCapacity(sites = 256, iters = 8),
         kBrReturn(depth = 24, iters = 128), kBrPattern(iters = 1024), kBrDbcc(iters = 1024),
         kBrDbccPair(iters = 1024)) else Nil) ++
-      (if (sys.env.get("IPC_TRAP_KERNEL").contains("1")) Seq(kTrapRte(100)) else Nil)
+      (if (sys.env.get("IPC_TRAP_KERNEL").contains("1")) Seq(kTrapRte(100)) else Nil) ++
+      // IPC_JTAB_KERNEL=1 appends the indexed jump-table probes (CPU_PRF_TRIM_BRIDX A/B).
+      (if (sys.env.get("IPC_JTAB_KERNEL").contains("1")) Seq(
+        kBrJumpTable(), kBrJumpTable(call = true, label = "br-jtab-jsr")) else Nil)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
