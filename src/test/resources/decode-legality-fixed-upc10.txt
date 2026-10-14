@@ -1,0 +1,76 @@
+# DecodeLegalityEnumSpec: entries of decode-legality-known.txt that CPU_UPC10=1 closes
+# (10-bit microcode PC + the decode-gap programs). With the flag on the spec expects
+# `known -- this list`; with it off this file is ignored. Every entry here must also be in
+# decode-legality-known.txt. Measured 2026-10-14: known 177 -> 106 with the flag on
+# (0 new, 0 wedges); the remaining 106 are all dut=ok/CHK musashi=ILL over-acceptance.
+ASL mem (..,A0,Xn)[MI-post]|ILL|ok
+ASL mem (..,A0,Xn)[MI-pre]|ILL|ok
+ASR mem (..,A0,Xn)[MI-post]|ILL|ok
+ASR mem (..,A0,Xn)[MI-pre]|ILL|ok
+BFFFO dyn (..,A0,Xn)[MI-post]|ILL|ok
+BFFFO dyn (..,A0,Xn)[MI-pre]|ILL|ok
+BFFFO dyn (..,PC,Xn)[MI-pre]|ILL|ok
+BTST D1 #imm|ILL|ok
+CHK.L D1 (..,A0,Xn)[MI-post]|ILL|ok
+CHK.L D1 (..,A0,Xn)[MI-pre]|ILL|ok
+CHK.L D1 (..,PC,Xn)[MI-pre]|ILL|ok
+CHK.W D1 (..,A0,Xn)[MI-post]|ILL|CHK
+CHK.W D1 (..,A0,Xn)[MI-pre]|ILL|CHK
+CHK.W D1 (..,PC,Xn)[MI-pre]|ILL|CHK
+CHK2.b (..,A0,Xn)[MI-post]|ILL|CHK
+CHK2.b (..,A0,Xn)[MI-pre]|ILL|CHK
+CHK2.b (..,PC,Xn)[MI-pre]|ILL|CHK
+CHK2.l (..,A0,Xn)[MI-post]|ILL|CHK
+CHK2.l (..,A0,Xn)[MI-pre]|ILL|CHK
+CHK2.l (..,PC,Xn)[MI-pre]|ILL|CHK
+CHK2.w (..,A0,Xn)[MI-post]|ILL|CHK
+CHK2.w (..,A0,Xn)[MI-pre]|ILL|CHK
+CHK2.w (..,PC,Xn)[MI-pre]|ILL|CHK
+CMP2.b (..,A0,Xn)[MI-post]|ILL|ok
+CMP2.b (..,A0,Xn)[MI-pre]|ILL|ok
+CMP2.b (..,PC,Xn)[MI-pre]|ILL|ok
+CMP2.l (..,A0,Xn)[MI-post]|ILL|ok
+CMP2.l (..,A0,Xn)[MI-pre]|ILL|ok
+CMP2.l (..,PC,Xn)[MI-pre]|ILL|ok
+CMP2.w (..,A0,Xn)[MI-post]|ILL|ok
+CMP2.w (..,A0,Xn)[MI-pre]|ILL|ok
+CMP2.w (..,PC,Xn)[MI-pre]|ILL|ok
+DIVS.W (..,A0,Xn)[MI-post]|ILL|ok
+DIVS.W (..,A0,Xn)[MI-pre]|ILL|ok
+DIVS.W (..,PC,Xn)[MI-pre]|ILL|ok
+DIVU.W (..,A0,Xn)[MI-post]|ILL|ok
+DIVU.W (..,A0,Xn)[MI-pre]|ILL|ok
+DIVU.W (..,PC,Xn)[MI-pre]|ILL|ok
+LSL mem (..,A0,Xn)[MI-post]|ILL|ok
+LSL mem (..,A0,Xn)[MI-pre]|ILL|ok
+LSR mem (..,A0,Xn)[MI-post]|ILL|ok
+LSR mem (..,A0,Xn)[MI-pre]|ILL|ok
+MOVE fromCCR (..,A0,Xn)[MI-post]|ILL|ok
+MOVE fromCCR (..,A0,Xn)[MI-pre]|ILL|ok
+MOVE fromSR (..,A0,Xn)[MI-post]|ILL|ok
+MOVE fromSR (..,A0,Xn)[MI-pre]|ILL|ok
+MOVE toCCR (..,A0,Xn)[MI-post]|ILL|ok
+MOVE toCCR (..,A0,Xn)[MI-pre]|ILL|ok
+MOVE toCCR (..,PC,Xn)[MI-pre]|ILL|ok
+MOVE.l [A0]+X+od,[A1]+X+od|ILL|ok
+MOVE.l [A0],[A1]+X+od|ILL|ok
+MOVE.l [PC],[A1]+X+od|ILL|ok
+MULS.W (..,A0,Xn)[MI-post]|ILL|ok
+MULS.W (..,A0,Xn)[MI-pre]|ILL|ok
+MULS.W (..,PC,Xn)[MI-pre]|ILL|ok
+MULU.W (..,A0,Xn)[MI-post]|ILL|ok
+MULU.W (..,A0,Xn)[MI-pre]|ILL|ok
+MULU.W (..,PC,Xn)[MI-pre]|ILL|ok
+NBCD (..,A0,Xn)[MI-post]|ILL|ok
+NBCD (..,A0,Xn)[MI-pre]|ILL|ok
+ROL mem (..,A0,Xn)[MI-post]|ILL|ok
+ROL mem (..,A0,Xn)[MI-pre]|ILL|ok
+ROR mem (..,A0,Xn)[MI-post]|ILL|ok
+ROR mem (..,A0,Xn)[MI-pre]|ILL|ok
+ROXL mem (..,A0,Xn)[MI-post]|ILL|ok
+ROXL mem (..,A0,Xn)[MI-pre]|ILL|ok
+ROXR mem (..,A0,Xn)[MI-post]|ILL|ok
+ROXR mem (..,A0,Xn)[MI-pre]|ILL|ok
+TST.b #imm|ILL|ok
+TST.l #imm|ILL|ok
+TST.w #imm|ILL|ok
