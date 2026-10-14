@@ -64,7 +64,7 @@ class EoriAddaDecodeTraceSpec extends AnyFunSuite {
       }
 
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The two table-walker AXI memories that used to be attached here are gone:
       // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
       // writebacks are DcacheService client traffic now, so they reach memory

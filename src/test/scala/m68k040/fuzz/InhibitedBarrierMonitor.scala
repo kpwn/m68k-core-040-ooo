@@ -64,6 +64,11 @@ final class InhibitedBarrierMonitor(dut: FuzzCoreDut, val label: String) {
   def violations: Int = busBefore.size + busAfter.size + cmdBefore.size + cmdAfter.size
 
   private val ax = dut.dcache.logic.axi
+  /** The P6 hot door (shipping `nonBlocking && hotDoor` L1D): every cacheable refill leaves
+    * here, so a refill outstanding on it is "another transaction" exactly as one on `axi`.
+    * Its ids (MSHR index) are a separate namespace, offset by `HotIdBase` in `Txn.id`. */
+  private val dh = if (dut.dcache.hotDoor) dut.dcache.logic.axiDh else null
+  private val HotIdBase = 0x1000
   private val lc = dut.dcache.logic.loadCmdPort
   private val lr = dut.dcache.logic.loadRspPort
   private val sp = dut.dcache.logic.storePort
@@ -96,6 +101,10 @@ final class InhibitedBarrierMonitor(dut: FuzzCoreDut, val label: String) {
       val id = ax.b.payload.id.toInt
       val i = outW.indexWhere(_.id == id); if (i >= 0) outW.remove(i)
     }
+    if (dh != null && dh.r.valid.toBoolean && dh.r.ready.toBoolean && dh.r.payload.last.toBoolean) {
+      val id = HotIdBase + dh.r.payload.id.toInt
+      val i = outR.indexWhere(_.id == id); if (i >= 0) outR.remove(i)
+    }
     def start(t: Txn): Unit = {
       val others = (outR ++ outW)
       val inhibOut = others.filter(_.inhib)
@@ -120,6 +129,11 @@ final class InhibitedBarrierMonitor(dut: FuzzCoreDut, val label: String) {
       val a = ax.ar.payload.addr.toLong & 0xffffffffL
       reads += 1; if (inhib) { inhibReads += 1; devReadAddrs += a }
       start(Txn(isRead = true, id, a, inhib, cycles))
+    }
+    if (dh != null && dh.ar.valid.toBoolean && dh.ar.ready.toBoolean) {
+      val a = dh.ar.payload.addr.toLong & 0xffffffffL
+      reads += 1
+      start(Txn(isRead = true, HotIdBase + dh.ar.payload.id.toInt, a, inhib = false, cycles))
     }
     if (ax.aw.valid.toBoolean && ax.aw.ready.toBoolean) {
       val id = ax.aw.payload.id.toInt

@@ -45,7 +45,7 @@ class AguCrossSpec extends AnyFunSuite {
     // descriptor"). Attach a responder, BEFORE the first clock edge -- the same ordering
     // ExceptionEntrySpec/RteSpec already document for the identical hazard. This test never
     // reads memory; the agent exists purely to own those inputs.
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
     cd.forkStimulus(10)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false

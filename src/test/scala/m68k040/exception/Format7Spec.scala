@@ -109,7 +109,7 @@ class Format7Spec extends AnyFunSuite {
       // (Found while gating the byte-lane wrap fixes: those add registers and a DLoadCmd
       // field, which reshuffles the seed -> uninitialised-register mapping and so changes
       // which pre-existing flakes draw a losing seed.)
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
 

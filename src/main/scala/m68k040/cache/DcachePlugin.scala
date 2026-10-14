@@ -4154,7 +4154,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val dbgStallDcPack = Bits(32 bits)
     dbgStallDcPack := B(0, 32 bits)
     dbgStallDcPack(0)  := resetSweepBusy
-    dbgStallDcPack(1)  := busy
+    // Non-blocking L1D: cacheable misses live in the MSHR file / WB buffer, never in the
+    // legacy FSM, so `busy` alone reads ~0 under the shipping L1D (OFF_PERF_STALL_DC dead).
+    dbgStallDcPack(1)  := (if (nonBlocking) busy || !nbIdle else busy)
     dbgStallDcPack(2)  := ldS1Valid
     dbgStallDcPack(3)  := ldS2Valid
     dbgStallDcPack(4)  := loadShadowValid

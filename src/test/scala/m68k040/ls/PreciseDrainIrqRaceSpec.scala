@@ -41,7 +41,7 @@ class PreciseDrainIrqRaceSpec extends AnyFunSuite {
     compiled.doSim("irq_race", seed = 1) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = false)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = false))
       // MMU is off for the whole run (see below), so the DTLB/ITLB table-walker
       // AXI masters are never driven by real page-walk traffic, but every other
       // established harness in this family (WildPcA7TraceSpec, PortedTestRunner,

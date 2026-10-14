@@ -210,7 +210,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
   test("store -> forwarded load -> ALU consumer (end-to-end)", VerilatorTest) {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       val base = 0x6000L
       // 64, not 16: a sectored miss installs the whole 64-byte line, so the bytes beyond
       // the first 16 must be the spec's own pattern rather than PRNG-filled SparseMemory

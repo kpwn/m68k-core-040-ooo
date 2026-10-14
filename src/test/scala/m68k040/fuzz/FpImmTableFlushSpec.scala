@@ -141,7 +141,7 @@ _fline:
     compiled.doSim(s"fp_imm_table_flush_${if (cached) "cached" else "uncached"}", 1) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       FuzzDut.attachProgramWithBusErrors(dut.icache.logic.axi, cd, PortedTestRunner.loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true))
       for (i <- image.bytes.indices) dmem.mem.write(PortedTestRunner.loadAddr + i, image.bytes(i).toByte)
       dut.ctrl.logic.mmuEnable #= false
       dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0

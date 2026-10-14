@@ -16,6 +16,11 @@ object HotDoorAttach {
       cold.cfg.copy(crossbarSingleOutstanding = false, idBusyBlock = false),
       sharedMem = cold.mem, sharedL2From = cold)
 
+  /** `model`, returning the COLD model so an `attachFull(...)` expression can be wrapped. */
+  def cold(dc: DcachePlugin, cd: ClockDomain, cold: AxiMemModel): AxiMemModel = {
+    model(dc, cd, cold); cold
+  }
+
   def apply(dc: DcachePlugin, cd: ClockDomain, agent: m68k040.ls.BehavioralMemAgent): m68k040.ls.BehavioralMemAgent = {
     model(dc, cd, agent.model); agent
   }

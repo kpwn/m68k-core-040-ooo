@@ -94,7 +94,7 @@ class FsaveFrestoreSpec extends AnyFunSuite {
       // translation fault in the `mmuFaulting` case, and a deterministic 0 background also
       // makes "the frame body is zero where it should be" a meaningful assertion.
       val zmem = new m68k040.sim.ConstFillSparseMemory(0.toByte)
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem))
       // (The two table-walker AXI memories that used to be attached here are gone:
       // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
       // writebacks are DcacheService client traffic now, so they reach memory
@@ -497,7 +497,7 @@ class FsaveFrestoreSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val zmem = new m68k040.sim.ConstFillSparseMemory(0.toByte)
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem))
       // (The two table-walker AXI memories that used to be attached here are gone:
       // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
       // writebacks are DcacheService client traffic now, so they reach memory
@@ -648,7 +648,7 @@ class FsaveFrestoreSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val zmem = new m68k040.sim.ConstFillSparseMemory(0.toByte)
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem))
       def pokeLong(addr: Long, v: Long): Unit =
         for (i <- 0 until 4) dmem.pokeByte(addr + i, ((v >> (8 * (3 - i))) & 0xff).toInt)
       // VA 0x0002E0CC: root idx = VA[31:25] = 0, ptr idx = VA[24:18] = 0,

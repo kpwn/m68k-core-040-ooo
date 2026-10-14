@@ -145,7 +145,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
     h.compiledDut.doSim(s"moves-fc-${System.nanoTime()}") { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
 
       // Supervisor tree: identity-mapped code + DataVa -> PaSup.
       h.buildMmuTable(dmem, DataVa, PaSup >> 12)
@@ -234,7 +234,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
     h.compiledDut.doSim(s"moves-prot-${System.nanoTime()}") { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
 
       h.buildMmuTable(dmem, SysVa, SysPa >> 12)                       // code + sys page
       map4k(dmem, h.MMU_ROOT, h.MMU_PTRT, h.MMU_PAGT, TgtVa, TgtPaSup)          // sup: open
@@ -326,7 +326,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
     h.compiledDut.doSim(s"dtlb-8k-${System.nanoTime()}") { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
 
       // Code: identity, 4 x 8 KB pages, its own leaf table.
       for (i <- 0 until 4)
@@ -395,7 +395,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
       }
       // page 31 keeps the `bra .` fence already written there.
       m68k040.sim.AxiMemModel.attachReadOnly(dut.icache.logic.axi, cd, sharedMem = mem)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
 
       for (i <- 0 until NPages)
         map8k(dmem, h.MMU_ROOT, h.MMU_PTRT, h.MMU_PAGT, pageVa(i), pageVa(i))
@@ -481,7 +481,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
       m68k040.sim.AxiMemModel.fillIFetchRunAheadGuard(mem, CodeVa + 4, 1024)
 
       m68k040.sim.AxiMemModel.attachReadOnly(dut.icache.logic.axi, cd, sharedMem = mem)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = mem)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = mem))
 
       // IE only: the instruction cache ON, the data cache OFF.
       boot(dut, cd, loadAddr, mmuOn = false, page8K = false,
@@ -559,7 +559,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
     h.compiledDut.doSim(s"exc-mmu-off-${System.nanoTime()}") { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // No page tables at all -- there is nothing to walk and nothing that should try.
       boot(dut, cd, loadAddr, mmuOn = false, page8K = false,
            urp = 0L, srp = 0L, cacr = 0x80008000L, sp = 0x00120000L)
@@ -619,7 +619,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
     h.compiledDut.doSim(s"exc-mmu-enable-${System.nanoTime()}") { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // Code identity-mapped (the I side translates too once TC.E is set) + the
       // post-enable system page mapped NON-identity.
       h.buildMmuTable(dmem, OnSysVa, OnSysPa >> 12)
@@ -689,7 +689,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
     h.compiledDut.doSim(s"exc-ttr-${System.nanoTime()}") { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // Code identity-mapped; the data page argument is a THROWAWAY far from SysVa,
       // so the vector table and stack have NO page-table entry of any kind. Only the
       // transparent-translation register can resolve them -- if the exception path

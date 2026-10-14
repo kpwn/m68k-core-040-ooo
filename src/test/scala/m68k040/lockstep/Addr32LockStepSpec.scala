@@ -481,7 +481,7 @@ class Addr32LockStepSpec extends AnyFunSuite {
       m68k040.sim.AxiMemModel.fillIFetchRunAheadGuard(mem, codeVa + 4, 1024)
 
       m68k040.sim.AxiMemModel.attachReadOnly(dut.icache.logic.axi, cd, sharedMem = mem)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = mem)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = mem))
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -590,7 +590,7 @@ class Addr32LockStepSpec extends AnyFunSuite {
     h.compiledDut.doSim(s"addr32-exc-xlate-${System.nanoTime()}") { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // Page table: the code identity-mapped (so I-fetch works), the ONE data page
       // deliberately NOT.
       h.buildMmuTable(dmem, PageVa, PagePpn)
@@ -693,7 +693,7 @@ class Addr32LockStepSpec extends AnyFunSuite {
     h.compiledDut.doSim(s"$tag-${System.nanoTime()}") { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       h.buildMmuTable(dmem, PageVa, PagePpn)     // maps PageVa + the 8 code pages ONLY
       // ...and make UnmapVa's leaf descriptor EXPLICITLY invalid (PDT = 00). Writing it
       // is not optional: `buildMmuTable` only fills the entries it needs, and the D-side
@@ -798,7 +798,7 @@ class Addr32LockStepSpec extends AnyFunSuite {
     h.compiledDut.doSim(s"addr32-exc-xlate-8k-${System.nanoTime()}") { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
 
       // ── hand-built 8 KB page tables: root VA[31:25], pointer VA[24:18], page VA[17:13]
       def poke32BE(a: Long, w: Long): Unit =

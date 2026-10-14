@@ -73,7 +73,7 @@ class LsEuSplitRingSpec extends AnyFunSuite {
   def initDut(dut: Dut, dataMemCfg: AxiMemModelConfig = AxiMemModelConfig(),
               dcacheEnabled: Boolean = true): (ClockDomain, AxiMemModel) = {
     val cd = dut.clockDomain; cd.forkStimulus(10)
-    val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, dataMemCfg)
+    val mem = m68k040.sim.HotDoorAttach.cold(dut.dcache, cd, AxiMemModel.attachFull(dut.dcache.logic.axi, cd, dataMemCfg))
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.iStkPush #= false; s.iLeaAddr #= false
@@ -225,7 +225,8 @@ class LsEuSplitRingSpec extends AnyFunSuite {
         fork {
           while (tracking.get()) {
             cd.waitSampling()
-            if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+            // Both read doors (CPU_AXI_DH: cacheable refills leave on the hot door).
+            if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1
           }
         }
 

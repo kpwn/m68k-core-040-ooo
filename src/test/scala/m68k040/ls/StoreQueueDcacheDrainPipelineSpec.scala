@@ -250,7 +250,7 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
   private def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
     cd.forkStimulus(10)
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
     dut.allocIn.valid #= false
     dut.commitIn.valid #= false
     dut.commitBIn.valid #= false
@@ -429,7 +429,8 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
         dut.dcache.logic.stS2HitVec.exists(_.toBoolean)
       localAckIdentity =
         if (s2LocalHit) Some(payloadDesc(dut.dcache.logic.stS2Payload)) else None
-      if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean)
+      // Both read doors (CPU_AXI_DH: a COPYBACK miss's allocate refill leaves on the hot door).
+      if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache))
         arCount += 1
       if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean)
         awCount += 1

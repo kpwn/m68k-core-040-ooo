@@ -150,7 +150,7 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
   def initDut(dut: Dut, dataMemCfg: AxiMemModelConfig = AxiMemModelConfig()):
       (ClockDomain, AxiMemModel, AxiMemModel) = {
     val cd = dut.clockDomain; cd.forkStimulus(10)
-    val mem   = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, dataMemCfg)
+    val mem   = m68k040.sim.HotDoorAttach.cold(dut.dcache, cd, AxiMemModel.attachFull(dut.dcache.logic.axi, cd, dataMemCfg))
     // The DTLB walker now reaches memory through the D-cache, so the page table must
     // live in the D-SIDE memory rather than a private walker image. Aliasing the old
     // name onto it keeps every buildPage/pokeDescriptor call site below unchanged.
@@ -683,8 +683,13 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
           compCycles += cycle
           compRobs += s.cRob.toInt
         }
+        // CPU_LS_P3_LAUNCH (shipping): a resident hit launches its L1D command from P3 and
+        // goes straight into the descriptor ring, so P4 stays empty on a pure hit stream;
+        // the third in-flight load is then a ring descriptor, not a P4 occupant.
+        val thirdInFlight = dut.eu.logic.p4Valid.toBoolean ||
+          (dut.eu.p3Launch && dut.eu.p3FastLoad && dut.eu.logic.alignedCount.toInt > 0)
         if (dut.eu.logic.tValid.toBoolean && dut.eu.logic.p3Valid.toBoolean &&
-            dut.eu.logic.p4Valid.toBoolean) allFrontStagesOccupied = true
+            thirdInFlight) allFrontStagesOccupied = true
 
         cd.waitSampling()
         cycle += 1
@@ -865,8 +870,21 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
         "cold-miss serialization must retain the fifth request upstream when the oldest ring entry completes")
       assert(sawFifthEnqueue,
         "the fifth request retained behind the full ring must eventually enqueue exactly once")
-      assert(completions == Seq(10, 11, 12, 13, 14),
+      // CPU_DCACHE_NONBLOCKING (shipping): responses are rid-tagged and complete as their
+      // MSHR fills, so completion ORDER is not a contract; every load completing exactly
+      // once with ITS OWN data is (the association the ring exists to get right).
+      val expectInOrder = !dut.dcache.nonBlocking
+      if (expectInOrder) assert(completions == Seq(10, 11, 12, 13, 14),
         s"full-ring untagged response association/order: got $completions")
+      else assert(completions.sorted == Seq(10, 11, 12, 13, 14),
+        s"full-ring response association: every load completes exactly once, got $completions")
+      cd.waitSampling(4)
+      for (i <- 0 until 5) {
+        dut.src.logic.obsIntAddr #= 20 + i; sleep(1)
+        val want = (BigInt(0x20 + i) << 24) | (BigInt(0x30 + i) << 16) | (BigInt(0x40 + i) << 8) | BigInt(0x50 + i)
+        assert(dut.src.logic.obsIntData.toBigInt == want,
+          f"full-ring load $i data: got 0x${dut.src.logic.obsIntData.toBigInt}%08x want 0x$want%08x")
+      }
       assert(dut.eu.logic.alignedCount.toInt == 0, "full descriptor ring must drain")
     }
   }

@@ -202,7 +202,7 @@ class ExceptionUnitStaleLoadRspRaceSpec extends AnyFunSuite {
     compiled.doSim(name, 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
 
       dut.rsrc.logic.src.valid #= false
       dut.rsrc.logic.u1v #= false
