@@ -147,6 +147,13 @@ object OperationDecoder {
           // STATIC form: the bit-number ext word precedes the EA's own. DYNAMIC form:
           // the bit number is Dn (op[11:9]), so the EA ext sits directly at op+1.
           eaShift := Mux(isStatBit, U(1, 2 bits), U(0, 2 bits))
+          // CPU_UPC10: BTST Dn,#imm (68020+) runs the µcode IMM_FLAGS program.
+          if (m68k040.top.ShippingCoreConfig.upc10) {
+            when(isDynBit && (tt === B"00") && (opword(5 downto 0) === B"6'b111100")) {
+              o.microcoded := True
+              o.ucEntry    := U(Microcode.IMM_FLAGS_ENTRY, o.ucEntry.getWidth bits)
+            }
+          }
           // size is dest-dependent (Dn=LONG, mem=BYTE) -> resolved in the assembler.
         }
         // ── CAS / CAS2 (020+ atomic compare-and-swap) ──────────────────────────
@@ -382,6 +389,13 @@ object OperationDecoder {
             is(0xA) {   // TST: flags only (NZ); NO write
               o.op := DecOp.TST; o.dstWrites := False
               o.writesNzvc := True
+              // CPU_UPC10: TST #imm (68020+) runs the µcode IMM_FLAGS program.
+              if (m68k040.top.ShippingCoreConfig.upc10) {
+                when(opword(5 downto 0) === B"6'b111100") {
+                  o.microcoded := True
+                  o.ucEntry    := U(Microcode.IMM_FLAGS_ENTRY, o.ucEntry.getWidth bits)
+                }
+              }
             }
           }
         }

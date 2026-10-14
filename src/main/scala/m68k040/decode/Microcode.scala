@@ -2344,7 +2344,7 @@ object Microcode {
   //   host op on it (srcB = the bit-number Dn for BTST; none for TST).
   private def romImmFlags: Vector[Desc] = Vector(
     Desc(UMove, dst = ST1, useImm = true, imm = SMiImm, sz = SzLong, isFirst = true),
-    Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, isLast = true))
+    Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, sz = SzHost, isLast = true))
   private def romUpc10: Vector[Desc] =
     romMiFromSr ++ romMiCmp2 ++ romMiBfFfoDo1 ++ romMiMoveBothPost ++ romImmFlags
   val MI_FROMSR_ENTRY: Int         = upc10Start

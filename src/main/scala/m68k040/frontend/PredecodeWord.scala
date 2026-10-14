@@ -373,6 +373,12 @@ object PredecodeWord {
                 r.lenWords := (bitBase + Mux(bitDstEaW(8), fullExtLen(bitDstEaW), U(1, 3 bits))).resized
               }
             }
+            // CPU_UPC10: BTST Dm,#imm (68020+; the µcode IMM_FLAGS program): opword + imm word.
+            if (m68k040.top.ShippingCoreConfig.upc10) {
+              when(isBtstOp && isDynBit && (mode === U(7, 3 bits)) && (reg === U(4, 3 bits))) {
+                r.lenWords := U(2, 4 bits)
+              }
+            }
           }
         }
         // ── MOVEP (0000 rrr 1 oo 001 aaa) + disp16 ──────────────────────────────
@@ -774,6 +780,13 @@ object PredecodeWord {
                       (u4mode === U(1, 3 bits)) && (u4o === U(0xA, 4 bits))
         when(isTstAn) {
           r.lenWords := U(1, 4 bits)
+        }
+        // CPU_UPC10: TST #imm (68020+; the µcode IMM_FLAGS program): opword + 1 (.B/.W) or
+        // 2 (.L) immediate words.
+        if (m68k040.top.ShippingCoreConfig.upc10) {
+          val isTstImm = !op(8) && (u4ss =/= U(3, 2 bits)) && (u4o === U(0xA, 4 bits)) &&
+                         (op(5 downto 0) === B"6'b111100")
+          when(isTstImm) { r.lenWords := Mux(u4ss === U(2, 2 bits), U(3, 4 bits), U(2, 4 bits)) }
         }
         // TAS <ea> mem-dest (task #158): op[15:6]==0b0100101011, mode != 000 (mode=000 is
         // the Dn form, already matched by `isTas` above). Opword + EA ext, same shape as

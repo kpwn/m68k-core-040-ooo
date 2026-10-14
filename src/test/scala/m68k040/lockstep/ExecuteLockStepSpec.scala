@@ -7975,6 +7975,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 7 + 1 + 2 + 2, seedDside = true)
   }
 
+  // TST #imm (.B/.W/.L) and BTST Dn,#imm (bit number mod 8; N/V/C preserved: the CCR is
+  // seeded before each BTST and the lock-step compares the full CCR per step).
+  test("lock-step: upc10 TST #imm / BTST Dn,#imm", VerilatorTest) {
+    upc10Only()
+    runLockStep("upc10-tst-btst-imm",
+      "move.l #3,%d1 ; tst.l #0x80000000 ; smi %d2 ; tst.w #0 ; seq %d3 ; tst.b #0x7f ; spl %d4 ; " +
+      "moveq #10,%d1 ; move #0x0b,%ccr ; btst %d1,#0x04 ; seq %d5 ; " +
+      "moveq #3,%d1 ; move #0x0b,%ccr ; btst %d1,#0x08 ; sne %d6 ; " +
+      "loop: bra loop",
+      nInstr = 1 + 6 + 4 + 4 + 1)
+  }
+
   // BFFFO with a dynamic offset through memory-indirect EAs (post-indexed, PC), and MOVE
   // between two memory-indirect EAs whose destination is post-indexed.
   test("lock-step: upc10 BFFFO dynamic offset / MOVE mi->mi post-indexed dst", VerilatorTest) {

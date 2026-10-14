@@ -2862,6 +2862,22 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       }
       // MOVE from SR is privileged: needsSupervisor on its first µop (the SR read).
       when(ucFromSrMi && ucFromSrIsSr) { ucEntryCtx.needsSup := True }
+      // TST #imm / BTST Dn,#imm (IMM_FLAGS, routed by OperationDecoder's ucEntry): the
+      // immediate (.L = words(1..2)) is materialised into T1; BTST's bit number is Dn =
+      // op[11:9] (ucMiOtherReg's default) at BYTE size (miHostSize, as for any BITOP).
+      val ucTstImm  = (ucEopw(15 downto 8) === B"8'h4A") && (ucEopw(7 downto 6) =/= B"11") &&
+                      (ucEopw(5 downto 0) === B"6'b111100")
+      val ucBtstImm = (ucEopw(15 downto 12) === B"0000") && ucEopw(8) && (ucEopw(7 downto 6) === B"00") &&
+                      (ucEopw(5 downto 0) === B"6'b111100")
+      when(ucTstImm || ucBtstImm) {
+        ucEntryCtx.miOtherIsImm := False
+        ucEntryCtx.miOtherValid := ucBtstImm
+        ucEntryCtx.miHostImm    := Mux(ucTstImm && (ucEopw(7 downto 6) === B"10"),
+                                       ucEntryPkt.words(1) ## ucEntryPkt.words(2),
+                                       ucEntryPkt.words(1).asSInt.resize(32).asBits)
+        ucEntryCtx.miRNzvc := ucEntrySpec.readsNzvc;  ucEntryCtx.miRX := ucEntrySpec.readsX
+        ucEntryCtx.miWNzvc := ucEntrySpec.writesNzvc; ucEntryCtx.miWX := ucEntrySpec.writesX
+      }
     }
     // The EA<->EA plain side's OWN address (task #119): independent of the pointer-load's
     // eaBase/eaDispLo/eaIndex group above, which stays dedicated to whichever side IS
