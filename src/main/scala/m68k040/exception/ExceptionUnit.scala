@@ -550,6 +550,11 @@ class ExceptionUnit(
   // curThrowaway/frameBase2/stFrame2 are the ENTRY-side bookkeeping; the RTE side
   // needs no extra state — `popIs1` (mirrors popIs7/popIs2) drives the loop-back.
   val curThrowaway = RegInit(False)   // this INTERRUPT entry needs a $1 throwaway frame
+  // CPU_ODD_TARGET_PRECISE: this vector-3 entry is a CALL (JSR/BSR) whose return-address
+  // push already retired -- undo it (frame at pre-call SP - 12, or USP += 4 from user mode).
+  // Set only by IDLE's entry capture, consumed and cleared by E_REDIR.
+  val oddTargetPrecise = m68k040.top.ShippingCoreConfig.oddTargetPrecise
+  val curOddCall   = if (oddTargetPrecise) RegInit(False) else null
   val frameBase2   = Reg(UInt(32 bits))   // ISP-relative base for the $1 frame (entry only)
   val stFrame2     = RegInit(False)       // E_STORE loop is currently on the 2nd ($1) frame
 
@@ -1706,7 +1711,15 @@ class ExceptionUnit(
         // `addrErr`/`faultAddr` and RobPlugin's euFaultCompletion->faultAddrStore),
         // NOT the trapping-instruction PC that TRAPV/CHK/DIV0 put there. Every other
         // vector routed through is2 keeps using `ppc` unchanged.
-        val ppcOrTarget = Mux(entryVector === 3, entryFaultAddr, ppc.resized)
+        // CPU_ODD_TARGET_PRECISE: the branch EU sends a vector-3 address with bit 0 =
+        // !isCall (bit 0 of an odd target is redundant). Restore it before ANY consumer.
+        val oddCallNow = if (oddTargetPrecise)
+          !entryIsInterrupt && (entryVector === 3) && !entryFaultAddr(0) else False
+        val faultAddrFix = if (oddTargetPrecise)
+          Mux(!entryIsInterrupt && (entryVector === 3), entryFaultAddr | U(1, 32 bits), entryFaultAddr)
+          else entryFaultAddr
+        if (oddTargetPrecise) curOddCall := oddCallNow
+        val ppcOrTarget = Mux(entryVector === 3, faultAddrFix, ppc.resized)
         curVec    := entryVector
         curPc     := entryPc
         curIs7    := is7
@@ -1721,7 +1734,7 @@ class ExceptionUnit(
         // Only access/address faults architecturally carry a fault address. Other
         // exception sources are allowed to leave entryFaultAddr unspecified, so do
         // not leak an unrelated combinational value into committed debug history.
-        curFault  := Mux(is7 || entryVector === 3, entryFaultAddr, U(0, 32 bits))
+        curFault  := Mux(is7 || entryVector === 3, faultAddrFix, U(0, 32 bits))
         // ── Task 11: capture the unimplemented-instruction state ─────────────────
         // A RECOGNIZED-but-unsupported FP op is being handed to FPSP via vector 11.
         // Latch what a subsequent FSAVE needs to build the 52-byte unimplemented-
@@ -1898,7 +1911,13 @@ class ExceptionUnit(
         // from the current bank: new SP = supervisor bank (M?MSP:ISP) - frame size
         // (format-$0 = 8, format-$2 = 12, format-$7 = 60 bytes).
         val supSp = Mux(ss.m, ss.msp, ss.isp)
-        frameBase := Mux(curIs7, supSp - 60, Mux(curIs2, supSp - 12, supSp - 8))
+        // CPU_ODD_TARGET_PRECISE: a supervisor CALL to an odd target already moved this
+        // same bank down by its retired return-address push; stack the format-$2 frame
+        // at pre-call SP - 12 (= current - 8) instead. Its ADDRESS field (SP+8) lands
+        // exactly on the stray return-address longword, so memory ends as on a 68040.
+        val fmt2Size = if (oddTargetPrecise)
+          Mux(curOddCall && ss.srSys(5), U(8, 32 bits), U(12, 32 bits)) else U(12, 32 bits)
+        frameBase := Mux(curIs7, supSp - 60, Mux(curIs2, supSp - fmt2Size, supSp - 8))
         // Task #132: the throwaway ($1) frame's base — settled ISP minus 8 bytes.
         // ss.m is True here (curThrowaway only set when it was), so ss.isp is
         // exactly the bank that will become active once M clears — same settle
@@ -2111,6 +2130,13 @@ class ExceptionUnit(
         ss.setIsp.valid := True; ss.setIsp.payload := frameBase2
       } .elsewhen(ss.m) { ss.setMsp.valid := True; ss.setMsp.payload := frameBase }
       .otherwise { ss.setIsp.valid := True; ss.setIsp.payload := frameBase }
+      // CPU_ODD_TARGET_PRECISE: a USER-mode CALL to an odd target pushed on the USP; give
+      // the 4 bytes back (SR still holds the pre-exception S here). Listed after writeA7,
+      // so it wins. The stray longword at USP-4 stays in memory (a 68040 never writes it).
+      if (oddTargetPrecise) {
+        when(curOddCall && !ss.srSys(5)) { ss.setUsp.valid := True; ss.setUsp.payload := ss.usp + 4 }
+        curOddCall := False
+      }
       // enter supervisor, clear trace: set S (bit5), clear T1/T0 (bits 7,6).
       // For an INTERRUPT entry ALSO raise the SR I-mask (bits 2:0) to the interrupt
       // level so equal/lower interrupts are held until RTE (NMI sets 7); fault/trap

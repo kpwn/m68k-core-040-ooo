@@ -689,6 +689,16 @@ object ShippingCoreConfig {
     * (16 steps for a typical DIVx.W, 32 for DIVx.L 32/32) instead of always running 64.
     * Default OFF. Read by `DivCore`/`DivUnit` (constructor default). */
   val divEarlyOut: Boolean = envFlag("CPU_DIV_EARLY_OUT", true)
+  /** PRECISE address error for a CALL (JSR / BSR) to an ODD target. The 68040 reports the
+    * fault with the transfer instruction's own PC (restart semantics), so the call must
+    * leave no side effect: A7 unchanged and no return address pushed. The crack retires
+    * its push before the trailing branch uop detects the odd target, so the branch EU tags
+    * a call's vector-3 fault (fault-address bit 0, redundant for an odd target, is sent as
+    * !isCall) and the exception sequencer undoes the push: the format-$2 frame is built at
+    * pre-call SP - 12 (its ADDRESS field overwrites the stray push in supervisor mode) and,
+    * from user mode, USP is restored. Cold path only: no branch/LSU/ROB-retire logic.
+    * Default OFF. Read by `BranchEuPlugin`, `ExceptionUnit`. */
+  val oddTargetPrecise: Boolean = envFlag("CPU_ODD_TARGET_PRECISE", false)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")

@@ -28,9 +28,13 @@
 |   D6 = stage counter, must be 6 at the end.
 |
 | Documented µarch semantics locked in by this test:
-|   - JSR/BSR: the return-address push (phase-0 STORE of the crack) retires
-|     BEFORE the branch phase faults, so at the handler A7 is already
-|     pre-JSR/BSR minus 4 (matches real-040 push-then-prefetch order).
+|   - JSR/BSR: either the 68040's restart semantics (CPU_ODD_TARGET_PRECISE:
+|     A7 unchanged, nothing pushed -- the frame PC is the call itself, so a
+|     re-executed call must not push twice) or the legacy core behaviour
+|     (the crack's return-address push retires BEFORE the branch phase
+|     faults: A7 = pre-call - 4, the return address left on the stack).
+|     Both are accepted here; ExecuteLockStepSpec "odd-target:" asserts the
+|     one the build selects.
 |   - RTS: the faulting RTS does NOT update arch state — the odd return
 |     address is still on the stack and A7 is unchanged.
 |   - DBcc: the counter decrement is suppressed on the faulting path
@@ -71,13 +75,16 @@ _s2_jsr:
 _s2_target:
     nop                             | never executed
 _s2_cont:
-    | Return-address push retired before the branch faulted: A7 must be
-    | pre-JSR minus 4.  Discard the stale return address.
+    | Precise: A7 == pre-JSR.  Legacy: A7 == pre-JSR - 4 (discard the stale
+    | return address).  Anything else fails.
+    cmp.l   %a6, %a7
+    beq     _s2_ok
     move.l  %a7, %d0
     addq.l  #4, %d0
     cmp.l   %a6, %d0
     bne     _fail
     addq.l  #4, %a7
+_s2_ok:
 
     | ── Stage 3: BRA.s with an odd displacement ──────────────────────
     lea     _s3_bra, %a4
@@ -127,8 +134,10 @@ _s6_bsr:
     .short  0x6103                  | bsr.s .+5 (odd target)
     nop                             | never executed
 _s6_cont:
-    | Like JSR: the return-address push retired before the branch phase
-    | faulted.  The stale return address is _s6_bsr+2.
+    | Like JSR: precise leaves A7 == pre-BSR; legacy leaves the stale return
+    | address _s6_bsr+2 at pre-BSR - 4.
+    cmp.l   %a6, %a7
+    beq     _s6_ok
     move.l  %a7, %d0
     addq.l  #4, %d0
     cmp.l   %a6, %d0
@@ -137,6 +146,7 @@ _s6_cont:
     lea     _s6_bsr+2, %a1
     cmp.l   %a1, %d0
     bne     _fail
+_s6_ok:
 
     | ── Final: all six stages must have trapped ──────────────────────
     cmp.l   #6, %d6

@@ -467,7 +467,13 @@ class BranchEuPlugin(val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRe
     trapvFaultPort.valid             := s1Valid && ((u1.isCondTrap && taken) || addrErr)
     trapvFaultPort.payload.robId     := s1Ctx.robId
     trapvFaultPort.payload.vector    := Mux(u1.isCondTrap, U(7, 8 bits), U(3, 8 bits))
-    trapvFaultPort.payload.faultAddr := target   // meaningful only for the addrErr (vec 3) case
+    // CPU_ODD_TARGET_PRECISE: an address-error target is odd by construction, so its bit 0
+    // carries no information -- it is sent as !isCall instead. The exception sequencer
+    // restores it to 1 and, for a CALL (bit 0 = 0), undoes the already-retired return-
+    // address push. A uop flop in place of an XOR of three, off every redirect path.
+    trapvFaultPort.payload.faultAddr :=
+      (if (m68k040.top.ShippingCoreConfig.oddTargetPrecise) (target(31 downto 1) ## !u1.isCall).asUInt
+       else target)   // meaningful only for the addrErr (vec 3) case
 
     // ---- S1: sim-only whitebox. A plain branch writes NO reg; an RTS/RTR ibranch
     // writes A7 (the postincremented SP); Scc/DBcc write Dn. Report that int write +

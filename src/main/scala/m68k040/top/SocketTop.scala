@@ -772,6 +772,7 @@ object GenSocketTopVerilog {
             s"prfTrimDivH=${ShippingCoreConfig.prfTrimDivH} " +
             s"prfTrimBrIdx=${ShippingCoreConfig.prfTrimBrIdx} " +
             s"divEarlyOut=${ShippingCoreConfig.divEarlyOut} " +
+            s"oddTargetPrecise=${ShippingCoreConfig.oddTargetPrecise} " +
             // TLB-miss cost chain (constructor DEFAULTS of LsEuPlugin / DtlbPlugin).
             s"walkAgeLimit=${ShippingCoreConfig.walkAgeLimit} " +
             s"dtlbHitUnderWalk=${ShippingCoreConfig.dtlbHitUnderWalk} " +

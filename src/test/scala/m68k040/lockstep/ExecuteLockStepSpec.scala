@@ -14110,4 +14110,117 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
   }
 
+
+  // ── ODD-TARGET CONTROL TRANSFERS: precise address error (CPU_ODD_TARGET_PRECISE) ──────
+  // A taken transfer to an ODD target raises vector 3 with a format-$2 frame whose PC is
+  // the transfer instruction itself and whose ADDRESS field is the odd target -- restart
+  // semantics, so the 68040 leaves NO side effect of the faulting instruction: a JSR/BSR
+  // has NOT decremented A7 nor written its return address, an RTS has NOT popped.
+  //
+  // TEST EXCEPTION (Musashi): the oracle is built with M68K_EMULATE_ADDRESS_ERROR OFF
+  // (m68kconf.h, not overridden by tools/musashi/patches/lockstep.patch), so Musashi pushes
+  // the return address and then simply executes from the odd PC -- it never raises vector
+  // 3. The oracle is therefore used ONLY for the pre-fault prefix (`nInstr` = the
+  // instructions before the first faulting transfer); everything after is a SELF-CHECKING
+  // program whose expectations are the 68040 semantics above, read back from the
+  // committed register file in `afterRun`.
+  //
+  // Per stage: A4 = expected frame PC (the transfer), A3 = expected odd target, A5 = the
+  // continuation the handler patches into the frame, A6 = SP just before the transfer,
+  // A2 = the SP the 68040 must show at the fault. Error bits in D7: stage k's SP mismatch
+  // = bit k, its stack-memory mismatch = bit k+12, handler frame checks = bits 24..28
+  // (with D4 bit <handler count> naming the stage). D6 counts handler entries.
+  //
+  // With the flag OFF the legacy behaviour (JSR/BSR push retires before the branch uop
+  // faults: SP = pre-call - 4, the return address left at pre-call SP - 4) is asserted
+  // instead, so the default configuration's lock-step gate stays a regression test too.
+  private sealed trait OddXferKind
+  private case object OddCall extends OddXferKind
+  private case object OddJump extends OddXferKind
+  private case object OddRet  extends OddXferKind
+  /** (tag, kind, setup lines (must leave A3 = the odd target), transfer). `$` = label suffix. */
+  private val oddTargetStages: Seq[(String, OddXferKind, Seq[String], String)] = Seq(
+    ("jsr (An)",          OddCall, Seq("lea ox$+3,%a0", "move.l %a0,%a3"),                     "jsr (%a0)"),
+    ("jsr d16(An)",       OddCall, Seq("lea ox$-0xff,%a0", "lea ox$+3,%a3"),                   "jsr 0x102(%a0)"),
+    ("jsr (d8,An,Xn)",    OddCall, Seq("lea ox$,%a0", "moveq #3,%d0", "lea ox$+3,%a3"),        "jsr 0(%a0,%d0.l)"),
+    ("jsr abs.L",         OddCall, Seq("lea ox$+3,%a3"),                                       "jsr (ox$+3).l"),
+    ("jsr d16(PC)",       OddCall, Seq("lea ox$+3,%a3"),                                       "jsr ox$+3(%pc)"),
+    ("jsr d16(A7)",       OddCall, Seq("lea 1(%sp),%a3"),                                      "jsr 1(%sp)"),
+    ("jmp (An)",          OddJump, Seq("lea ox$+3,%a0", "move.l %a0,%a3"),                     "jmp (%a0)"),
+    ("jmp (d8,An,Xn)",    OddJump, Seq("lea ox$,%a0", "moveq #3,%d0", "lea ox$+3,%a3"),        "jmp 0(%a0,%d0.l)"),
+    ("bsr.s odd disp",    OddCall, Seq("lea ox$+5,%a3"),                                       ".short 0x6103"),
+    ("bsr.w odd disp",    OddCall, Seq("lea ox$+5,%a3"),                                       ".short 0x6100,0x0003"),
+    ("rts odd return",    OddRet,  Seq("lea ox$+3,%a3", "move.l %a3,-(%sp)"),                  "rts"))
+
+  /** Returns (program, number of instructions before the first faulting transfer). */
+  private def oddTargetProgram(user: Boolean, precise: Boolean): (String, Int) = {
+    val pre = Seq("move.l #oh3,%d0", "move.l %d0,0xc", "moveq #0,%d4", "moveq #0,%d5",
+                  "moveq #0,%d6", "moveq #0,%d7") ++
+      // User variant: boot supervisor (the oracle cannot seed a USP), then drop to user.
+      (if (user) Seq("move.l #0x00200000,%a0", "move.l %a0,%usp", "move.w #0x0000,%sr") else Seq.empty)
+    val stages = oddTargetStages.zipWithIndex.map { case ((_, kind, setup, xfer), k) =>
+      def l(x: String) = x.replace("$", k.toString)
+      val legacyCall = !precise && kind == OddCall
+      val head = Seq(s"lea oc$k,%a5", s"lea ox$k,%a4") ++ setup.map(l) ++
+        Seq("move.l %sp,%a6", if (legacyCall) "lea -4(%a6),%a2" else "movea.l %a6,%a2")
+      val body = Seq(s"ox$k: ${l(xfer)}", s"or$k: nop", "nop", "nop",
+        s"oc$k: cmpa.l %a2,%sp", s"beq.s os$k", s"bset #$k,%d7", s"os$k: nop")
+      // Stack memory just below the pre-transfer SP. Supervisor: the frame's ADDRESS field
+      // (= the odd target) on the 68040; the stale return address on the legacy path. In
+      // user mode the frame goes to the SSP, so only the RTS's still-unpopped value is checked.
+      val mem =
+        if (legacyCall) Seq(s"lea or$k,%a1", "cmpa.l -4(%a6),%a1", s"beq.s om$k", s"bset #${k + 12},%d7", s"om$k: nop")
+        else if (!user) Seq("cmpa.l -4(%a6),%a3", s"beq.s om$k", s"bset #${k + 12},%d7", s"om$k: nop")
+        else Seq.empty
+      val ret = if (kind == OddRet) Seq("cmpa.l (%a6),%a3", s"beq.s oq$k", s"bset #${k + 12},%d7", s"oq$k: nop") else Seq.empty
+      val tidy = Seq("movea.l %a6,%sp") ++ (if (kind == OddRet) Seq("addq.l #4,%sp") else Seq.empty)
+      (head, body ++ mem ++ ret ++ tidy)
+    }
+    val expSr = if (user) "0x0000" else "0x2700"
+    val frameTop = if (user) Seq("cmpa.l #0x00100000,%a1") else Seq("cmpa.l %a1,%a2")
+    val handler = Seq(
+      "oh3: addq.l #1,%d6",
+      "move.w (%sp),%d1", "andi.w #0x2700,%d1", s"cmpi.w #$expSr,%d1", "beq.s ohk0", "bset #24,%d7", "bset %d6,%d4",
+      "ohk0: cmpi.w #0x200c,6(%sp)", "beq.s ohk1", "bset #25,%d7", "bset %d6,%d4",
+      "ohk1: cmpa.l 2(%sp),%a4", "beq.s ohk2", "bset #26,%d7", "bset %d6,%d4",
+      "ohk2: cmpa.l 8(%sp),%a3", "beq.s ohk3", "bset #27,%d7", "bset %d6,%d4",
+      "ohk3: lea 12(%sp),%a1") ++ frameTop ++ Seq("beq.s ohk4", "bset #28,%d7", "bset %d6,%d4",
+      "ohk4: move.l %a5,2(%sp)", "rte")
+    val tail = Seq("move.l %sp,%d3", "move.l #0xd0d0d0d0,%d5", "odone: bra.s odone")
+    val lines = pre ++ stages.flatMap { case (h, b) => h ++ b } ++ tail ++ handler
+    (lines.mkString(" ; "), pre.size + stages.head._1.size)
+  }
+
+  private def oddTargetRun(tag: String, user: Boolean): Unit = {
+    val precise = m68k040.top.ShippingCoreConfig.oddTargetPrecise
+    val (src, prefix) = oddTargetProgram(user, precise)
+    val bootSp = if (user) 0x00200000L else 0x00100000L
+    runLockStep(tag, src, nInstr = prefix,
+      afterRun = (dut, _) => {
+        val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+        var g = 0
+        while (probe.readArch(5) != 0xd0d0d0d0L && g < 60000) { dut.clockDomain.waitSampling(); g += 1 }
+        dut.clockDomain.waitSampling(16)
+        val d = probe.readD
+        def stagesOf(mask: Long, base: Int): String =
+          oddTargetStages.indices.filter(k => ((mask >> (k + base)) & 1L) != 0).map(k => oddTargetStages(k)._1).mkString(", ")
+        val mode = if (precise) "PRECISE (68040)" else "LEGACY (push retires first)"
+        assert(d(5) == 0xd0d0d0d0L, f"[$tag] program never reached its end marker (d5=0x${d(5)}%08x, handler entries=${d(6)})")
+        assert(d(6) == oddTargetStages.size.toLong,
+          s"[$tag] $mode: ${d(6)} of ${oddTargetStages.size} transfers raised vector 3")
+        assert((d(7) & 0xfffL) == 0L, f"[$tag] $mode: SP wrong after the fault for: ${stagesOf(d(7), 0)} (d7=0x${d(7)}%08x)")
+        assert((d(7) & 0xfff000L) == 0L, f"[$tag] $mode: stack memory wrong for: ${stagesOf(d(7), 12)} (d7=0x${d(7)}%08x)")
+        assert((d(7) & 0x1f000000L) == 0L,
+          f"[$tag] $mode: frame check failed (bits 24 SR,25 fmt/vec,26 PC,27 ADDRESS,28 frame position) d7=0x${d(7)}%08x " +
+          s"in handler entries ${(1 to oddTargetStages.size).filter(i => ((d(4) >> i) & 1L) != 0).mkString(",")}")
+        assert(d(3) == bootSp, f"[$tag] $mode: final SP 0x${d(3)}%08x != boot SP 0x$bootSp%08x")
+      })
+  }
+
+  test("odd-target: JSR/JMP/BSR/RTS to an odd address -> vector 3, 68040 side effects (supervisor)", VerilatorTest) {
+    oddTargetRun("odd-target-sup", user = false)
+  }
+  test("odd-target: JSR/JMP/BSR/RTS to an odd address -> vector 3, 68040 side effects (user mode, USP)", VerilatorTest) {
+    oddTargetRun("odd-target-user", user = true)
+  }
 }
