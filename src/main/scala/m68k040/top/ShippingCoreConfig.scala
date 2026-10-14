@@ -698,7 +698,7 @@ object ShippingCoreConfig {
     * pre-call SP - 12 (its ADDRESS field overwrites the stray push in supervisor mode) and,
     * from user mode, USP is restored. Cold path only: no branch/LSU/ROB-retire logic.
     * Default OFF. Read by `BranchEuPlugin`, `ExceptionUnit`. */
-  val oddTargetPrecise: Boolean = envFlag("CPU_ODD_TARGET_PRECISE", false)
+  val oddTargetPrecise: Boolean = envFlag("CPU_ODD_TARGET_PRECISE", true)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
