@@ -2,8 +2,8 @@
 | family the microcode engine has no entry for must take a CLEAN vector-4
 | ILLEGAL, never execute with the wrong destination.
 |
-| The remaining unsupported family needs a tt/dr carried through ctx:
-|   line-E MEMORY shift      — `rol.w ([bd,An],od)`
+| Line-E MEMORY shift `rol.w ([bd,An],od)` is implemented with CPU_UPC10
+| (MI_RMW + shift ctx bits): it must execute and rotate the target word.
 | Scc is now implemented with a dedicated condition-and-byte-store program.
 | Keep it as a positive control: it must execute and leave D0 unchanged.
 |
@@ -40,14 +40,13 @@ _start:
     scs     ([0x10,%a0],0)            | now implemented; must NOT trap
 _c2:
     lea     _c3, %a5
-    rol.w   ([0x10,%a0],0)            | line-E memory shift <memory-indirect> -> must trap
-    bra     _fail
+    rol.w   ([0x10,%a0],0)            | line-E memory shift <memory-indirect>: LEGAL with CPU_UPC10
 _c3:
-    cmp.l   #1, %d5                   | only unsupported memory shift traps
+    tst.l   %d5                       | nothing traps any more
     bne     _fail
     cmp.l   #0x11223344, %d0          | no wrong-register write
     bne     _fail
-    cmp.l   #0xFF5A5A5A, 0x00021000   | SCS byte write only; shift untouched
+    cmp.l   #0xFEB55A5A, 0x00021000   | SCS wrote FF, then ROL.W #1 of 0xFF5A = 0xFEB5
     bne     _fail
     cmp.l   #0x00021000, 0x00020010   | the pointer is untouched
     bne     _fail

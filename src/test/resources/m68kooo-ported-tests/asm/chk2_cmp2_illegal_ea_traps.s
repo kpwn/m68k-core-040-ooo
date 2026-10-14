@@ -3,8 +3,8 @@
 | load).  Pinned by the 2026-07-15 v2_cc2_ea_ok_f3 fire-gate fix:
 |   PRM-illegal modes  : Dn, An, (An)+, -(An), #imm  (Musashi also
 |                        ILLEGALs these — §4.39 control class only)
-|   fail-safe          : memory-indirect ([bd,An]) — a legal 68020+ EA
-|                        the CMP2 crack does not implement.
+|   LEGAL (CPU_UPC10)  : memory-indirect ([bd,An]) executes via the
+|                        MI CMP2 microcode rows; it must NOT trap.
 |   LEGAL (2026-10-13) : brief-indexed, PC-indexed brief, full-format
 |                        no-memind now execute (the bound loads carry
 |                        the index and the full-format bd); they must
@@ -51,8 +51,10 @@ _c6:
     cmp2.l  (0,%a0,%d0.l), %d1        | brief indexed: LEGAL, executes (no trap)
 _c7:
     lea     _c8, %a5
-    cmp2.l  ([0,%a0]), %d1            | full-format memind
-    bra     _fail
+    move.l  #0x00022000, (%a0)        | memind pointer -> a known bounds pair
+    clr.l   0x00022000
+    move.l  #10, 0x00022004
+    cmp2.l  ([0,%a0]), %d1            | full-format memind: LEGAL with CPU_UPC10, executes
 _c8:
     lea     _c9, %a5
     .word   0x04FB, 0x1000, 0x0000    | cmp2.l (0,%pc,%d0.w), %d1 (PC-idx): LEGAL
@@ -61,7 +63,7 @@ _c9:
     .word   0x04F0, 0x1000, 0x0160, 0x0010  | cmp2.l (16,%a0) full-format: LEGAL
                                              | (ext[8]=1, IS=1, bd.W)
 _c10:
-    cmp.l   #6, %d5                   | the six non-control / memory-indirect shapes trap
+    cmp.l   #5, %d5                   | the five non-control shapes trap
     bne     _fail
 
     | PASS

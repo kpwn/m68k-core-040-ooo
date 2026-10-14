@@ -233,7 +233,7 @@ case class OpSpec() extends Bundle {
   // Task 6b's FP-generic memory-source load family (18 format x EA-bucket entry groups +
   // 1 trap entry, 58 new rows) pushes romSize from 252 to 310, overflowing 8 bits (0..255)
   // -> widened to 9 bits (0..511). FMax-neutral (cold decode field).
-  val ucEntry       = UInt(9 bits)
+  val ucEntry       = UInt(Microcode.upcBits bits)
   // ── Commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC) ─────────
   // Classification only (the assembler builds the op µop carrying these): `sysOp`
   // marks a serializing commit-time system op, `sysKind` selects which, `sysReadDir`

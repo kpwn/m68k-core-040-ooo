@@ -354,7 +354,7 @@ object PredecodeWord {
             val bitDstEaW    = Mux(isStatBit, extW2, extW)
             val bitDstEaKnown = Mux(isStatBit, extW2Known, extWKnown)
             val (mok, mext, mamb) = memDestExt(mode, reg, bitDstEaW, bitDstEaKnown)
-            when(mok) {
+            val bitLenChain = when(mok) {
               r.lenWords := (bitBase + mext).resized
               r.ambiguousLine := mamb
             } elsewhen(isBtstOp && (mode === U(7, 3 bits)) && (reg === U(2, 3 bits))) {
@@ -371,6 +371,13 @@ object PredecodeWord {
               // BTST Dm,(d8,PC,Xn) brief/full-format -- same PRM §4.16 read-only allowance.
               when(bitDstEaKnown) {
                 r.lenWords := (bitBase + Mux(bitDstEaW(8), fullExtLen(bitDstEaW), U(1, 3 bits))).resized
+              }
+            }
+            // CPU_UPC10: BTST Dm,#imm (68020+; the µcode IMM_FLAGS program): opword + imm word.
+            // A further arm of the same chain (bitBase = 1 for the dynamic form).
+            if (m68k040.top.ShippingCoreConfig.upc10) {
+              bitLenChain.elsewhen(isBtstOp && isDynBit && (mode === U(7, 3 bits)) && (reg === U(4, 3 bits))) {
+                r.lenWords := U(2, 4 bits)
               }
             }
           }
@@ -749,7 +756,7 @@ object PredecodeWord {
                           u4o === U(6, 4 bits) || u4o === U(0xA, 4 bits))
         when(isUnaryMem) {
           val (mok, mext, mamb) = memDestExt(u4mode, op(2 downto 0).asUInt, extW, extWKnown)   // EA is op+1
-          when(mok) {
+          val unaryLenChain = when(mok) {
             r.lenWords := (U(1, 3 bits) + mext).resized
             r.ambiguousLine := mamb
           } elsewhen(u4o === U(0xA, 4 bits) && u4mode === U(7, 3 bits) &&
@@ -760,6 +767,13 @@ object PredecodeWord {
             when(tok) {
               r.lenWords := (U(1, 3 bits) + text).resized
               r.ambiguousLine := tamb
+            }
+          }
+          // CPU_UPC10: TST #imm (68020+; the µcode IMM_FLAGS program): opword + 1 (.B/.W)
+          // or 2 (.L) immediate words. A further arm of the same chain.
+          if (m68k040.top.ShippingCoreConfig.upc10) {
+            unaryLenChain.elsewhen(u4o === U(0xA, 4 bits) && (op(5 downto 0) === B"6'b111100")) {
+              r.lenWords := Mux(u4ss === U(2, 2 bits), U(3, 4 bits), U(2, 4 bits))
             }
           }
         }

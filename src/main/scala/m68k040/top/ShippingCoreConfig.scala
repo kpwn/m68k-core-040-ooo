@@ -710,6 +710,15 @@ object ShippingCoreConfig {
     * only: one 16-bit mux on the exception sequencer's frame-word data.
     * Default OFF. Read by `ExceptionUnit`. */
   val fsaveCleanIdleCmd: Boolean = envFlag("CPU_FSAVE_CLEAN_IDLE_CMD", true)
+
+  /** CPU_UPC10: widen the microcode PC (OpSpec.ucEntry, DecodeStage ucPc/ucNextPc) from 9 to
+    * 10 bits so the microcode ROM may grow past 512 rows, and append the decode-gap programs
+    * that need the room (memory-indirect MOVE SR/CCR, CHK, CHK2/CMP2, MUL.W/DIV.W, memory
+    * shifts, NBCD, BFFFO dynamic offset, MOVE MI->MI post-indexed; TST #imm, BTST Dn,#imm).
+    * The ROM stays one synchronous-read block RAM, so the µPC -> row -> µop path depth is
+    * unchanged. Default OFF: with it off the ROM content and every width are as before.
+    * Read by `Microcode`, `DecodeContracts`, `DecodeStage`, `OperationDecoder`. */
+  val upc10: Boolean = envFlag("CPU_UPC10", true)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")

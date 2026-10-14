@@ -22,7 +22,9 @@ import org.scalatest.funsuite.AnyFunSuite
   * The run is ~30 minutes, so it is opt-in: `LEGALITY_ENUM=1`. Every remaining, understood
   * mismatch is listed in `src/test/resources/decode-legality-known.txt` (`desc|dut|musashi`);
   * the test fails on any mismatch NOT in that list (a regression or a new finding) and prints
-  * the listed entries that no longer mismatch (a fix -- delete them from the list).
+  * the listed entries that no longer mismatch (a fix -- delete them from the list). With
+  * CPU_UPC10=1 the entries in `decode-legality-fixed-upc10.txt` are removed from the
+  * expected set first (the flag closes them).
   *
   * Every EA extension word that is not structurally required is the one-word no-op opcode
   * 0x4A40 (TST.W D0), so a length disagreement on a LEGAL instruction degrades into
@@ -348,12 +350,23 @@ class DecodeLegalityEnumSpec extends AnyFunSuite {
     l.foreach(x => println(s"[legality] $x"))
     println(s"[legality] other vector differences (value-dependent, informational): ${o.size}")
     o.foreach(x => println(s"[legality-info] $x"))
-    val known: Set[String] = {
-      val f = java.nio.file.Paths.get("src/test/resources/decode-legality-known.txt")
+    def readList(path: String): Set[String] = {
+      val f = java.nio.file.Paths.get(path)
       if (!java.nio.file.Files.exists(f)) Set.empty
       else scala.io.Source.fromFile(f.toFile).getLines().map(_.trim)
         .filter(x => x.nonEmpty && !x.startsWith("#")).toSet
     }
+    // The known list describes the DEFAULT build. CPU_UPC10 (10-bit microcode PC + the
+    // decode-gap programs) closes a further set, listed on its own: with the flag on the
+    // expected mismatches are `known -- upc10Fixed`, so an entry the flag claims to close
+    // but which still mismatches is reported as NEW (a failure), exactly like a regression.
+    val baseKnown  = readList("src/test/resources/decode-legality-known.txt")
+    val upc10Fixed = readList("src/test/resources/decode-legality-fixed-upc10.txt")
+    val upc10      = m68k040.top.ShippingCoreConfig.upc10
+    assert(!upc10 || (upc10Fixed -- baseKnown).isEmpty,
+      s"decode-legality-fixed-upc10.txt lists entries absent from the known list: ${(upc10Fixed -- baseKnown).mkString(", ")}")
+    val known: Set[String] = if (upc10) baseKnown -- upc10Fixed else baseKnown
+    println(s"[legality] known list: ${known.size} (base ${baseKnown.size}, upc10=$upc10)")
     val now = keys.result().toSet
     val fresh = (now -- known).toSeq.sorted
     val gone  = (known -- now).toSeq.sorted

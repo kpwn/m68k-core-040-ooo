@@ -1775,7 +1775,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // current 130). Task 6b's FP-generic memory-source load family pushes romSize from
     // 252 to 310, overflowing 8 bits (0..255) the same way -- widened to 9 bits (0..511),
     // mirroring `OpSpec.ucEntry`'s identical widening (DecodeContracts.scala).
-    val ucPc     = Reg(UInt(9 bits))
+    val ucPc     = Reg(UInt(Microcode.upcBits bits))
     ucPc.simPublic()
     val ucCtx    = Reg(Microcode.Ctx())
     ucCtx.miOther.simPublic(); ucCtx.miOtherValid.simPublic()  // debug-only (task #144)
@@ -2595,8 +2595,34 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // Raw opword matching avoids adding a late decoded-spec dependency.
     val ucSccMi = (ucEopw(15 downto 12) === B"0101") &&
       (ucEopw(7 downto 3) === B"11110") && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
-    val ucIsMemInd = (ucSccMi || ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucAddqSubqMi || ucImmDstMi || ucDynBitMi || ucSingleMi ||
-                       ucLeaMi || ucPeaMi || ucJmpMi || ucJsrMi) &&
+    // ── CPU_UPC10 memory-indirect host families (raw-opword classifiers, as above) ──
+    // MOVE SR/CCR,<mi> (store-only, MI_FROMSR); MOVE <mi>,CCR / CHK / MULx.W / DIVx.W (EA
+    // as SOURCE, MI_ALU_SRC); NBCD / memory shift (RMW, MI_RMW). What sets them apart from
+    // the §7 ALU hosts rides ctx.miExt (cluster, shift, sign, trap PC, SR/CCR, no-dst).
+    // All False without the flag, so the gates and the entry mux are unchanged.
+    val upc10 = Microcode.upcBits == 10
+    def u10(b: => Bool): Bool = if (upc10) b else False
+    // `a || b` with the flag, plain `a` without (no constant term left in the RTL).
+    def orU10(a: Bool, b: => Bool): Bool = if (upc10) a || b else a
+    val ucMiSrcIsMi  = ucMiSrcEa.klass === EaClass.MEMINDIRECT
+    val ucFromSrMi   = u10(((ucEopw(15 downto 6) === B"10'b0100000011") ||
+                            (ucEopw(15 downto 6) === B"10'b0100001011")) && ucMiSrcIsMi)
+    val ucFromSrIsSr = !ucEopw(9)
+    val ucToCcrMi    = u10((ucEopw(15 downto 6) === B"10'b0100010011") && ucMiSrcIsMi)
+    val ucChkMi      = u10((ucEopw(15 downto 12) === B"0100") && ucEopw(8) && !ucEopw(6) && ucMiSrcIsMi)
+    val ucMulDivWMi  = u10(((ucEopw(15 downto 12) === B"1100") || (ucEopw(15 downto 12) === B"1000")) &&
+                           (ucEopw(7 downto 6) === B"11") && ucMiSrcIsMi)
+    val ucNbcdMi     = u10((ucEopw(15 downto 6) === B"10'b0100100000") && ucMiSrcIsMi)
+    val ucShiftMemMi = u10((ucEopw(15 downto 11) === B"11100") && (ucEopw(7 downto 6) === B"11") && ucMiSrcIsMi)
+    val ucHostSrcMi  = ucToCcrMi || ucChkMi || ucMulDivWMi
+    // CMP2/CHK2 <mi>,Rn: the EA follows the Rn/size ext word, so it is the ext-shifted
+    // `ucBfEaDec` window (like MULx.L) -- NOT a ucIsMemInd host; routed in ucRealEntry.
+    val ucCmp2Ext    = ucEntryPkt.words(1)
+    val ucCmp2Mi     = u10((ucEopw(15 downto 11) === B"00000") && !ucEopw(8) && (ucEopw(7 downto 6) === B"11") &&
+                           (ucEopw(10 downto 9) =/= B"11") && (ucBfEaDec.klass === EaClass.MEMINDIRECT))
+    val ucIsMemInd = orU10(ucSccMi || ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucAddqSubqMi || ucImmDstMi || ucDynBitMi || ucSingleMi ||
+                       ucLeaMi || ucPeaMi || ucJmpMi || ucJsrMi,
+                       ucFromSrMi || ucHostSrcMi || ucNbcdMi || ucShiftMemMi) &&
                      (ucPendValid || fed.valid)
     // The host op's OTHER operand register:
     //   MOVE src-EA (load to a reg)  -> the dst reg  = op[11:9] (Dn) / +8 for An (isMovea n/a here).
@@ -2651,23 +2677,30 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // ADDQ/SUBQ, ALU Dn,<ea>), it is vector 4. Only the read-only families keep it.
     val ucMiDstFieldPc = ucMoveDstMi && (ucEopw(8 downto 6) === B"111")
     val ucMiSrcFieldPc = !ucIsMove && (ucEopw(5 downto 3) === B"111")
-    val ucMiPcReadOnly = ucAluSrcMi || ucLeaMi || ucPeaMi || ucJmpMi || ucJsrMi || ucMiFlagsOnly
+    val ucMiPcReadOnly = ucAluSrcMi || ucLeaMi || ucPeaMi || ucJmpMi || ucJsrMi || orU10(ucMiFlagsOnly, ucHostSrcMi)
     val ucMiPcDstBad   = ucMiDstFieldPc || (ucMiSrcFieldPc && !ucMiPcReadOnly)
+    // `Mux(c, entry, rest)` with the flag, `rest` without.
+    def muxU10(c: => Bool, entry: Int, rest: UInt): UInt = if (upc10) Mux(c, U(entry, ew bits), rest) else rest
     val ucMiEntry =
       Mux(ucMiPcDstBad, U(Microcode.MI_UNSUPPORTED_ENTRY, ew bits),
       // task #204: ucMoveBothMiOk (both-MI, dst NOT post-indexed) is a strict subset of
       // ucMoveBothMi — checked FIRST so it wins over the illegal fallback; a post-indexed
       // dst (or any other both-MI shape ucMoveBothMiOk excludes) still falls through to the
       // existing MI_MOVE_BOTH_MI_ILLEGAL_ENTRY arm below.
-      Mux(ucSccMi, U(Microcode.MI_SCC_ENTRY, ew bits),
+      // CPU_UPC10: MOVE SR/CCR,<mi> shares the Scc arm (both selects are raw-opword).
+      Mux(orU10(ucSccMi, ucFromSrMi),
+          (if (upc10) Mux(ucFromSrMi, U(Microcode.MI_FROMSR_ENTRY, ew bits), U(Microcode.MI_SCC_ENTRY, ew bits))
+           else U(Microcode.MI_SCC_ENTRY, ew bits)),
       Mux(ucMoveBothMiOk,  U(Microcode.MI_MOVE_BOTH_MI_ENTRY, ew bits),
-      Mux(ucMoveBothMi,    U(Microcode.MI_MOVE_BOTH_MI_ILLEGAL_ENTRY, ew bits),
+      // CPU_UPC10: a post-indexed dst has its own program (index at the final store).
+      Mux(ucMoveBothMi,    U(if (Microcode.upcBits == 10) Microcode.MI_MOVE_BOTH_POST_ENTRY
+                             else Microcode.MI_MOVE_BOTH_MI_ILLEGAL_ENTRY, ew bits),
       Mux(ucMoveSrcMiEaEa, U(Microcode.MI_MOVE_EAEA_ENTRY,     ew bits),
       Mux(ucMoveDstMiEaEa, U(Microcode.MI_MOVE_EAEA_REV_ENTRY, ew bits),
       Mux(ucMoveSrcMi, U(Microcode.MI_MOVE_SRC_ENTRY, ew bits),
       Mux(ucMoveDstMiImmEarly, U(Microcode.MI_MOVE_DST_IMM_ENTRY, ew bits),
       Mux(ucMoveDstMi, U(Microcode.MI_MOVE_DST_ENTRY, ew bits),
-      Mux(ucAluSrcMi,  U(Microcode.MI_ALU_SRC_ENTRY,  ew bits),
+      Mux(orU10(ucAluSrcMi, ucHostSrcMi), U(Microcode.MI_ALU_SRC_ENTRY,  ew bits),
       Mux(ucMiFlagsOnly, U(Microcode.MI_FLAGS_ENTRY, ew bits),
       // task #201: LEA/PEA/JMP/JSR each get their OWN dedicated entry (address-generate /
       // push / ibranch — none of them are a §7 host-op load/store/RMW at all, so they
@@ -2695,7 +2728,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `ucFpMemBad`, `eaBase` and `eaIndex*` above already use for this family. Reading
     // `ucMiEa` here would walk the pointer chain with a displacement decoded from the wrong
     // word. (2026-09-17, with the FP memory-indirect EA support.)
-    ucEntryCtx.miOd         := Mux(ucIsFpMem || ucIsMulDivMi, ucBfEaDec.od, ucMiEa.od)
+    ucEntryCtx.miOd         := Mux(orU10(ucIsFpMem || ucIsMulDivMi, ucCmp2Mi), ucBfEaDec.od, ucMiEa.od)
     // task #203: a bit-field op's memory-indirect EA is decoded SEPARATELY (`ucBfEaDec`,
     // over the bf-ext-shifted word window — a plain-op decode over `ucMiEa`'s own window
     // would misread a bit-field's ext words entirely). `ctx.miPost` is READ by the NEW
@@ -2703,7 +2736,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // this override strictly to `ucEntrySpec.op === DecOp.BITFIELD` so a NON-bit-field
     // memory-indirect op (which owns the real `ucMiEa` window) is completely unaffected
     // (zero regression risk to the already-working §5 host-op indexed-memind family).
-    ucEntryCtx.miPost       := Mux(ucIsFpMem || ucIsMulDivMi || (ucEntrySpec.op === DecOp.BITFIELD), ucBfEaDec.memPost, ucMiEa.memPost)
+    ucEntryCtx.miPost       := Mux(orU10(ucIsFpMem || ucIsMulDivMi || (ucEntrySpec.op === DecOp.BITFIELD), ucCmp2Mi), ucBfEaDec.memPost, ucMiEa.memPost)
     ucEntryCtx.miOp         := ucEntrySpec.op
     // BITOP (BTST/BCHG/BCLR/BSET) tt sub-kind (task #152): OperationDecoder carries it as
     // opword[7:6] regardless of static/dynamic form (see OperationDecoder.scala's `tt`),
@@ -2782,6 +2815,72 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     ucEntryCtx.miWX    := Mux(ucAnArith, False, ucMiWriteX)
     ucEntryCtx.miRNzvc := ucEntrySpec.op === DecOp.NEGX   // NEGX reads old NZ (clear-only Z)
     ucEntryCtx.miRX    := ucEntrySpec.op === DecOp.NEGX
+    // CPU_UPC10 host families: the µop attributes the fast crack takes from the OpSpec (or,
+    // for MOVE SR/CCR, from the assembler's fixed MOVEFROMSR/MOVETOCCR shape).
+    if (upc10) {
+      val x = ucEntryCtx.miExt
+      val ucDivWMi = ucMulDivWMi && (ucEopw(15 downto 12) === B"1000")
+      x.cplx      := ucChkMi || ucMulDivWMi || ucCmp2Mi
+      x.shiftOp   := Mux(ucShiftMemMi, ucEopw(10 downto 9), B"00")
+      x.shiftDir  := ucShiftMemMi && ucEopw(8)
+      x.divSigned := (ucMulDivWMi && ucEopw(8)) || (ucCmp2Mi && ucCmp2Ext(15))
+      x.faultNext := ucChkMi || ucDivWMi || ucCmp2Mi
+      x.fromSr    := ucFromSrMi && ucFromSrIsSr
+      x.fromCcr   := ucFromSrMi && !ucFromSrIsSr
+      x.toCcr     := ucToCcrMi
+      x.noDst     := ucChkMi || ucToCcrMi || ucCmp2Mi || (ucEntrySpec.op === DecOp.CMP)
+      x.isChk2    := ucCmp2Mi && ucCmp2Ext(11)
+      when(ucChkMi || ucMulDivWMi || ucNbcdMi || ucShiftMemMi || ucCmp2Mi) {
+        ucEntryCtx.miRNzvc := ucEntrySpec.readsNzvc;  ucEntryCtx.miRX := ucEntrySpec.readsX
+        ucEntryCtx.miWNzvc := ucEntrySpec.writesNzvc; ucEntryCtx.miWX := ucEntrySpec.writesX
+      }
+      when(ucFromSrMi) {          // reads the whole CCR, writes none (MOVEFROMSR/CCR)
+        ucEntryCtx.miRNzvc := True;  ucEntryCtx.miRX := True
+        ucEntryCtx.miWNzvc := False; ucEntryCtx.miWX := False
+      }
+      when(ucToCcrMi) {           // CCR := src[4:0] (MOVETOCCR): no read, writes all
+        ucEntryCtx.miRNzvc := False; ucEntryCtx.miRX := False
+        ucEntryCtx.miWNzvc := True;  ucEntryCtx.miWX := True
+      }
+      // CHK / MULx.W / DIVx.W: the other operand is Dn = op[11:9] (ucMiOtherReg's default).
+      when(ucChkMi || ucMulDivWMi) { ucEntryCtx.miOtherValid := True }
+      // NBCD: the EU's BCD correction reads the operand on srcB as well as srcA (the fast
+      // crack's srcA = srcB = the loaded byte) -> srcB = T1.
+      when(ucNbcdMi) {
+        ucEntryCtx.miOther := U(Microcode.T1, 5 bits); ucEntryCtx.miOtherValid := True
+      }
+      // Memory shift: implicit count 1 as the immediate.
+      when(ucShiftMemMi) {
+        ucEntryCtx.miOtherIsImm := True; ucEntryCtx.miHostImm := B(1, 32 bits)
+      }
+      // CMP2/CHK2: Rn (A/D = ext[15], reg = ext[14:12]) on srcC; od + size for the upper bound.
+      when(ucCmp2Mi) {
+        ucEntryCtx.miOther := Mux(ucCmp2Ext(15), (U(8, 5 bits) + ucCmp2Ext(14 downto 12).asUInt).resize(5),
+                                                 ucCmp2Ext(14 downto 12).asUInt.resize(5))
+        ucEntryCtx.miOtherValid := True
+        ucEntryCtx.miOtherIsImm := False
+        val szBytes = ucEopw(10 downto 9).mux(B"00" -> U(1, 32 bits), B"01" -> U(2, 32 bits), default -> U(4, 32 bits))
+        ucEntryCtx.miHostImm := (ucBfEaDec.od.asUInt + szBytes).asBits
+      }
+      // MOVE from SR is privileged: needsSupervisor on its first µop (the SR read).
+      when(ucFromSrMi && ucFromSrIsSr) { ucEntryCtx.needsSup := True }
+      // TST #imm / BTST Dn,#imm (IMM_FLAGS, routed by OperationDecoder's ucEntry): the
+      // immediate (.L = words(1..2)) is materialised into T1; BTST's bit number is Dn =
+      // op[11:9] (ucMiOtherReg's default) at BYTE size (miHostSize, as for any BITOP).
+      val ucTstImm  = (ucEopw(15 downto 8) === B"8'h4A") && (ucEopw(7 downto 6) =/= B"11") &&
+                      (ucEopw(5 downto 0) === B"6'b111100")
+      val ucBtstImm = (ucEopw(15 downto 12) === B"0000") && ucEopw(8) && (ucEopw(7 downto 6) === B"00") &&
+                      (ucEopw(5 downto 0) === B"6'b111100")
+      when(ucTstImm || ucBtstImm) {
+        ucEntryCtx.miOtherIsImm := False
+        ucEntryCtx.miOtherValid := ucBtstImm
+        ucEntryCtx.miHostImm    := Mux(ucTstImm && (ucEopw(7 downto 6) === B"10"),
+                                       ucEntryPkt.words(1) ## ucEntryPkt.words(2),
+                                       ucEntryPkt.words(1).asSInt.resize(32).asBits)
+        ucEntryCtx.miRNzvc := ucEntrySpec.readsNzvc;  ucEntryCtx.miRX := ucEntrySpec.readsX
+        ucEntryCtx.miWNzvc := ucEntrySpec.writesNzvc; ucEntryCtx.miWX := ucEntrySpec.writesX
+      }
+    }
     // The EA<->EA plain side's OWN address (task #119): independent of the pointer-load's
     // eaBase/eaDispLo/eaIndex group above, which stays dedicated to whichever side IS
     // mem-indirect. Computed unconditionally (harmless when unused — only the new
@@ -2939,7 +3038,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
                           ucBfEntRdOnly && ucBfIsMemind
     val ucIsBfMemindRmw = ucIsBfRmw && ucBfIsMemind
     val ucBfMemindRdEntry = Mux(ucBfDo,
-      Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),   // FFO+dyn-offset memind: NOT implemented
+      Mux(ucBfEntOp === 5, U(if (upc10) Microcode.MI_BF_FFO_DO1_ENTRY else Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),   // FFO+dyn-offset memind (CPU_UPC10)
                            U(Microcode.MI_BF_RD_DO1_ENTRY,  ew bits)),
       U(Microcode.MI_BF_RD_DO0_ENTRY, ew bits))
     val ucBfMemindRmwEntry = Mux(ucBfDo,
@@ -3048,7 +3147,10 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
         // address. This is what makes the gate SAFE to make generic: a family nobody
         // routed traps, rather than silently writing the wrong register or branching to a
         // wild PC -- which is exactly how all four previous drift bugs presented.
-        Mux(ucIsMulDiv, ucMdEntry,
+        // CPU_UPC10: CMP2/CHK2 <mi> shares the MULx.L/DIVx.L arm (no extra priority level
+        // in front of the late spec.microcoded/ucEntry tail).
+        Mux(orU10(ucIsMulDiv, ucCmp2Mi),
+            (if (upc10) Mux(ucCmp2Mi, U(Microcode.MI_CMP2_ENTRY, ew bits), ucMdEntry) else ucMdEntry),
         Mux(ucEntrySpec.microcoded, ucEntrySpec.ucEntry,
                                     U(Microcode.MI_UNSUPPORTED_ENTRY, ew bits)))))))))))
     ucRealEntry.simPublic()  // debug-only (task #144)
@@ -3104,7 +3206,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     //   ucCurLast -> ucNextPc` crosses the Mem's output register.
     // `ucCtx` needs NO such adjustment: it is a Reg latched on ucBegin and constant for the
     // whole chain, so reading it live (as before) is correct — the old code read the same Reg.
-    val ucNextPc  = UInt(9 bits)   // task 6b: widened 8->9 bits alongside ucPc/OpSpec.ucEntry
+    val ucNextPc  = UInt(Microcode.upcBits bits)   // 9 bits, 10 with CPU_UPC10 (Microcode.upcBits)
     val ucRowBitsRom = ucReadRow(ucNextPc.resize(log2Up(Microcode.romSize)))
     // MULx.L/DIVx.L memory-indirect (ctx.mdMi): rows 0/1 of the MULDIV program are replaced
     // by the pointer-chain loads (Microcode.mdMiRow0/1). The select is off REGISTERED state
@@ -3737,7 +3839,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // are mutually exclusive anyway.
     ucNextPc := ucPc                                              // (c) hold
     when(ucBegin) {
-      ucNextPc := ucRealEntry.resize(9)                           // (a) entry
+      ucNextPc := ucRealEntry.resize(Microcode.upcBits)                         // (a) entry
     } elsewhen(ucActive) {
       when(pushProduced.ready && !ucCurLast) { ucNextPc := ucPc + 1 }   // (b) advance
     }
@@ -3755,7 +3857,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `ucBegin || ucActive` because `ucPc` has no reset value — while the engine is idle it
     // holds an arbitrary (in sim, randomized) value that is never used as a live row.
     GenerationFlags.simulation {
-      assert(!((ucBegin || ucActive) && ucNextPc >= U(Microcode.romSize, 9 bits)),
+      assert(!((ucBegin || ucActive) && (if (Microcode.romSize < Microcode.upcRows) ucNextPc >= U(Microcode.romSize, Microcode.upcBits bits) else False)),
         s"DecodeStage: the microcode µPC left the ROM (ucNextPc >= romSize=${Microcode.romSize}) while the µcode engine was entering or running -- either a ucEntry constant is stale/out of range, or a ROM chain ran past its last row without an isLast descriptor. The Mem rows at/above romSize are UNINITIALIZED, so continuing would execute undefined microcode.",
         FAILURE)
     }
