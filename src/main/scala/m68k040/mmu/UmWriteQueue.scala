@@ -54,7 +54,9 @@ case class UmWriteDrain() extends Bundle {
   *   - flush  : speculative (uncommitted) entries are discarded -> never written
   * Four independently valid slots avoid head-of-line deadlock when a younger
   * walk allocated first but an older ROB owner committed first. */
-class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2) extends Component {
+class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2,
+                   /** `CPU_UM_LOAD_ORDER`: elaborate `io.committedPending`. */
+                   committedPendingPort: Boolean = false) extends Component {
   require(depth >= 2 && isPow2(depth))
   require(Set(2, 4, 8, 16)(retireWidth))
   val ptrW = log2Up(depth)
@@ -74,6 +76,10 @@ class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2) extends Component {
     // Admission credit for the owning single walker. A full queue must never
     // overwrite a live architectural U/M update.
     val full     = out Bool ()
+    // `CPU_UM_LOAD_ORDER`: a COMMITTED entry is still waiting to drain, i.e. a U/M
+    // update whose owner has already retired is not yet visible in memory. Only a
+    // function of this queue's own registers.
+    val committedPending = if (committedPendingPort) out Bool () else null
     // (2026-09-09: the task #210 `pageQuery`/`pageHazard` interlock that used to live
     // here has been REMOVED. See the "WHY THERE IS NO SAME-PAGE INTERLOCK" note below
     // the port bundle for the full argument -- it compared two different address
@@ -139,6 +145,8 @@ class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2) extends Component {
   val nextSeq   = Reg(UInt(seqW bits)) init 0
   nextSeq.simPublic()
   io.full := valids.asBits.andR
+  if (committedPendingPort)
+    io.committedPending := (0 until depth).map(i => valids(i) && committed(i)).reduce(_ || _)
   val freeSlot = OHToUInt(OHMasking.first(~valids.asBits))
 
   // ---- commit: stamp matching entries in architectural retirement order ----

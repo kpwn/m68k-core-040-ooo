@@ -70,7 +70,9 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                  /** `ShippingCoreConfig.beRetime`: the MOVEC/debug-apply ATC flush is a REGISTERED pulse. */
                  beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime,
                  /** `ShippingCoreConfig.umAtomic`: atomic, order-checked U/M drain. */
-                 umAtomic: Boolean = m68k040.top.ShippingCoreConfig.umAtomic) extends FiberPlugin
+                 umAtomic: Boolean = m68k040.top.ShippingCoreConfig.umAtomic,
+                 /** `ShippingCoreConfig.umLoadOrder`: U/M update visible to younger loads. */
+                 umLoadOrder: Boolean = m68k040.top.ShippingCoreConfig.umLoadOrder) extends FiberPlugin
     with DTranslationService with DtlbWalkerDcacheClient {
   var _req: Stream[DTranslationCmd] = null
   var _rsp: Stream[DTranslationRsp] = null
@@ -109,6 +111,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   override def umRmwArming: Bool = _umRmwArming
   override def umRmwBlock: Bool = _umRmwBlock
   override def umRmwYield: Bool = _umRmwYield
+  var _umCommittedPending: Bool = null
+  override def umCommittedPending: Bool = _umCommittedPending
+  var _umOwnerMark: Flow[UInt] = null
+  override def umOwnerMark: Flow[UInt] = _umOwnerMark
 
   during setup {
     if (umAtomic) {
@@ -138,6 +144,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore    = Stream(DStoreCmd())
     _walkStoreAck = Bool()
     _walkStoreErr = Bool()
+    if (umLoadOrder) {
+      _umCommittedPending = Bool()
+      _umOwnerMark = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+    }
     _walkCmodePolicy = CacheMode()
     if (walkSqCheck) {
       _walkOrderAddr = UInt(32 bits)
@@ -1183,7 +1193,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // descriptor byte over this same AXI bus) and is discarded on a flush. NOT
     // performed speculatively.
     val retirement = host.get[m68k040.services.RobRetirementService]
-    val umq = new UmWriteQueue(4, retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2))
+    val umq = new UmWriteQueue(4, retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2),
+                               committedPendingPort = umLoadOrder)
     retirement.foreach(r => for (lane <- 2 until r.retiredRobIds.length)
       umq.io.commitExtra(lane - 2) << r.retiredRobIds(lane))
     umq.io.full.simPublic()   // sim-only: a full queue withholds the walker's admission credit
@@ -1205,6 +1216,34 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umq.io.alloc.payload.preCommitted := walkPreCommitted
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
+    // CPU_UM_LOAD_ORDER (see ShippingCoreConfig.umLoadOrder). (1) Mark the OWNER so its
+    // macro's retirement flushes every younger instruction: a younger load may already
+    // have read this descriptor's pre-update byte, out of order, before this walk even
+    // finished. A pre-committed entry (exception-sequencer access) has no owner to mark;
+    // the sequencer's own redirect flushes the younger path anyway. (2) Export the
+    // committed-but-undrained state for LsEuPlugin's load hold.
+    if (umLoadOrder) {
+      _umOwnerMark.valid   := umq.io.alloc.valid && !walkPreCommitted
+      _umOwnerMark.payload := walkRobId
+      _umCommittedPending  := umq.io.committedPending
+      // TRIPWIRE: the mark reaches `RobPlugin.orderViolated` two cycles after the
+      // allocation (LsEuPlugin registers it once; the ROB bit is a register). An owner
+      // retiring before that would escape the flush. Retirement needs the walk's own
+      // translation response, an LS completion and a ROB completion first, so it cannot
+      // -- asserted rather than argued.
+      GenerationFlags.simulation {
+        val markAge = RegInit(U(3, 2 bits))
+        val markRob = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)) init 0
+        when(_umOwnerMark.valid) { markAge := 0; markRob := _umOwnerMark.payload }
+          .elsewhen(markAge =/= 3) { markAge := markAge + 1 }
+        def retiring(id: UInt): Bool =
+          (umCommitValid && umCommitId === id) || (umCommitBValid && umCommitBId === id)
+        assert(!((_umOwnerMark.valid && retiring(_umOwnerMark.payload)) ||
+                 (markAge === 0 && retiring(markRob))),
+          "DtlbPlugin(umLoadOrder): a U/M owner retired before its order mark could reach " +
+          "the ROB -- a younger load of the descriptor would escape the flush", FAILURE)
+      }
+    }
     umq.io.commit.valid   := umCommitValid
     umq.io.commit.payload := umCommitId
     umq.io.commitB.valid   := umCommitBValid

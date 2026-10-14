@@ -48,6 +48,15 @@ _start:
     | = 0x00FFA000
     move.l  #0x00FFA000, %d0
     movec   %d0, %dtt0
+    | DTT1/ITT1 must NOT match: the user-mode access to VA 0x80001000 has to
+    | reach the walker and fault.  State it rather than inherit it from
+    | reset -- a harness posture that maps the high half through DTT1 (the
+    | copyback sweep's inhibited MMIO/sentinel window, which ignores FC2)
+    | would otherwise translate the access transparently, never page-fault,
+    | and the handler's retry loop would spin on the resulting bus error.
+    moveq   #0, %d0
+    movec   %d0, %dtt1
+    movec   %d0, %itt1
 
     | URP = SRP = 0x200000 (1 MB into memory)
     move.l  #0x00200000, %d0

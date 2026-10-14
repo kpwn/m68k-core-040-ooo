@@ -53,6 +53,8 @@ object PortedTestRunner {
   val loadAddr: Long = ProgramAssembler.DefaultLoadAddress
   val SentinelAddr: Long = 0xFFFF0000L
   val PassWord: Long = 0xC0FFEE00L
+  /** Q700 SCC RR0 status mirror polled by the ROM (see its seeding in `run`). */
+  val SccStatusMirror: Long = 0x50F0C022L
 
   lazy val compiled = M68kSim().withVerilator.compile(new FuzzCoreDut)
   private var runIdx = 0
@@ -151,8 +153,8 @@ object PortedTestRunner {
       // FAIL_MISMATCH (0xBADC0C22) diagnostic. Per its own header this test cannot
       // legitimately pass in a harness with no SCC model backing 0x50f0c022 (the
       // original m68k-ooo tb leaves that address unmapped, where it instead reports
-      // FAIL_NO_SCC) -- so it is left red rather than special-cased here. Backing the
-      // SCC window is a deliberate, separate decision, not a fill-convention fix.
+      // FAIL_NO_SCC). It is therefore backed below by a one-byte IDLE-SCC model (see
+      // `SccStatusMirror`): the expectation is a property of the device, not the CPU.
       //
       // Review note (harness-SMC-fix, post-commit): passing this non-null `sharedMem`
       // means `AxiMemModel` no longer draws a `simRandom.nextLong()` seed for a fresh
@@ -236,6 +238,15 @@ object PortedTestRunner {
       // otherwise read back as an instant 0xFFFFFFFF "FAIL" on cycle 1.
       for (i <- 0 until 4) dmem.mem.write(SentinelAddr + i, 0.toByte)
 
+      // Q700 SCC status mirror (`rom_scc_mmio_btst_dbf_timeout`, the ROM's 0x408478b4
+      // poll). This harness has no SCC; without a backing byte the poll reads the 0xFF
+      // RAM fill, i.e. "Rx character available" (RR0 bit 0) on the very first poll, and
+      // the program reports FAIL_MISMATCH although the CPU executed it correctly. An idle
+      // SCC answers RR0 = 0x04 (Tx buffer empty, nothing received), which is what the
+      // program -- and the ROM loop it isolates -- was written against. One byte, at the
+      // one address the corpus polls; nothing else in the corpus touches it.
+      dmem.mem.write(SccStatusMirror, 0x04.toByte)
+
       dut.ctrl.logic.mmuEnable #= false
       dut.ctrl.logic.urp   #= 0
       dut.ctrl.logic.srp   #= 0
@@ -275,19 +286,31 @@ object PortedTestRunner {
           // COPYBACK transparent translations on both instruction and data
           // sides. Cover the high 2 GiB with identity/INHIBITED data translation
           // so MMIO and the AXI-observed sentinel remain visible. Install the
-          // complete mapping before TC.E and before the first redirect.
+          // complete mapping before the first redirect.
+          //
+          // TC.E STAYS 0 (reset value). The TTRs apply whether or not paged translation
+          // is enabled (DtlbPlugin/ItlbPlugin `ttHit` is checked before `!mmuEnable`, as
+          // on a 68040), so the cache-mode partition above is fully in force without it.
+          // Enabling TC.E here used to turn the posture into a NON-reset MMU state that
+          // programs which configure their own MMU cannot survive: they clear ITT0/DTT0
+          // (or rewrite one TTR of a pair) BEFORE loading SRP and setting TC, which is
+          // only safe because TC.E is 0 at reset. With TC.E pre-set, the very next
+          // instruction fetch after `movec %d0,%itt0` was table-walked through SRP = 0
+          // (the vector table) and the core ran garbage -- tst_abs_beqw_mmu_on,
+          // mmu_swapmode_*, mmu_pagefault_rte_basic (DTT1 leaked into user mode) and
+          // exc_ifetch_bus_error (I-side high half walked instead of bus-erroring) all
+          // hung on that harness state, not on a core defect.
           dut.ctrl.logic.itt0 #= CachePosture.LowHalfCopybackTtr
           dut.ctrl.logic.itt1 #= 0
           dut.ctrl.logic.dtt0 #= CachePosture.LowHalfCopybackTtr
           dut.ctrl.logic.dtt1 #= CachePosture.HighHalfInhibitedTtr
           dut.rob.logic.exc.ss.cacr #= CachePosture.CacrDataAndInstructionEnable
-          dut.ctrl.logic.mmuEnable #= true
           cd.waitSampling()
 
           // Fail closed if the intended second posture silently decays into an
           // AsWritten run because of a stale hierarchy name or non-sticky poke.
-          assert(dut.ctrl.logic.mmuEnable.toBoolean,
-            "ForceCacheableCopyback did not enable TC.E")
+          assert(!dut.ctrl.logic.mmuEnable.toBoolean,
+            "ForceCacheableCopyback must leave TC.E at its reset value (0)")
           assert(dut.ctrl.logic.itt0.toBigInt == CachePosture.LowHalfCopybackTtr,
             s"ForceCacheableCopyback ITT0 readback was 0x${dut.ctrl.logic.itt0.toBigInt.toString(16)}")
           assert(dut.ctrl.logic.dtt0.toBigInt == CachePosture.LowHalfCopybackTtr,

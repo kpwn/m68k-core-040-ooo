@@ -158,7 +158,9 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
                  /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME): drive `rsp.inhibitHint`. */
                  feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
                  /** `ShippingCoreConfig.umAtomic`: atomic, order-checked U drain. */
-                 umAtomic: Boolean = m68k040.top.ShippingCoreConfig.umAtomic) extends FiberPlugin
+                 umAtomic: Boolean = m68k040.top.ShippingCoreConfig.umAtomic,
+                 /** `ShippingCoreConfig.umLoadOrder`: U/M update visible to younger loads. */
+                 umLoadOrder: Boolean = m68k040.top.ShippingCoreConfig.umLoadOrder) extends FiberPlugin
     with TranslationService with ItlbWalkerDcacheClient {
   var _req: TranslationReq = null
   var _rsp: TranslationRsp = null
@@ -200,6 +202,9 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore    = Stream(DStoreCmd())
     _walkStoreAck = Bool()
     _walkStoreErr = Bool()
+    if (umLoadOrder) {
+      _umCommittedPending = Bool()
+    }
     _walkCmodePolicy = CacheMode()
     if (umAtomic) {
       _umRmwBusy = Bool(); _umRmwArming = Bool()
@@ -220,6 +225,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   override def umRmwArming: Bool = _umRmwArming
   override def umRmwBlock: Bool = _umRmwBlock
   override def umRmwYield: Bool = _umRmwYield
+  var _umCommittedPending: Bool = null
+  override def umCommittedPending: Bool = _umCommittedPending
 
   // U deferred-write queue hooks (driven by the LS-cluster wiring, mirroring the DTLB).
   // NOTE there is deliberately NO `umAccessRobId` here, unlike the DTLB: an instruction
@@ -1143,7 +1150,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // Clean fetch walks have no ROB owner; their precommitted lifetime below is
     // unchanged by widening the shared queue's ordinary retirement interface.
     val retirement = host.get[m68k040.services.RobRetirementService]
-    val umq = new UmWriteQueue(4, retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2))
+    val umq = new UmWriteQueue(4, retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2),
+                               committedPendingPort = umLoadOrder)
     retirement.foreach(r => for (lane <- 2 until r.retiredRobIds.length)
       umq.io.commitExtra(lane - 2) << r.retiredRobIds(lane))
     umq.io.full.simPublic()   // sim-only: a full queue withholds the walker's admission credit
@@ -1175,6 +1183,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umq.io.alloc.payload.preCommitted := True
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
+    // CPU_UM_LOAD_ORDER: born-committed entries need no owner flush, only the load hold.
+    if (umLoadOrder) _umCommittedPending := umq.io.committedPending
 
     // ── AN INCIDENTAL MASK, NAMED AND CHECKED (race audit, 2026-09-18) ───────────
     // `when(umFlush && missPending)` above reads `missPending` as a REGISTER, and the

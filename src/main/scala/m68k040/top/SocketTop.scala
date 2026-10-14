@@ -782,6 +782,7 @@ object GenSocketTopVerilog {
             s"coldWbShare=${ShippingCoreConfig.coldWbShare} " +
             s"walkSqCheck=${ShippingCoreConfig.walkSqCheck} " +
             s"umAtomic=${ShippingCoreConfig.umAtomic} " +
+            s"umLoadOrder=${ShippingCoreConfig.umLoadOrder} " +
             s"dbgLite=${ShippingCoreConfig.dbgLite}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,

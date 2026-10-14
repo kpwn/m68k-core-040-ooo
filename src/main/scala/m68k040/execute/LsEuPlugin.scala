@@ -584,7 +584,16 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // takes a hold back from here (see the `walkOrderHold` drive below).
     val walkOrderClient: Option[m68k040.services.DtlbWalkerDcacheClient] =
       host.get[m68k040.services.DtlbWalkerDcacheClient].filter(_.walkOrderHold != null)
+    // `CPU_UM_LOAD_ORDER`: the DTLB's U/M owner mark (forwarded on `orderViolation`).
+    val walkOrderClientMark: Option[Flow[UInt]] =
+      host.get[m68k040.services.DtlbWalkerDcacheClient].flatMap(c => Option(c.umOwnerMark))
     val anyWalkerPresent = walkPresent.exists(identity)
+    // `CPU_UM_LOAD_ORDER` (see ShippingCoreConfig.umLoadOrder): a REGISTERED hold on new
+    // core-LS load admission while a committed U/M descriptor write has not drained.
+    // Driven next to the CPU_UM_ATOMIC lock below.
+    val umLoadOrderOn = walkClients.exists(_.exists(_.umCommittedPending != null))
+    val umLoadHoldR: Bool = if (umLoadOrderOn) RegInit(False) else null
+    if (umLoadOrderOn) umLoadHoldR.simPublic()
 
     // Per-walker request views. A DUT that hosts no TLB plugin (the standalone LS-EU
     // tests) sees these permanently idle, every admission predicate below folds to
@@ -2038,7 +2047,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // walker. `alignedCmdFire` below MUST carry the same term: `dcache.loadCmd.ready`
     // never references `valid`, so an unqualified `alignedSendValid && ready` would
     // advance the ring past an entry whose command was never actually presented.
-    val coreLsGrant     = (ldOwner === U(OWNER_CORE, 2 bits)) && !excLoadCmdValid
+    val coreLsGrant     = (ldOwner === U(OWNER_CORE, 2 bits)) && !excLoadCmdValid &&
+                          (if (umLoadOrderOn) !umLoadHoldR else True)
     val coreLsLoadReq   = Mux(useSplitCmd, llReg.valid, alignedSendValid || alignedFallThrough)
     val coreLsLoadAdmit = coreLsLoadReq && coreLsGrant && !ldFifoFull
     dcache.loadCmd.valid         := coreLsLoadAdmit
@@ -4591,6 +4601,29 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     orderViolationPort.payload := (if (!lsOooIssue) p4Front.robId
                                    else Mux(parkViolation, parkMem(parkDrainIdx).bk.robId,
                                             p4Front.robId))
+    // `CPU_UM_LOAD_ORDER`: the DTLB's U/M OWNER mark shares this port (same recovery:
+    // flush everything younger at the owner macro's retirement). It is the deferrable
+    // one -- the park cannot wait and an LS-OoO violator may leave P4 -- so it is
+    // registered once and yields the port to either; it still reaches `orderViolated`
+    // before the owner can retire (DtlbPlugin's tripwire).
+    if (lsOooIssue) walkOrderClientMark.foreach { mk =>
+      val markPend = RegInit(False)
+      val markRob  = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)) init 0
+      val lsWants  = parkViolation || lsOooViolation
+      val emit     = markPend && !lsWants
+      when(emit) { markPend := False }
+      when(mk.valid) { markPend := True; markRob := mk.payload }
+      when(emit) {
+        orderViolationPort.valid   := True
+        orderViolationPort.payload := markRob
+      }
+      GenerationFlags.simulation {
+        assert(!(mk.valid && markPend && !emit),
+          "LsEuPlugin(umLoadOrder): a second U/M owner mark arrived while the first was " +
+          "still waiting for the order-violation port -- the first would be lost", FAILURE)
+      }
+      markPend.simPublic()
+    }
     if (lsOooIssue) { lsOooViolation.simPublic(); parkViolation.simPublic() }
 
     // ── TRIPWIRE: the one case the park does not cover ────────────────────────────────
@@ -6030,6 +6063,16 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // and it re-arms with a fresh re-read when the fence is gone. A client that owns
     // the store port completes on the D-cache alone. `umFenceR` is registered (all
     // inputs to the lock are flops), so the lock adds no path from the fence logic.
+    // `CPU_UM_LOAD_ORDER`: the load hold. Released while a quiesce/exception/D4 fence is
+    // up -- the same fence on which the U/M drain YIELDS (CPU_UM_ATOMIC) -- so a fence
+    // that waits on the LS pipe can never wait on a drain that waits on the fence. All
+    // inputs are flops (queue state, fence regs), so the hold is one registered term.
+    if (umLoadOrderOn) {
+      val fence = quiesceHold || excActive || (if (d4) d4WalkerFence else False)
+      val pend  = walkClients.flatMap(_.flatMap(c => Option(c.umCommittedPending)))
+                             .reduce(_ || _)
+      umLoadHoldR := pend && !fence
+    }
     if (umAtomicOn) {
       val fence = quiesceHold || excActive || (if (d4) d4WalkerFence else False)
       val umFenceR = RegNext(fence) init False
