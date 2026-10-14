@@ -700,6 +700,17 @@ class MicrobenchSpec extends CoreBenchHarness {
     Kernel(s"$op-dep-$n", src, stopAt(setup.size + n))
   }
 
+  /** DEP. Per-FORM divide latency (CPU_DIV_EARLY_OUT A/B): `d0` is the dividend and
+    * divisor `d1` = 1 (`d2` = 0 as the 64/32 high half / remainder), so every step leaves
+    * the operands unchanged -- a constant-latency serial chain at the chosen dividend
+    * magnitude. */
+  def kDivFormDep(name: String, op: String, d0: Long, n: Int): Kernel = {
+    val setup = Seq("moveq #1,%d1", "moveq #0,%d2", f"move.l #0x$d0%x,%%d0")
+    val body = (0 until n).map(_ => op)
+    val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
+    Kernel(s"$name-dep-$n", src, stopAt(setup.size + n))
+  }
+
   /** IND. Six independent destination registers -> measures THROUGHPUT. The
     * divider is single-outstanding, so if throughput ~= latency that is the
     * measured confirmation of the serialization, not an assumption. */
@@ -1387,6 +1398,32 @@ class MicrobenchSpec extends CoreBenchHarness {
         } catch {
           case e: Throwable =>
             println(s"  [divmul] $op NOT MEASURED: ${e.getClass.getSimpleName}: " +
+              s"${Option(e.getMessage).getOrElse("").take(200)}")
+        }
+      }
+    }
+
+    if (enabled("divform")) {
+      println("\n-- DIVIDE LATENCY PER FORM (d1 = 1) ---------------------------------")
+      Seq(
+        ("divu.w-small",  "divu.w %d1,%d0",        100L),
+        ("divu.w",        "divu.w %d1,%d0",        0x8765L),
+        ("divs.w",        "divs.w %d1,%d0",        0x4321L),
+        ("divu.l32-small","divu.l %d1,%d0",        100L),
+        ("divu.l32-mid",  "divu.l %d1,%d0",        0x123456L),
+        ("divu.l32-big",  "divu.l %d1,%d0",        0x87654321L),
+        ("divs.l32-big",  "divs.l %d1,%d0",        0x76543210L),
+        ("divul.l-big",   "divul.l %d1,%d2:%d0",   0x87654321L),
+        ("divsl.l-big",   "divsl.l %d1,%d2:%d0",   0x76543210L),
+        ("divu.l64-big",  "divu.l %d1,%d2:%d0",    0x87654321L),
+        ("divs.l64-big",  "divs.l %d1,%d2:%d0",    0x76543210L)
+      ).foreach { case (name, op, d0) =>
+        try {
+          val dep = diffStat(compiled, s"$name-dep", n => kDivFormDep(name, op, d0, n), 20, 40)
+          report("divform", s"$name LATENCY (DEP)", dep, "DEP; serial chain; differential")
+        } catch {
+          case e: Throwable =>
+            println(s"  [divform] $name NOT MEASURED: ${e.getClass.getSimpleName}: " +
               s"${Option(e.getMessage).getOrElse("").take(200)}")
         }
       }

@@ -7336,6 +7336,46 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #5,%d6 ; loop: bra loop", nInstr = 6)
   }
 
+  // CPU_DIV_EARLY_OUT: randomized divide sweep, every form x signedness, edge-biased
+  // operands (0, 1, -1, INT_MIN, INT_MAX, 16-bit boundaries, random bit-lengths),
+  // incl. overflow (V only, N/Z/C preserved -- CCR is randomised before each divide)
+  // and DIV0 (vector 5 -> RTE). Run with CPU_DIV_EARLY_OUT=1 AND =0.
+  for (chunk <- 0 until 4) {
+    test(s"lock-step: DIV sweep (all forms, edge+random operands, ovf, DIV0) chunk $chunk", VerilatorTest) {
+      val rnd = new scala.util.Random(0xD1F0 + chunk)
+      def v32(): Long = rnd.nextInt(12) match {
+        case 0 => 0L
+        case 1 => 1L
+        case 2 => 0xFFFFFFFFL
+        case 3 => 0x80000000L
+        case 4 => 0x7FFFFFFFL
+        case 5 => Seq(0xFFFFL, 0x8000L, 0x7FFFL, 0x10000L, 0xFFFF8000L, 0xFFFF0000L)(rnd.nextInt(6))
+        case 6 => rnd.nextInt(16).toLong
+        case 7 => (-1L - rnd.nextInt(300)) & 0xFFFFFFFFL
+        case _ => val n = 1 + rnd.nextInt(32); (rnd.nextLong() & ((1L << n) - 1)) & 0xFFFFFFFFL
+      }
+      val forms = Seq("divu.w %d1,%d0", "divs.w %d1,%d0", "divu.l %d1,%d0", "divs.l %d1,%d0",
+                      "divul.l %d1,%d2:%d0", "divsl.l %d1,%d2:%d0",
+                      "divu.l %d1,%d2:%d0", "divs.l %d1,%d2:%d0")
+      val sb = new StringBuilder
+      sb ++= "move.l #handler,%d6 ; move.l %d6,0x14 ; "
+      var n = 2
+      for (i <- 0 until 120) {
+        val op = forms(i % forms.size)
+        val isW = op.contains(".w")
+        var b = v32()
+        if (isW && rnd.nextBoolean()) b = (b & 0xFFFFL) | (rnd.nextInt(0x10000).toLong << 16) // junk upper half
+        if (rnd.nextInt(40) != 0 && ((isW && (b & 0xFFFF) == 0) || (!isW && b == 0))) b = 1 + rnd.nextInt(9)
+        sb ++= f"move.l #0x${v32()}%x,%%d0 ; move.l #0x$b%x,%%d1 ; move.l #0x${v32()}%x,%%d2 ; "
+        sb ++= s"move.w #${rnd.nextInt(32)},%ccr ; $op ; "
+        n += 5
+        if ((isW && (b & 0xFFFF) == 0) || (!isW && b == 0)) n += 1   // handler's rte
+      }
+      sb ++= "moveq #1,%d7 ; loop: bra loop ; handler: rte"
+      runLockStep(s"div-sweep-$chunk", sb.toString, nInstr = n + 1, maxCycles = 20000)
+    }
+  }
+
   // DIVU.L 64/32 DIV0 -> vector 5 -> handler -> RTE.
   test("lock-step: DIVU.L 64/32 DIV0 -> handler -> RTE", VerilatorTest) {
     runLockStep("div-l64-div0",
