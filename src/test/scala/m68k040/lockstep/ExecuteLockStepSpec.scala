@@ -7856,6 +7856,140 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 6 + 3 + 2, seedDside = true)
   }
 
+  // ── CPU_UPC10 decode-gap families (memory-indirect EAs; TST #imm / BTST Dn,#imm) ──
+  // Common frame: A0=0x3000, D3=4, pointer slots [0x3100]=0x3200, [0x3104]=0x3300, so
+  //   ([0x100,a0])           -> 0x3200          (no index)
+  //   ([0x100,a0,d3.l])      -> 0x3300          (pre-indexed)
+  //   ([0x100,a0],d3.l*2,2)  -> 0x3200+8+2      (post-indexed + od)
+  //   ([pN,pc])              -> [pN]            (PC memory-indirect)
+  // Each test cancels (not fails) without CPU_UPC10: the forms are vector 4 there.
+  private val upc10Frame =
+    "move.l #0x3000,%a0 ; moveq #4,%d3 ; move.l #0x3200,0x3100 ; move.l #0x3300,0x3104 ; "
+  private def upc10Only(): Unit =
+    assume(m68k040.top.ShippingCoreConfig.upc10, "CPU_UPC10 off: these forms decode as vector 4")
+
+  test("lock-step: upc10 MULx.W/DIVx.W memory-indirect sources", VerilatorTest) {
+    upc10Only()
+    runLockStep("upc10-muldivw-memind",
+      upc10Frame +
+      "move.w #7,0x3200 ; move.w #-3,0x3300 ; move.w #9,0x320A ; " +
+      "move.l #1000,%d5 ; move.l #0x1234,%d6 ; moveq #-5,%d1 ; move.l #-10000,%d7 ; " +
+      "mulu.w ([0x100,%a0]),%d6 ; muls.w ([0x100,%a0,%d3.l]),%d1 ; " +
+      "divu.w ([0x100,%a0],%d3.l*2,2),%d5 ; divs.w ([p4,%pc]),%d7 ; " +
+      "move.l %d7,%d4 ; loop: bra loop ; .align 4 ; p4: .long 0x3300",
+      nInstr = 4 + 3 + 4 + 4 + 2, seedDside = true)
+  }
+
+  // DIVU.W by a zero memory-indirect divisor: vector 5, format $2 (stacks the NEXT pc).
+  test("lock-step: upc10 DIVU.W memory-indirect divide-by-zero -> handler -> RTE", VerilatorTest) {
+    upc10Only()
+    runLockStep("upc10-divw-memind-zero",
+      "move.l #handler,%d0 ; move.l %d0,0x14 ; " + upc10Frame +
+      "move.w #0,0x3200 ; move.l #1000,%d5 ; moveq #1,%d1 ; " +
+      "divu.w ([0x100,%a0]),%d5 ; moveq #7,%d2 ; loop: bra loop ; " +
+      "handler: moveq #1,%d4 ; rte",
+      nInstr = 2 + 4 + 3 + 1 + 2 + 1 + 1, seedDside = true)
+  }
+
+  // CHK.W/CHK.L in bounds (pre/post/PC) and one CHK.W out of bounds (Dn > bound).
+  test("lock-step: upc10 CHK memory-indirect bounds", VerilatorTest) {
+    upc10Only()
+    runLockStep("upc10-chk-memind",
+      "move.l #handler,%d0 ; move.l %d0,0x18 ; " + upc10Frame +
+      "move.w #100,0x3200 ; move.l #50000,0x3300 ; move.w #10,0x320A ; " +
+      "moveq #50,%d1 ; chk.w ([0x100,%a0]),%d1 ; " +
+      "move.l #40000,%d2 ; chk.l ([0x100,%a0,%d3.l]),%d2 ; " +
+      "moveq #10,%d5 ; chk.w ([0x100,%a0],%d3.l*2,2),%d5 ; " +
+      "move.l #123,%d6 ; chk.l ([p5,%pc]),%d6 ; " +
+      "moveq #20,%d1 ; chk.w ([0x100,%a0],%d3.l*2,2),%d1 ; " +   // 20 > 10 -> vector 6
+      "moveq #7,%d3 ; loop: bra loop ; .align 4 ; p5: .long 0x3300 ; " +
+      "handler: moveq #1,%d4 ; rte",
+      nInstr = 2 + 4 + 3 + 10 + 2 + 2, seedDside = true)
+  }
+
+  // CMP2/CHK2 through memory-indirect bound pairs (.B/.W/.L, Dn and An, PC) with an N/V
+  // sentinel set right before each compare (CMP2 preserves N/V), plus a CHK2 trap.
+  test("lock-step: upc10 CMP2/CHK2 memory-indirect bound pairs", VerilatorTest) {
+    upc10Only()
+    runLockStep("upc10-cmp2-memind",
+      "move.l #handler,%d0 ; move.l %d0,0x18 ; " + upc10Frame +
+      "move.w #10,0x3200 ; move.w #100,0x3202 ; " +            // .W pair @0x3200
+      "move.l #-5,0x3300 ; move.l #5000,0x3304 ; " +            // .L pair @0x3300
+      "move.b #3,0x320A ; move.b #9,0x320B ; " +                // .B pair @0x320A
+      "move.w #50,%d1 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.w ([0x100,%a0]),%d1 ; " +
+      "move.w #100,%d1 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.w ([0x100,%a0]),%d1 ; " +
+      "move.l #6000,%d2 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.l ([0x100,%a0,%d3.l]),%d2 ; " +
+      "move.l #-5,%a1 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.l ([p6,%pc]),%a1 ; " +
+      "moveq #2,%d5 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.b ([0x100,%a0],%d3.l*2,2),%d5 ; " +
+      "moveq #9,%d5 ; chk2.b ([0x100,%a0],%d3.l*2,2),%d5 ; " +   // in bounds
+      "moveq #10,%d5 ; chk2.b ([0x100,%a0],%d3.l*2,2),%d5 ; " +  // 10 > 9 -> vector 6
+      "moveq #7,%d6 ; loop: bra loop ; .align 4 ; p6: .long 0x3300 ; " +
+      "handler: moveq #1,%d4 ; rte",
+      nInstr = 2 + 4 + 6 + 20 + 4 + 2 + 2, seedDside = true,
+      // The trapping CHK2's own CCR write is not committed (as for the register-EA CHK2).
+      structuralKnownGap = Some("BUG_chk_chk2_flags_not_committed_on_trap.md"))
+  }
+
+  // NBCD and the eight memory shifts/rotates through memory-indirect EAs; each result is
+  // read back into a register so the lock-step compares the memory effect.
+  test("lock-step: upc10 NBCD / memory shift memory-indirect RMW", VerilatorTest) {
+    upc10Only()
+    runLockStep("upc10-rmw-memind",
+      upc10Frame +
+      "move.w #0x8421,0x3200 ; move.w #0x4003,0x3300 ; move.w #0x0991,0x320A ; " +
+      "move #0x10,%ccr ; nbcd ([0x100,%a0],%d3.l*2,2) ; move.w 0x320A,%d0 ; " +
+      "asl.w ([0x100,%a0]) ; move.w 0x3200,%d1 ; " +
+      "asr.w ([0x100,%a0,%d3.l]) ; move.w 0x3300,%d2 ; " +
+      "lsl.w ([0x100,%a0],%d3.l*2,2) ; move.w 0x320A,%d4 ; " +
+      "lsr.w ([0x100,%a0]) ; move.w 0x3200,%d5 ; " +
+      "move #0x10,%ccr ; roxl.w ([0x100,%a0,%d3.l]) ; move.w 0x3300,%d6 ; " +
+      "move #0x00,%ccr ; roxr.w ([0x100,%a0]) ; move.w 0x3200,%d7 ; " +
+      "rol.w ([0x100,%a0],%d3.l*2,2) ; move.w 0x320A,%d1 ; " +
+      "ror.w ([0x100,%a0,%d3.l]) ; move.w 0x3300,%d2 ; " +
+      "loop: bra loop",
+      nInstr = 4 + 3 + 3 + 18 + 1, seedDside = true)
+  }
+
+  // MOVE SR/CCR to memory-indirect destinations, MOVE <mi>,CCR (pre/post/PC).
+  test("lock-step: upc10 MOVE SR/CCR memory-indirect", VerilatorTest) {
+    upc10Only()
+    runLockStep("upc10-srccr-memind",
+      upc10Frame +
+      "move #0x1b,%ccr ; move.w %sr,([0x100,%a0],%d3.l*2,2) ; move.w 0x320A,%d0 ; " +
+      "move #0x04,%ccr ; move.w %ccr,([0x100,%a0,%d3.l]) ; move.w 0x3300,%d1 ; " +
+      "move.w #0x0015,0x3200 ; move.w ([0x100,%a0]),%ccr ; scs %d2 ; " +
+      "move.w #0x000a,0x3300 ; move.w ([p7,%pc]),%ccr ; smi %d4 ; " +
+      "loop: bra loop ; .align 4 ; p7: .long 0x3300",
+      nInstr = 4 + 12 + 1, seedDside = true)
+  }
+
+  // MOVE SR,<mi> from USER mode: vector 8 at the instruction (the SR-read µop leads the
+  // program, so the privilege check precedes the pointer load). The handler skips it.
+  test("lock-step: upc10 MOVE SR,<mi> in user mode -> privilege violation", VerilatorTest) {
+    upc10Only()
+    runLockStep("upc10-fromsr-memind-user",
+      "move.l #handler,0x20 ; move.l #0x3000,%a0 ; moveq #4,%d3 ; move.l #0x3200,0x3100 ; " +
+      "move.l #0x200000,%a2 ; move.l %a2,%usp ; " +
+      "move.w #0,%sr ; move.w %sr,([0x100,%a0],%d3.l*2,2) ; moveq #7,%d2 ; loop: bra loop ; " +
+      "handler: addq.l #8,2(%sp) ; rte",
+      nInstr = 7 + 1 + 2 + 2, seedDside = true)
+  }
+
+  // BFFFO with a dynamic offset through memory-indirect EAs (post-indexed, PC), and MOVE
+  // between two memory-indirect EAs whose destination is post-indexed.
+  test("lock-step: upc10 BFFFO dynamic offset / MOVE mi->mi post-indexed dst", VerilatorTest) {
+    upc10Only()
+    runLockStep("upc10-bfffo-move-memind",
+      upc10Frame +
+      "move.l #0x00F0F000,0x320A ; move.l #0x00001234,0x320E ; move.l #0x00000001,0x3300 ; " +
+      "moveq #5,%d2 ; bfffo ([0x100,%a0],%d3.l*2,2){%d2:20},%d0 ; " +
+      "moveq #3,%d5 ; bfffo ([p8,%pc]){%d5:16},%d1 ; " +
+      "move.l #0x11223344,0x3200 ; move.l ([0x100,%a0]),([0x104,%a0],%d3.l*2,8) ; " +
+      "move.l 0x3310,%d6 ; move.w ([0x100,%a0,%d3.l]),([0x100,%a0],%d3.l,4) ; move.l 0x3208,%d7 ; " +
+      "loop: bra loop ; .align 4 ; p8: .long 0x3300",
+      nInstr = 4 + 3 + 2 + 2 + 2 + 3 + 1, seedDside = true)
+  }
+
   // MULx.L / DIVx.L with MEMORY-INDIRECT sources: no-index, pre-indexed, post-indexed
   // with od, and ([bd,PC]) -- .L32, .L64 and the DIVxL remainder form.
   test("lock-step: decl MULx.L/DIVx.L memory-indirect sources", VerilatorTest) {

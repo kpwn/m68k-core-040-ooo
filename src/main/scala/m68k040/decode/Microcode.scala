@@ -2285,7 +2285,76 @@ object Microcode {
     Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = ST1, useImm = true,
       imm = SMiOd, sz = SzByte, miHostIndex = true, isLast = true))
 
-  val rom: Vector[Desc] = romBeforeScc ++ romScc
+  // ── CPU_UPC10 decode-gap programs (appended past MI_SCC; present only with the flag) ──
+  // Every row reuses an existing descriptor shape; what differs between the host ops is
+  // carried by `Ctx.miExt` (cluster / shift / sign / trap PC / SR-CCR / no-dst / CHK2),
+  // which `applyMiExt` folds onto the UMiHostOp µop in both resolvers.
+  private val upc10Start: Int = romBeforeScc.size + romScc.size
+  //   MI_FROMSR: MOVE SR/CCR,<mem-indirect>. The SR/CCR read is FIRST (isFirst, so the
+  //   needsSupervisor privilege check is the macro boundary, ahead of any pointer fault).
+  //     f0 MOVE SR|CCR -> T1 (.W)  f1 LOAD.L ptr -> T0  f2 STORE.W T1 -> (T0+od(+post))
+  private def romMiFromSr: Vector[Desc] = Vector(
+    // keepCommit: f0 (writes only T1) is the macro's oracle step; the no-reg/no-flag
+    // store is a dropped crack µop -- the fast MOVEFROMSR mem crack's convention.
+    Desc(UMiHostOp, dst = ST1, sz = SzWord, keepCommit = true, isFirst = true),
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true),
+    Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = ST1, useImm = true, imm = SMiOd,
+         sz = SzWord, miHostIndex = true, isLast = true))
+  //   MI_CMP2: CMP2/CHK2 <mem-indirect>,Rn. Lower bound at (T0+od(+post)), upper at
+  //   (T0+od+size(+post)) -- ctx.miHostImm carries od+size.
+  //     c0 LOAD.L ptr -> T0 ; c1 LOAD.sz lo -> T1 ; c2 LOAD.sz hi -> T2 ; c3 CMP2CHK2 T1,T2,Rn
+  private def romMiCmp2: Vector[Desc] = Vector(
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),
+    Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true),
+    Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST2, useImm = true, imm = SMiImm,
+         sz = SzHost, miHostIndex = true),
+    Desc(UMiHostOp, srcA = ST1, srcB = ST2, srcC = SMiOther, isLast = true))
+  //   MI_BF_FFO_DO1: BFFFO <mem-indirect>{Dn:w} -- MI_BF_RD_DO1's pointer walk and loads,
+  //   then BF_DYN_FFO_DO1's prefunnel + FFOFULL tail (Dn2 = Dn[off] + index, +NZ).
+  private def romMiBfFfoDo1: Vector[Desc] = Vector(
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),
+    Desc(UBfResolve, srcA = SBfOffReg, dst = ST0, useImm = true, imm = SBfDeltaImm, sz = SzLong),
+    Desc(UBfAdd, srcA = ST2, srcB = ST0, dst = ST2, sz = SzLong),
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SBfMiDispLo,
+         sz = SzLong, miHostIndex = true),
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SBfMiDispHi,
+         sz = SzByte, miHostIndex = true),
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST0, sz = SzLong,
+         bfDyn = true, bfTstForm = true),
+    Desc(UBfMem, srcA = ST0, srcB = SBfOffReg, srcC = ST2, dst = SBfRdDst, sz = SzLong,
+         bfDyn = true, bfWritesNz = true, bfStoreForm = 6, isLast = true))
+  //   MI_MOVE_BOTH_MI_POST: MOVE <mi>,([bd,An],Xn,od) -- MI_MOVE_BOTH_MI with the dst
+  //   index moved from the dst pointer load to the final store.
+  private def romMiMoveBothPost: Vector[Desc] = Vector(
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),
+    Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true),
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SMiOtherEaBase, dst = ST2, useImm = true,
+         imm = SMiOtherEaDispLo, sz = SzLong),
+    Desc(UMiHostMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SMiOtherOd,
+         sz = SzHost, indexFromMiOtherEa = true, miMoveFlags = true, isLast = true))
+  //   IMM_FLAGS: TST #imm / BTST Dn,#imm -- materialize the immediate, then the flags-only
+  //   host op on it (srcB = the bit-number Dn for BTST; none for TST).
+  private def romImmFlags: Vector[Desc] = Vector(
+    Desc(UMove, dst = ST1, useImm = true, imm = SMiImm, sz = SzLong, isFirst = true),
+    Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, isLast = true))
+  private def romUpc10: Vector[Desc] =
+    romMiFromSr ++ romMiCmp2 ++ romMiBfFfoDo1 ++ romMiMoveBothPost ++ romImmFlags
+  val MI_FROMSR_ENTRY: Int         = upc10Start
+  val MI_CMP2_ENTRY: Int           = MI_FROMSR_ENTRY + romMiFromSr.size
+  val MI_BF_FFO_DO1_ENTRY: Int     = MI_CMP2_ENTRY + romMiCmp2.size
+  val MI_MOVE_BOTH_POST_ENTRY: Int = MI_BF_FFO_DO1_ENTRY + romMiBfFfoDo1.size
+  val IMM_FLAGS_ENTRY: Int         = MI_MOVE_BOTH_POST_ENTRY + romMiMoveBothPost.size
+
+  val rom: Vector[Desc] = romBeforeScc ++ romScc ++
+    (if (m68k040.top.ShippingCoreConfig.upc10) romUpc10 else Vector.empty)
 
   // MULDIV @152..165 building blocks (see the romP4 block): the (An)+/-(An) source load
   // and the dropped An write-back, both keyed off the CAS/MOVES ctx auto-EA fields.
@@ -2697,7 +2766,45 @@ object Microcode {
     // MULx.L / DIVx.L with a MEMORY-INDIRECT source: DecodeStage substitutes the first two
     // rows of the MULDIV program (see `mdMiRow0`/`mdMiRow1`).
     val mdMi     = Bool()
+    // CPU_UPC10 host-op extension (see `MiExt`); absent (null) without the flag.
+    val miExt    = (m68k040.top.ShippingCoreConfig.upc10) generate MiExt()
   }
+
+  /** CPU_UPC10: what a UMiHostOp µop takes from the latched instruction beyond the §7 ALU
+    * set -- the OpSpec attributes the original host ops never needed. All False/0 for every
+    * pre-existing host (so their µops are unchanged); applied by `applyMiExt`. */
+  case class MiExt() extends Bundle {
+    val cplx      = Bool()        // cluster CPLX (CHK / MUL / DIV / CMP2CHK2) instead of INT
+    val shiftOp   = Bits(2 bits)  // memory shift: the OpSpec tt / dir
+    val shiftDir  = Bool()
+    val divSigned = Bool()        // MULS/DIVS sign; CMP2/CHK2 A/D bit (the fast crack's reuse)
+    val faultNext = Bool()        // group-2 trap (CHK / DIV0 / CHK2) stacks the next PC
+    val fromSr    = Bool()
+    val fromCcr   = Bool()
+    val toCcr     = Bool()
+    val noDst     = Bool()        // the host op writes no register (CHK / toCCR / CMP2)
+    val isChk2    = Bool()
+  }
+
+  /** Fold `ctx.miExt` onto a resolved µop. `hostOp` = this row is UMiHostOp. Called LAST by
+    * both `resolve` and `resolveFromBits` (identical hardware, so the equivalence gate holds
+    * by construction); a no-op without CPU_UPC10. */
+  private def applyMiExt(u: DecodedUop, hostOp: Bool, ctx: Ctx): Unit =
+    if (m68k040.top.ShippingCoreConfig.upc10) {
+      val x = ctx.miExt
+      when(hostOp) {
+        when(x.cplx) { u.cluster := Cluster.CPLX }
+        u.shiftOp   := x.shiftOp
+        u.shiftDir  := x.shiftDir
+        u.divSigned := x.divSigned
+        when(x.faultNext) { u.faultUsesNextPc := True }
+        u.fromSr    := x.fromSr
+        u.fromCcr   := x.fromCcr
+        u.toCcr     := x.toCcr
+        when(x.noDst) { u.dstValid := False }
+        u.isChk2    := x.isChk2
+      }
+    }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
   private def ayReg(ctx: Ctx): UInt = (U(8, 5 bits) + ctx.opword(2 downto 0).asUInt).resize(5)
@@ -3243,6 +3350,7 @@ object Microcode {
     // `!ucCurLast`, and clears `ucActive` on the isLast row, so the isLast row's µop is
     // by construction the macro's last µop. No separate derivation is possible or needed.
     u.lastOfInstr := Bool(d.isLast)
+    applyMiExt(u, Bool(d.uop == UMiHostOp), ctx)
     u
   }
 
@@ -3785,6 +3893,7 @@ object Microcode {
     // `lastOfInstr` -- exact twin of resolve()'s block above (the ROM row's own `isLast`
     // terminal-row marker); see there for the rationale.
     u.lastOfInstr := d.isLast
+    applyMiExt(u, d.uop === UOpHw.UMiHostOp, ctx)
     u
   }
 }
