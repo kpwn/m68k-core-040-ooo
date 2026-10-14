@@ -2782,18 +2782,30 @@ object Microcode {
     val fromSr    = Bool()
     val fromCcr   = Bool()
     val toCcr     = Bool()
-    val noDst     = Bool()        // the host op writes no register (CHK / toCCR / CMP2)
+    val noDst     = Bool()        // the host op writes no register (CMP / CHK / toCCR / CMP2)
     val isChk2    = Bool()
   }
+
+  /** UMiHostOp writes no register: CMP, or (CPU_UPC10) ctx.miExt.noDst, which DecodeStage
+    * sets for CMP as well as CHK / MOVE to CCR / CMP2 -- one latched bit instead of the
+    * enum compare on the dstValid path. */
+  private def miHostNoDst(ctx: Ctx): Bool =
+    if (m68k040.top.ShippingCoreConfig.upc10) ctx.miExt.noDst else ctx.miOp === DecOp.CMP
+  /** UMiHostOp cluster: INT, or CPLX for the CPU_UPC10 CHK / MUL / DIV / CMP2 hosts. */
+  private def setMiHostCluster(u: DecodedUop, ctx: Ctx): Unit =
+    if (m68k040.top.ShippingCoreConfig.upc10) {
+      u.cluster := Cluster.INT
+      when(ctx.miExt.cplx) { u.cluster := Cluster.CPLX }
+    } else u.cluster := Cluster.INT
 
   /** Fold `ctx.miExt` onto a resolved µop. `hostOp` = this row is UMiHostOp. Called LAST by
     * both `resolve` and `resolveFromBits` (identical hardware, so the equivalence gate holds
     * by construction); a no-op without CPU_UPC10. */
-  private def applyMiExt(u: DecodedUop, hostOp: Bool, ctx: Ctx): Unit =
+  private def applyMiExt(u: DecodedUop, hostOp: Bool, ctx: Ctx, cluster: Boolean = false): Unit =
     if (m68k040.top.ShippingCoreConfig.upc10) {
       val x = ctx.miExt
       when(hostOp) {
-        when(x.cplx) { u.cluster := Cluster.CPLX }
+        if (cluster) when(x.cplx) { u.cluster := Cluster.CPLX }   // resolve() only (see setMiHostCluster)
         u.shiftOp   := x.shiftOp
         u.shiftDir  := x.shiftDir
         u.divSigned := x.divSigned
@@ -2801,7 +2813,6 @@ object Microcode {
         u.fromSr    := x.fromSr
         u.fromCcr   := x.fromCcr
         u.toCcr     := x.toCcr
-        when(x.noDst) { u.dstValid := False }
         u.isChk2    := x.isChk2
       }
     }
@@ -3044,7 +3055,7 @@ object Microcode {
       // CMP writes NO result register (flags only) — the MI_ALU_SRC row's dst slot
       // (SMiOther, shared with the writing ALU ops) must not land for a CMP host
       // (FUZZER-CAUGHT: `cmp.<sz> ([...]),Dn` clobbered Dn with the compare result).
-      when(ctx.miOp === DecOp.CMP) { u.dstValid := False }
+      when(miHostNoDst(ctx)) { u.dstValid := False }
     } else if (d.uop == UMiHostMove) {
       // The host MOVE (load-to-Dn / store-from-Dn) sets NZVC per ctx.miWNzvc (miMoveFlags
       // rows). An intermediate host-load to T1 (ALU-src/RMW) writes NO flags (the host op
@@ -3350,7 +3361,7 @@ object Microcode {
     // `!ucCurLast`, and clears `ucActive` on the isLast row, so the isLast row's µop is
     // by construction the macro's last µop. No separate derivation is possible or needed.
     u.lastOfInstr := Bool(d.isLast)
-    applyMiExt(u, Bool(d.uop == UMiHostOp), ctx)
+    applyMiExt(u, Bool(d.uop == UMiHostOp), ctx, cluster = true)
     u
   }
 
@@ -3567,7 +3578,7 @@ object Microcode {
       is(UOpHw.UBfAdd)      { u.cluster := Cluster.INT }
       // The §7 host ALU/unary ops (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/NOT/TST) all run
       // on the INT (ALU) pipe; CPLX/CHK/DIV are not full-format mem-indirect hosts in scope.
-      is(UOpHw.UMiHostOp)   { u.cluster := Cluster.INT }
+      is(UOpHw.UMiHostOp)   { setMiHostCluster(u, ctx) }
       // UMiLeaFinal needs the LS-EU's AGU (leaAddr short-circuit, base+imm+scaled-index) —
       // an explicit override since d.mem=MNone would otherwise default to Cluster.INT
       // (mirrors the fast-path leaGenUop's `u.cluster := Cluster.LS`). UMiPushFinal
@@ -3644,7 +3655,7 @@ object Microcode {
       // (SMiOther, shared with the writing ALU ops) must not land for a CMP host
       // (FUZZER-CAUGHT: `cmp.<sz> ([...]),Dn` clobbered Dn with the compare result).
       // (Ordering preserved: this overrides the dstValid assigned by the d.auto chain above.)
-      when(ctx.miOp === DecOp.CMP) { u.dstValid := False }
+      when(miHostNoDst(ctx)) { u.dstValid := False }
     } .elsewhen(d.uop === UOpHw.UMiHostMove) {
       // The host MOVE (load-to-Dn / store-from-Dn) sets NZVC per ctx.miWNzvc (miMoveFlags
       // rows). An intermediate host-load to T1 (ALU-src/RMW) writes NO flags (the host op

@@ -2687,8 +2687,10 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       // ucMoveBothMi — checked FIRST so it wins over the illegal fallback; a post-indexed
       // dst (or any other both-MI shape ucMoveBothMiOk excludes) still falls through to the
       // existing MI_MOVE_BOTH_MI_ILLEGAL_ENTRY arm below.
-      Mux(ucSccMi, U(Microcode.MI_SCC_ENTRY, ew bits),
-      muxU10(ucFromSrMi, if (upc10) Microcode.MI_FROMSR_ENTRY else 0,
+      // CPU_UPC10: MOVE SR/CCR,<mi> shares the Scc arm (both selects are raw-opword).
+      Mux(orU10(ucSccMi, ucFromSrMi),
+          (if (upc10) Mux(ucFromSrMi, U(Microcode.MI_FROMSR_ENTRY, ew bits), U(Microcode.MI_SCC_ENTRY, ew bits))
+           else U(Microcode.MI_SCC_ENTRY, ew bits)),
       Mux(ucMoveBothMiOk,  U(Microcode.MI_MOVE_BOTH_MI_ENTRY, ew bits),
       // CPU_UPC10: a post-indexed dst has its own program (index at the final store).
       Mux(ucMoveBothMi,    U(if (Microcode.upcBits == 10) Microcode.MI_MOVE_BOTH_POST_ENTRY
@@ -2707,7 +2709,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       Mux(ucPeaMi, U(Microcode.MI_PEA_ENTRY, ew bits),
       Mux(ucJmpMi, U(Microcode.MI_JMP_ENTRY, ew bits),
       Mux(ucJsrMi, U(Microcode.MI_JSR_ENTRY, ew bits),
-                         U(Microcode.MI_RMW_ENTRY,    ew bits)))))))))))))))))
+                         U(Microcode.MI_RMW_ENTRY,    ew bits))))))))))))))))
     // ---- debug-only observability (task #139 mechanism #2 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     ucMiEntry.simPublic()
@@ -2826,7 +2828,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       x.fromSr    := ucFromSrMi && ucFromSrIsSr
       x.fromCcr   := ucFromSrMi && !ucFromSrIsSr
       x.toCcr     := ucToCcrMi
-      x.noDst     := ucChkMi || ucToCcrMi || ucCmp2Mi
+      x.noDst     := ucChkMi || ucToCcrMi || ucCmp2Mi || (ucEntrySpec.op === DecOp.CMP)
       x.isChk2    := ucCmp2Mi && ucCmp2Ext(11)
       when(ucChkMi || ucMulDivWMi || ucNbcdMi || ucShiftMemMi || ucCmp2Mi) {
         ucEntryCtx.miRNzvc := ucEntrySpec.readsNzvc;  ucEntryCtx.miRX := ucEntrySpec.readsX
@@ -3145,10 +3147,12 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
         // address. This is what makes the gate SAFE to make generic: a family nobody
         // routed traps, rather than silently writing the wrong register or branching to a
         // wild PC -- which is exactly how all four previous drift bugs presented.
-        Mux(ucIsMulDiv, ucMdEntry,
-        muxU10(ucCmp2Mi, if (upc10) Microcode.MI_CMP2_ENTRY else 0,
+        // CPU_UPC10: CMP2/CHK2 <mi> shares the MULx.L/DIVx.L arm (no extra priority level
+        // in front of the late spec.microcoded/ucEntry tail).
+        Mux(orU10(ucIsMulDiv, ucCmp2Mi),
+            (if (upc10) Mux(ucCmp2Mi, U(Microcode.MI_CMP2_ENTRY, ew bits), ucMdEntry) else ucMdEntry),
         Mux(ucEntrySpec.microcoded, ucEntrySpec.ucEntry,
-                                    U(Microcode.MI_UNSUPPORTED_ENTRY, ew bits))))))))))))
+                                    U(Microcode.MI_UNSUPPORTED_ENTRY, ew bits)))))))))))
     ucRealEntry.simPublic()  // debug-only (task #144)
 
     // LUT-reduction Task A2: the real `Mem(DescBits(), romSize)` (built from
