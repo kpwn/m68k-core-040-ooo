@@ -818,7 +818,7 @@ object ShippingCoreConfig {
     * Cold path only: a U/M write is queued only by a walk whose leaf lacks U (first
     * touch) or M (first write) -- zero cycles on any TLB hit or U/M-set walk.
     * Default OFF; `CPU_UM_LOAD_ORDER=1` enables; echoed in `SHIPPING_CONFIG`. */
-  val umLoadOrder: Boolean = envFlag("CPU_UM_LOAD_ORDER", false)
+  val umLoadOrder: Boolean = envFlag("CPU_UM_LOAD_ORDER", true)
 
   /** DTLB victim buffer depth (`CPU_DTLB_VICTIM`), 0 = OFF and elaborates NO hardware.
     * Same registered design as the ITLB's (`ITLB_VICTIM`): a fully associative buffer of
