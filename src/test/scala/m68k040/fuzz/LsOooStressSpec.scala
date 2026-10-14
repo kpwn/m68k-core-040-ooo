@@ -35,6 +35,10 @@ class LsOooStressSpec extends AnyFunSuite {
   private val nOps      = envInt("LSOOO_STRESS_OPS", 120)
   private val requireP1Fire = sys.env.get("LSOOO_REQUIRE_P1_FIRE").contains("1")
   private val Timeout   = 400000L
+  /** IRQ storm shape: pulses per dense burst, and the minimum quiet window after it (must
+    * exceed the ~75-cycle IRQ round trip PLUS the slowest instruction, ~65-cycle DIVU). */
+  private val IrqBurst    = 8
+  private val IrqQuietMin = 192
 
   private val Dev = 0xFFFF0100L
   /** Aligned device registers whose bus traffic is counted exactly. 0x108 is the RMW
@@ -195,7 +199,7 @@ class LsOooStressSpec extends AnyFunSuite {
       val p = gen(seed)
       val arCnt = mutable.Map.empty[Long, Int].withDefaultValue(0)
       val awCnt = mutable.Map.empty[Long, Int].withDefaultValue(0)
-      var excEntries = 0L; var lastExc = false
+      var excEntries = 0L; var lastExc = false; var irqTaken = 0L
       var p1Enabled = false; var p1Fires = 0L
       val outcome = PortedTestRunner.run(s"lsooo_stress_s$seed", p.src, Timeout,
         cachePosture = CachePosture.ForceCacheableCopyback, liveness = true,
@@ -212,15 +216,31 @@ class LsOooStressSpec extends AnyFunSuite {
             val e = !d.rob.logic.excIdle.toBoolean
             if (e && !lastExc) excEntries += 1
             lastExc = e
+            if (d.rob.logic.interruptPending.toBoolean) irqTaken += 1
           }
+          // BOUNDED STORM. A level-1 IRQ round trip (recognition -> stacking -> handler ->
+          // RTE -> refetch) costs ~75 cycles here, and the program's slowest instruction
+          // (DIVU, a fixed 64-iteration divider, ~65 cycles from issue) is squashed and
+          // restarted whenever an interrupt is recognised in front of it. An UNBOUNDED pulse
+          // train at a mean period of ~58 cycles therefore never leaves a window long enough
+          // for the first DIVU to retire: every seed starved at its first `divu.w` after
+          // ~3.8k interrupts and timed out (no wedge -- handler/RTE pairs kept retiring and
+          // the nest never deepened, since the handler runs at mask 1). So: a dense burst
+          // (the old phase-swept 7..97 gap, which still lands pulses during entry/handler/RTE
+          // and back-to-back with RTE), then a quiet window longer than the round trip plus
+          // the slowest instruction, itself swept so bursts drift across program positions.
           if (p.irq) fork {
-            var gap = 7
+            var gap = 7; var burst = 0
             while (true) {
-              cd.waitSampling(gap)
-              d.intCtrl.logic.iplIn #= 1
-              cd.waitSampling(6)
-              d.intCtrl.logic.iplIn #= 0
-              gap = if (gap >= 97) 7 else gap + 3
+              for (_ <- 0 until IrqBurst) {
+                cd.waitSampling(gap)
+                d.intCtrl.logic.iplIn #= 1
+                cd.waitSampling(6)
+                d.intCtrl.logic.iplIn #= 0
+                gap = if (gap >= 97) 7 else gap + 3
+              }
+              burst += 1
+              cd.waitSampling(IrqQuietMin + (burst * 37) % 128)
             }
           }
         })
@@ -230,7 +250,7 @@ class LsOooStressSpec extends AnyFunSuite {
         val (gr, gw) = (arCnt(a), awCnt(a))
         if (er != gr || ew != gw) Some(f"0x$a%08x reads $gr (want $er) writes $gw (want $ew)") else None
       }
-      val line = f"[lsooo-stress] seed=$seed irq=${p.irq} outcome=$outcome rmw=${p.rmw} excEntries=$excEntries " +
+      val line = f"[lsooo-stress] seed=$seed irq=${p.irq} outcome=$outcome rmw=${p.rmw} excEntries=$excEntries irqTaken=$irqTaken " +
         s"p1Enabled=$p1Enabled p1Fires=$p1Fires " +
         f"devReads=${exactRegs.map(arCnt).sum} splitReads=${arCnt.filter(_._1 >= Dev + 0x2C).values.sum} " +
         mon.summary
@@ -246,9 +266,12 @@ class LsOooStressSpec extends AnyFunSuite {
         .updated("replays", tot("replays") + mon.replays)
         .updated("replayRedirects", tot("replayRedirects") + mon.replayRedirects)
         .updated("excEntries", tot("excEntries") + excEntries)
+        .updated("irqTaken", tot("irqTaken") + irqTaken)
         .updated("commits", tot("commits") + mon.commits)
       if (outcome != PortedPass)
         failures += s"seed=$seed $outcome ${PortedTestRunner.lastLivenessFailure.getOrElse("")}"
+      else if (p.irq && irqTaken == 0)
+        failures += s"seed=$seed IRQ run took no interrupt (vacuous storm)"
       else if (devMismatch.nonEmpty)
         failures += s"seed=$seed DEVICE COUNT: ${devMismatch.mkString("; ")}"
       else if (requireP1Fire && p.irq && (!p1Enabled || p1Fires == 0))
