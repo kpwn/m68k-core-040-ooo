@@ -684,7 +684,7 @@ object ShippingCoreConfig {
     * JMP/JSR target is computed first by an LS-AGU address-generate µop into T0 (fast path:
     * `leaGenUop`; memory-indirect µcode: MI_JMP/MI_JSR rows), and the branch jumps to (T0).
     * Default OFF. Read by `BranchEuPlugin`, `MicroOpAssembler`, `Microcode`, `DecodeStage`. */
-  val prfTrimBrIdx: Boolean = envFlag("CPU_PRF_TRIM_BRIDX", false)
+  val prfTrimBrIdx: Boolean = envFlag("CPU_PRF_TRIM_BRIDX", true)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")

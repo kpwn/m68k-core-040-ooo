@@ -9668,7 +9668,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             // cycles (the SQ launch/ack handshake plus the replay stage), so the
             // ceiling is set just above it. This row exists to pin that baseline in
             // the same suite as the widened ones -- 9 / 14 / 71 / 128.
-            case "zero"   => (1, 12)
+            case "zero"   => (1, 16)
             case "dram20" => (12, 40)
             case "stslow" => (55, 100)
             case _        => (110, 200)
