@@ -709,7 +709,7 @@ object ShippingCoreConfig {
     * FsaveFrestoreSpec "FSAVE CONSUMES ..." (second frame word $10 = $BEEF). Cold path
     * only: one 16-bit mux on the exception sequencer's frame-word data.
     * Default OFF. Read by `ExceptionUnit`. */
-  val fsaveCleanIdleCmd: Boolean = envFlag("CPU_FSAVE_CLEAN_IDLE_CMD", false)
+  val fsaveCleanIdleCmd: Boolean = envFlag("CPU_FSAVE_CLEAN_IDLE_CMD", true)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
