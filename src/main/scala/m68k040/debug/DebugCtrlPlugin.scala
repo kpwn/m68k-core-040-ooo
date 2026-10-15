@@ -315,8 +315,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // the shadows in place instead of a 1024-flop start-of-apply snapshot.
       val applyNoSnap = stage >= 3 && !lite && m68k040.top.ShippingCoreConfig.dbgApplyNoSnap
       val awIsArchHold: Bool = if (applyNoSnap) RegInit(False) else False
-      val archHoldNow: Bool = if (applyNoSnap) Bool() else False
-      if (applyNoSnap) archHoldNow := False   // driven by the apply FSM below
+      val archHoldNow: Bool = if (applyNoSnap) Bool() else False   // driven next to `archApplyShadow`
 
       /** FMAX companion to `awIsHaltAfter`: `wStrb.orR` precomputed on the edge that
         * captures `wStrb`. Together the two turn `haltAfterInvalidate` into a single
