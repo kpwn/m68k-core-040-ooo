@@ -606,7 +606,13 @@ class ExceptionUnit(
   fmBackend.io.memoryResponse.valid := False
   fmBackend.io.memoryResponse.payload.data := 0
   fmBackend.io.memoryResponse.payload.fault := False
-  val fmLoaded = Vec.fill(8)(Reg(Bits(80 bits)))
+  // CPU_FM_STAGE_RAM: the cold FMOVEM staging buffer is written once per loaded register
+  // (index = fpReg) and read once per FM_WRITE step (index = fmWriteIndex), never both
+  // per entry in one cycle by different readers -- an 8x80 LUTRAM (one write, one async
+  // read) instead of 640 flops + an 80-bit 8:1 read mux. `fmLoadedMask` stays in flops.
+  private val fmStageRam = m68k040.top.ShippingCoreConfig.fmStageRam
+  val fmLoaded    = if (!fmStageRam) Vec.fill(8)(Reg(Bits(80 bits))) else null
+  val fmLoadedMem = if (fmStageRam) Mem(Bits(80 bits), 8) else null
   val fmLoadedMask = Reg(Bits(8 bits)) init 0
   val fmWriteIndex = Reg(UInt(3 bits)) init 0
   val fmNextAddress = Reg(UInt(32 bits))
@@ -3194,9 +3200,10 @@ class ExceptionUnit(
       when(fmBackend.io.translation.fire) { dxPendVpn := fmBackend.io.translation.payload.vpn }
       fmBackend.io.loaded.ready := True
       when(fmBackend.io.loaded.fire) {
+        if (fmStageRam) fmLoadedMem.write(fmBackend.io.loaded.payload.fpReg.resize(3), fmBackend.io.loaded.payload.value)
         for (i <- 0 until 8) {
           when(fmBackend.io.loaded.payload.fpReg === i) {
-            fmLoaded(i) := fmBackend.io.loaded.payload.value
+            if (!fmStageRam) fmLoaded(i) := fmBackend.io.loaded.payload.value
             fmLoadedMask(i) := True
           }
         }
@@ -3262,7 +3269,7 @@ class ExceptionUnit(
     FM_WRITE.whenIsActive {
       fmFpWrite.valid := fmLoadedMask(fmWriteIndex)
       fmFpWrite.payload.fpReg := fmWriteIndex
-      fmFpWrite.payload.value := fmLoaded(fmWriteIndex)
+      fmFpWrite.payload.value := (if (fmStageRam) fmLoadedMem.readAsync(fmWriteIndex) else fmLoaded(fmWriteIndex))
       when(fmWriteIndex === 7) { goto(FM_DONE) } otherwise { fmWriteIndex := fmWriteIndex + 1 }
     }
     FM_DONE.whenIsActive {

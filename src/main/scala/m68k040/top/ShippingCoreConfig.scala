@@ -1015,4 +1015,9 @@ object ShippingCoreConfig {
     * pair -> one rotate) and stage 2 its duplicate zero compares (`Bitfield.stage1T`).
     * Bit-identical (BitfieldTrimEquivSpec). Default OFF; echoed in `SHIPPING_CONFIG`. */
   val bfTrim: Boolean = envFlag("CPU_BF_TRIM", false)
+  /** CPU_FM_STAGE_RAM (payload hunt 2026-10-15): the ExceptionUnit's cold FMOVEM staging
+    * buffer (`fmLoaded`, 8 x 80 b) becomes an 8-deep LUTRAM (one write, one async read)
+    * instead of 640 flops + an 8:1 80-bit read mux. Same cycles. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val fmStageRam: Boolean = envFlag("CPU_FM_STAGE_RAM", false)
 }
