@@ -2949,10 +2949,20 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     val alignedParkAny = alignedParkVec.asBits.orR
     val alignedParkIsB = if (parkNoLine)
       alignedHeadLive && alignedRspEntry.twoAccess && alignedRspEntry.splitSecond else False
+    // Sim bookkeeping only (`splitMergeValid/Rob`): a parked, live, unfaulted slot A.
     val alignedParkIsA = if (parkNoLine)
       (0 until alignedDepth).map(i => alignedParkVec(i) && alignedMem(i).twoAccess &&
         !alignedMem(i).splitSecond && !alignedPoisoned(i)).reduce(_ || _) &&
       !dcache.loadRsp.payload.fault && !sqFlushSig
+    else False
+    // Hardware capture: ANY response for a slot A (parked or popping live, poisoned or
+    // faulted). The line is only read by its own pair's slot B, whose response is the
+    // next split response (B is not sent until A pops, and split commands are never
+    // answered out of order); a poisoned/faulted A never has a B that merges. So the
+    // extra captures are unobservable, and the clock enable is one AND-OR off the match.
+    val alignedRspAnyA = if (parkNoLine)
+      (0 until alignedDepth).map(i => alignedRspMatchVec(i) && alignedMem(i).twoAccess &&
+        !alignedMem(i).splitSecond).reduce(_ || _)
     else False
     val splitMergeNow = Bits(32 bits)   // driven next to `splitMergeLine` below
     for (i <- 0 until alignedDepth) {
@@ -3553,8 +3563,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       // Nothing else can write `splitMergeLine` this cycle: a pop capture needs the
       // response to belong to the head popping live, which a park excludes, and its
       // pair's slot B is not sent until this A pops. The squash clear below still wins.
+      when(alignedRspAnyA) { splitMergeLine := dcache.loadRsp.payload.line }
       when(alignedParkIsA) {
-        splitMergeLine  := dcache.loadRsp.payload.line
         splitMergeValid := True
         splitMergeRob   := MuxOH(alignedParkVec, alignedMem.map(_.bk.robId))
       }
@@ -3571,9 +3581,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     when(alignedRspFire && !alignedRspIsPoison) {
       when(alignedRspIsSplitA && !alignedRspFault) {
         if (parkNoLine) {
-          // A parked slot A already captured at park time.
+          // The line was captured by `alignedRspAnyA` when the response arrived.
           when(alignedHeadLive) {
-            splitMergeLine  := alignedRspLine
             splitMergeValid := True
             splitMergeRob   := alignedRspEntry.bk.robId
           }
