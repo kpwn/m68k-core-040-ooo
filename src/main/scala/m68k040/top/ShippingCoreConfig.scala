@@ -994,4 +994,32 @@ object ShippingCoreConfig {
     * Advertised as OFF_FEATURES bit 26 (`dbg_lite`). Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val dbgLite: Boolean = envFlag("CPU_DBG_LITE", false)
+
+  /** CPU_LS_PROBE_NOWAIT (2026-10-15, `load/store` IPC agent). A load in the LS EU's T stage
+    * that is PREDICTED to forward from the store queue (its page-offset word matches one of
+    * the last four stores through P1; a registered hint) no longer WAITS for the D-cache
+    * early-probe credit (`dcache.loadProbe.ready`) before launching its DTLB request: it
+    * offers the probe and launches either way. (Skipping the wait for EVERY load measured
+    * +7.2% cycles on `load-stream` and +12% on `dhrystone-x0-byteStoreOnly-cb`: a load that
+    * needs the array is better off waiting a cycle for its probe.) A probe the
+    * credit refuses is simply not taken -- the same architecturally invisible outcome as a
+    * DROPPED probe (`loadProbePort.fire && !loadProbeLaunch`): the resolved command later takes
+    * the ordinary S1 read (one cycle more load latency), and a load the SQ forwards never
+    * needs the array at all. Waiting held the WHOLE in-order LS pipe (T -> P1 -> issue) for
+    * every cycle the credit was closed by a draining store's grant, which on a store/load
+    * stream throttles LS issue to 2 per 3 cycles. Removes a term from `normalReqArm`
+    * (no new logic level). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val lsProbeNoWait: Boolean = envFlag("CPU_LS_PROBE_NOWAIT", false)
+
+  /** CPU_LS_STORE_COMP_DETACH (2026-10-15, `load/store` IPC agent). A fast (copyback/
+    * write-through, MMU-on) store whose data is ALREADY captured, reaching P3 on a cycle an
+    * older LS completion owns the single comp* stage (`olderThanP3Comp`, typically a
+    * SQ-forwarded load completing from P4), no longer HOLDS P3: it allocates its SQ entry as
+    * usual and hands its (data-free) completion to the existing detached-store completion
+    * owner, pre-captured, which completes it on the next free comp* cycle. Holding P3 stalled
+    * the in-order LS front (P3 -> P2T -> DTLB req.ready -> T -> issue) one cycle per
+    * store->load pair. Same eligibility as the late-data reservation it reuses (no stack push,
+    * CCR restore, X write, LEA, or split access). Requires the detached owner
+    * (`detachLateStore`, shipping); inert otherwise. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val lsStoreCompDetach: Boolean = envFlag("CPU_LS_STORE_COMP_DETACH", false)
 }

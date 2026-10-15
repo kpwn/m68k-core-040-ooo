@@ -1194,7 +1194,16 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
               s"${if (!dut.lsEu.logic.detachedStore.get.reserveReady.toBoolean) " FULL" else ""})" else ""
             val wk = if (ls.nextIntWake.valid.toBoolean) s"wake${ls.nextIntWake.payload.toInt}" else ""
             println(f"CTRACE $telemCycle%6d [$head%-40s] $iss%-9s s1=${if (ls.s1Valid.toBoolean) 1 else 0} " +
-              s"p3=${if (ls.p3Valid.toBoolean) 1 else 0} p4=${if (ls.p4Valid.toBoolean) 1 else 0} $an $det $wk " +
+              s"p3=${if (ls.p3Valid.toBoolean) 1 else 0} p4=${if (ls.p4Valid.toBoolean) 1 else 0} " +
+              s"t=${if (ls.tValid.toBoolean) 1 else 0} tx=${if (ls.txValid.toBoolean) 1 else 0} " +
+              s"nrf=${if (ls.normalReqFire.toBoolean) 1 else 0} xrdy=${if (ls.xlate.req.ready.toBoolean) 1 else 0} " +
+              s"lpr=${if (dut.dcache.logic.loadProbePort.ready.toBoolean) 1 else 0} " +
+              s"lpv=${if (dut.dcache.logic.loadProbePort.valid.toBoolean) 1 else 0} " +
+              s"sc=${if (dut.dcache.logic.storeClaimReg.toBoolean) 1 else 0} sro=${if (dut.dcache.logic.storeReadOwed.toBoolean) 1 else 0} " +
+              s"ss1=${if (dut.dcache.logic.stS1Valid.toBoolean) 1 else 0} sh=${if (dut.dcache.logic.loadShadowValid.toBoolean) 1 else 0} " +
+              s"ep=${dut.dcache.logic.earlyProbeValids.map(v => if (v.toBoolean) "1" else "0").mkString} " +
+              s"lc=${if (dut.dcache.logic.loadCmdPort.valid.toBoolean) 1 else 0}${if (dut.dcache.logic.loadCmdPort.ready.toBoolean) 1 else 0} " +
+              s"ldPort=${if (dut.dcache.logic.loadPortReserved.toBoolean) 1 else 0} sadv=${if (dut.dcache.logic.stS1Advance.toBoolean) 1 else 0} fe=${if (ls.p3FastEnq.toBoolean) 1 else 0} $an $det $wk " +
               s"cap=${if (ls.lateDataCapture.toBoolean) 1 else 0} rob=${dut.rob.logic.head.toInt}" +
               s"/${dut.rob.logic.count.toInt} disp=${if (!dut.disp.logic.dispValidSim.toBoolean) "FE"
                 else if (!dut.disp.logic.dispRobReadySim.toBoolean) "ROBFULL"
@@ -2403,7 +2412,10 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
   //    backward loop) so the LS pipe is never crossed by a mispredict redirect —
   //    see note in kMixed; a load that trails a taken-branch redirect exposes a
   //    core-level LS-replay stall, which is out of scope for this measurement tool.
-  def kLoadStore: Kernel = {
+  def kLoadStore: Kernel = kLoadStoreV(copyback = false)
+  /** Same kernel with copyback D-space (`load/store-cb`, opt-in via IPC_LS_CB=1): separates
+    * the precise write-through store cost from the rest of the kernel's cycles. */
+  def kLoadStoreV(copyback: Boolean): Kernel = {
     // Walk a 4-line window (offsets 0x3000,0x3010,0x3020,0x3030). For each of the
     // `unroll` repetitions and each of the 4 lines:
     //   move.l %dS,addr   store (1 macro)
@@ -2419,7 +2431,8 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       }
     }
     val src = (setup ++ body).mkString(" ; ")
-    Kernel("load/store", src, setup.size + reps * lines.size * 3)
+    Kernel(if (copyback) "load/store-cb" else "load/store", src, setup.size + reps * lines.size * 3,
+      copybackDtt = copyback)
   }
 
   // 4. branchy: a loop whose body contains a data-dependent conditional branch that

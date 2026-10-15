@@ -6332,6 +6332,48 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
   }
 
+  // CPU_LS_PROBE_NOWAIT / CPU_LS_STORE_COMP_DETACH. PROBE_NOWAIT: a T-stage load that finds
+  // the D-cache early-probe credit closed
+  // (a draining copyback store holds the shared read port) launches WITHOUT a probe. Covers
+  // the three outcomes of such a load -- full SQ forward (same address as the store just
+  // before it), sub-word forward, and a plain cache HIT on a line no store touches (the
+  // ordinary resolved-command read) -- in a copyback store/load stream that keeps the
+  // credit contended, with varying data so a stale or mis-routed value cannot match.
+  // STORE_COMP_DETACH: the same stream puts a store in P3 on the cycle the SQ-forwarded load
+  // ahead of it completes from P4, so the store's completion (NZVC write) is handed to the
+  // detached owner; the CCR-reading Scc after selected stores checks the deferred flags.
+  test("lock-step: probe-less load launch / detached store completion (copyback)", VerilatorTest) {
+    val setup = Seq(
+      "move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0",
+      "move.l #0xC000,%d7", "movec %d7,%tc",
+      "move.l #0x11223344,%d2", "moveq #0,%d1", "moveq #0,%d5") ++
+      (0 until 4).map(n => s"move.l #0x${(0xa0a0a0a0L + n).toHexString},0x${(0x3100 + n * 16).toHexString}")
+    val lines = Seq(0x3000, 0x3010, 0x3020, 0x3030)
+    val body = (0 until 6).flatMap { rep => lines.zipWithIndex.flatMap { case (a, i) =>
+      Seq("addq.l #3,%d2", f"move.l %%d2,0x$a%x", f"move.l 0x$a%x,%%d0", "add.l %d0,%d1",
+        f"move.l %%d${if (i == 3) 6 else 2},0x$a%x", "smi %d6", f"move.l 0x$a%x,%%d0",
+        f"move.l 0x${0x3100 + i * 16}%x,%%d3", "add.l %d3,%d5") ++
+      (if ((rep + i) % 3 == 0) Seq(f"move.b %%d2,0x${a + 1}%x", f"move.w 0x$a%x,%%d4", "add.l %d4,%d5") else Nil)
+    } }
+    val evict = for (line <- lines; n <- 1 to 4)
+      yield s"move.l #0,0x${(line + n * DcWayStride).toHexString}"
+    var skipped = 0; var detached = 0
+    runLockStep("ls-probe-nowait", (setup ++ body ++ evict).mkString(" ; "),
+      checkMem = lines.map(_.toLong), checkSpan = 4, maxCycles = 100000,
+      perCycle = dut => {
+        val t = dut.lsEu.logic.probeSkipped
+        if (t != null && t.toBoolean) skipped += 1
+        if (m68k040.top.ShippingCoreConfig.lsStoreCompDetach &&
+            dut.lsEu.logic.p3CompDetachFire.toBoolean) detached += 1
+      })
+    println(s"LS_PROBE_NOWAIT_ORACLE skipped=$skipped detached=$detached")
+    if (m68k040.top.ShippingCoreConfig.lsProbeNoWait)
+      assert(skipped > 0, "CPU_LS_PROBE_NOWAIT on, but no load ever launched without a probe")
+    if (m68k040.top.ShippingCoreConfig.lsStoreCompDetach)
+      assert(detached > 0, "CPU_LS_STORE_COMP_DETACH on, but no store completion was ever detached")
+  }
+
   test("lock-step: early store address preserves late data, byte lanes and CCR", VerilatorTest) {
     for (copyback <- Seq(false, true)) {
       val setup = (if(copyback) Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
