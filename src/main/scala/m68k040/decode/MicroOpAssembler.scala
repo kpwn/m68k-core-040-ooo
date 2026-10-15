@@ -3507,7 +3507,7 @@ object MicroOpAssembler {
     val bfmEaOk  = (bfmEaDec.klass === EaClass.MEMSIMPLE) && (bfmEaDec.autoMode === EaAuto.NONE)
     val bfmOffset5 = bfExt(10 downto 6).asUInt              // static offset 0..31
     val bfmWidthRaw= bfExt(4 downto 0).asUInt               // raw width (0->32)
-    val bfmWidth   = (((bfmWidthRaw - 1) & U(31, 5 bits)) + 1)   // 1..32
+    val bfmWidth   = (((bfmWidthRaw - 1) & U(31, 5 bits)).resize(6) + 1)   // 1..32 (6 bits: 32 must not wrap to 0)
     val bfmDn2     = bfExt(14 downto 12).asUInt.resize(5)
     val bfmBfOp    = op(10 downto 8)
     val bfmByteOff = bfmOffset5 >> 3                        // 0..3 (FOLDED into disp)
