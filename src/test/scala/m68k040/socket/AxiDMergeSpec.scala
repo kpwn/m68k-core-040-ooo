@@ -274,6 +274,7 @@ class AxiDMergeSpec extends AnyFunSuite {
     dut.io.out.b.payload.id   #= id
     dut.io.out.b.payload.resp #= 0
     dut.io.out.b.valid #= true
+    sleep(1) // settle the poke before sampling ready: a B held past its own handshake is a SECOND, spurious B
     var g = 0
     while (!dut.io.out.b.ready.toBoolean && g < bound) { dut.clockDomain.waitSampling(); g += 1 }
     val taken = dut.io.out.b.ready.toBoolean
@@ -344,6 +345,7 @@ class AxiDMergeSpec extends AnyFunSuite {
       dut.io.out.b.payload.id   #= AxiIds.D_STORE
       dut.io.out.b.payload.resp #= 0
       dut.io.out.b.valid #= true
+      sleep(1) // settle the poke before sampling ready: a B held past its own handshake is a SECOND, spurious B
       var g = 0
       while (!dut.io.out.b.ready.toBoolean && g < 200) { stepRetiring(); g += 1 }
       assert(dut.io.out.b.ready.toBoolean, "the arbiter never accepted the first B")
@@ -364,6 +366,7 @@ class AxiDMergeSpec extends AnyFunSuite {
       dut.io.out.b.payload.id   #= AxiIds.D_PUSH
       dut.io.out.b.payload.resp #= 0
       dut.io.out.b.valid #= true
+      sleep(1) // settle the poke before sampling ready: a B held past its own handshake is a SECOND, spurious B
       g = 0
       var seen = false
       while (!seen && g < 200) {

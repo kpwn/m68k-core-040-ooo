@@ -760,6 +760,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     rdEn  := False
     rdEn.simPublic()
     rdSet.simPublic()   // DEBUG (pea-cache-evict-2026-08-19 investigation), temporary
+    // CPU_TAIL20: `rdSet` is the shared S0 read address of EVERY way's data, tag, valid and
+    // dirty array (routed fo 28-45 at ~0.65 ns, the last hop of the i20 tail family
+    // `nb_eway -> tagMem/dataMem ADDRARDADDR`); let synthesis replicate its driver.
+    if (m68k040.top.ShippingCoreConfig.tail20) rdSet.addAttribute("max_fanout", "8")
     val rdData  = Vec(dataMem.map(_.readSync(rdSet, rdEn)))
     // Slice `D3-BURST`: the tag read rides the SAME `rdSet`/`rdEn` port as before --
     // only the low `secBits` are dropped, because those select the sector WITHIN the

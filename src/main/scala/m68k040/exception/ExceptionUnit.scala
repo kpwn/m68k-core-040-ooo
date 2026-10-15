@@ -884,9 +884,16 @@ class ExceptionUnit(
   // multi-cycle + ack-gated, so the extra cycle is free). The registered Stream
   // remains valid and payload-stable until accepted; this cuts the arc without
   // reverting to a one-cycle pulse that can be dropped. ────────────────────────
+  // CPU_TAIL20: the payload defaults are DON'T-CARE (it is captured only while the
+  // held command is invalid and is observable only once `stoValidReg` is set, which
+  // happens only on a cycle a store state drives real values). A constant-0 default
+  // made Vivado implement the capture as a synchronous RESET of every payload bit
+  // driven by the deep `frameBase -> excNeedXlate -> state` cone (i20 tail family
+  // `exc_frameBase -> exc_stoPaddrReg/R`, `.../stoDataReg/R`).
+  val stoTail20 = m68k040.top.ShippingCoreConfig.tail20
   val stoVld   = Bool();        stoVld := False
-  val stoPaddr = UInt(32 bits); stoPaddr := U(0, 32 bits)
-  val stoData  = Bits(32 bits); stoData := B(0, 32 bits)
+  val stoPaddr = UInt(32 bits); if (stoTail20) stoPaddr.assignDontCare() else stoPaddr := U(0, 32 bits)
+  val stoData  = Bits(32 bits); if (stoTail20) stoData.assignDontCare()  else stoData := B(0, 32 bits)
   val stoSize  = Size();        stoSize := Size.LONG
   val stoValidReg = RegInit(False)
   val stoPaddrReg = Reg(UInt(32 bits))
@@ -953,7 +960,7 @@ class ExceptionUnit(
   when(dcStore.fire) {
     stoValidReg := False
   }
-  when(stoVld) {
+  if (!stoTail20) when(stoVld) {
     // E_STORE is a one-cycle capture state and cannot be re-entered until the
     // previous store's terminal ack, so this never overwrites a held command.
     assert(!stoValidReg,
@@ -965,6 +972,25 @@ class ExceptionUnit(
     stoSizeReg  := stoSize
     stoCmodeReg := commandCacheMode
     if (framesCopyback) when(stoCb) { stoCmodeReg := m68k040.cache.CacheMode.COPYBACK }
+  } else {
+    // CPU_TAIL20: the `ldo*` capture discipline. The payload has one reader each
+    // (`dcStore.payload.*`), observable only while `stoValidReg` is set; that flop is set
+    // only by `stoVld`, which (asserted below) never fires while it is already set, so on
+    // the setting cycle `!stoValidReg` holds and the payload latches exactly the values
+    // the `when(stoVld)` form latched, and while the command is held it is frozen.
+    when(!stoValidReg) {
+      stoPaddrReg := stoPaddr
+      stoDataReg  := stoData
+      stoSizeReg  := stoSize
+      stoCmodeReg := commandCacheMode
+      if (framesCopyback) when(stoCb) { stoCmodeReg := m68k040.cache.CacheMode.COPYBACK }
+    }
+    when(stoVld) {
+      assert(!stoValidReg,
+        "ExceptionUnit: attempted to overwrite an unaccepted frame-store command",
+        FAILURE)
+      stoValidReg := True
+    }
   }
 
   // ── D-cache LOAD + D-TLB req: REGISTERED outputs (FMax). The frame/vector load

@@ -994,4 +994,10 @@ object ShippingCoreConfig {
     * Advertised as OFF_FEATURES bit 26 (`dbg_lite`). Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val dbgLite: Boolean = envFlag("CPU_DBG_LITE", false)
+  /** Fmax tail (i20 census, 2026-10-15): cycle-identical restructures of the routed
+    * tail families -- IQ log-depth first-one select + `valid` from the candidate OR,
+    * exception-store payload captured without a data reset, the merged AXI write
+    * response not re-qualified by the arbiter `busy` flop, and fanout caps on the
+    * D-cache array read set. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val tail20: Boolean = envFlag("CPU_TAIL20", false)
 }

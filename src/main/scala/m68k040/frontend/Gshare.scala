@@ -171,6 +171,12 @@ class GsharePlugin(retainRedirectHistory: Boolean = false,
     val phtStrong0 = phtCtr0(1) === phtCtr0(0)
     val phtTaken1 = (readCounter(phtIndex1) >= U(2, 2 bits))
     phtIndex0.simPublic(); phtIndex1.simPublic()
+    // CPU_TAIL20: the index drives every cell of the 2048-row PHT LUTRAM read port
+    // (routed fo~130 on `phtRows ... DPRA*`, the i20 `ibuf/headPtr -> retainedRepair` tail);
+    // let synthesis replicate its driver. Attribute only -- no logic change.
+    if (m68k040.top.ShippingCoreConfig.tail20) {
+      phtIndex0.addAttribute("max_fanout", "32"); phtIndex1.addAttribute("max_fanout", "32")
+    }
     phtTaken0.simPublic(); phtTaken1.simPublic()
 
     // Registered four-word window lookup for the fetch-directed FTB. All four reads

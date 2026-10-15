@@ -95,7 +95,8 @@ object AxiDMerge {
   *                     uses. Parameterised ONLY so directed tests can use a short value;
   *                     production is `AxiDMerge.V1_TIMEOUT_CYCLES`. */
 class AxiDMerge(axiCfg: Axi4Config,
-                grantTimeout: BigInt = AxiDMerge.V1_TIMEOUT_CYCLES) extends Component {
+                grantTimeout: BigInt = AxiDMerge.V1_TIMEOUT_CYCLES,
+                bValidNoBusy: Boolean = m68k040.top.ShippingCoreConfig.tail20) extends Component {
   import AxiDMerge.Owner
   require(grantTimeout >= 2, s"grantTimeout must be >= 2 (got $grantTimeout)")
 
@@ -395,9 +396,15 @@ class AxiDMerge(axiCfg: Axi4Config,
     io.dc.b.payload   := io.out.b.payload
     io.itlb.b.payload := io.out.b.payload
     io.dtlb.b.payload := io.out.b.payload
-    io.dc.b.valid   := io.out.b.valid && busy && (owner === U(Owner.DCACHE, 2 bits))
-    io.itlb.b.valid := io.out.b.valid && busy && (owner === U(Owner.ITLB,   2 bits))
-    io.dtlb.b.valid := io.out.b.valid && busy && (owner === U(Owner.DTLB,   2 bits))
+    // CPU_TAIL20 (`bValidNoBusy`): a B can only answer an AW this arbiter forwarded, and
+    // every forwarded AW keeps `busy` set until its own B fires (D20b's release needs
+    // `!awTaken`), so `out.b.valid` implies `busy` and the AND is redundant. Dropping it
+    // takes the `wr_busy` flop off the head of the B -> storeAck -> SQ drain -> IQ wakeup
+    // chain (i20 tail family `merge/wr_busy -> IQ dynWait/aluWaitAny`). Tripwired below.
+    def bBusy: Bool = if (bValidNoBusy) True else busy
+    io.dc.b.valid   := io.out.b.valid && bBusy && (owner === U(Owner.DCACHE, 2 bits))
+    io.itlb.b.valid := io.out.b.valid && bBusy && (owner === U(Owner.ITLB,   2 bits))
+    io.dtlb.b.valid := io.out.b.valid && bBusy && (owner === U(Owner.DTLB,   2 bits))
     io.out.b.ready := busy && io.out.b.valid && (
       ((owner === U(Owner.DCACHE, 2 bits)) && io.dc.b.ready)   ||
       ((owner === U(Owner.ITLB,   2 bits)) && io.itlb.b.ready) ||
@@ -446,6 +453,8 @@ class AxiDMerge(axiCfg: Axi4Config,
     val rHot = io.dc.r.valid.asUInt +^ io.itlb.r.valid.asUInt +^
                io.dtlb.r.valid.asUInt +^ io.rvRValid.asUInt
     assert(rHot <= U(1), "AxiDMerge: an R beat was presented to more than one owner", FAILURE)
+    if (bValidNoBusy) assert(!io.out.b.valid || wr.busy,
+      "AxiDMerge: a B response arrived with no write grant outstanding", FAILURE)
     val bHot = io.dc.b.valid.asUInt +^ io.itlb.b.valid.asUInt +^ io.dtlb.b.valid.asUInt
     assert(bHot <= U(1), "AxiDMerge: a B beat was presented to more than one owner", FAILURE)
     // D20b (2026-09-13): the invariant is now "a grant clears on COMPLETION, or because
