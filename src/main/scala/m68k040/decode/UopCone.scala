@@ -61,7 +61,8 @@ class UopCone(val enabled: Boolean, immW: Int) {
         case (_: Bool, _: Bool) => true
         case _ => false
       }
-      while (d.isDefined && n < 16 && same(d.get)) {
+      // Never look through a register (its single driver is its NEXT value).
+      while (!r.isReg && d.isDefined && n < 16 && same(d.get)) {
         r = d.get; d = r.getSingleDriver; n += 1
       }
       r
