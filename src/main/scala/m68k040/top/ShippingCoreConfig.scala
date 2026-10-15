@@ -1002,4 +1002,10 @@ object ShippingCoreConfig {
     * Every read returns the same value as the flop array on every cycle after the sweep.
     * Unsectored only. Default OFF; echoed in `SHIPPING_CONFIG`. */
   val dcacheVictimLutram: Boolean = envFlag("CPU_DCACHE_VICTIM_LUTRAM", false)
+  /** Area (sqarea 2026-10-15): the I-cache prefetch-provenance telemetry `pfFilled`
+    * (ways x sets flops with an all-clear) becomes one async-read LUTRAM per way. The
+    * all-clear on invalidate is dropped: the bit is consumed only under `s1HitVec(w)`,
+    * which needs a valid line, and every `valids := True` install also writes the bit,
+    * so a stale bit under an invalid line is never observed. Default OFF; echoed. */
+  val icachePfFilledLutram: Boolean = envFlag("CPU_ICACHE_PFFILLED_LUTRAM", false)
 }
