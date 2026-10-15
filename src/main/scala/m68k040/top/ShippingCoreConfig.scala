@@ -1008,4 +1008,10 @@ object ShippingCoreConfig {
     * which needs a valid line, and every `valids := True` install also writes the bit,
     * so a stale bit under an invalid line is never observed. Default OFF; echoed. */
   val icachePfFilledLutram: Boolean = envFlag("CPU_ICACHE_PFFILLED_LUTRAM", false)
+  /** Area (sqarea 2026-10-15): the IssueQueue static scoreboards' producer-position rows
+    * (`physToPosition`, depth x 4 bits for sbInt/sbNzvc/sbX/sbFp/sbFpcc) live in async-read
+    * LUTRAMs written by the two push ways, instead of flop arrays with a depth:1 read mux
+    * per push source. A row is read only under its `busy` bit, which is set only together
+    * with an insert of that row, so every observed value is identical. Default OFF; echoed. */
+  val iqPositionLutram: Boolean = envFlag("CPU_IQ_POS_LUTRAM", false)
 }

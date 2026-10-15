@@ -770,6 +770,7 @@ object GenSocketTopVerilog {
             s"dcacheNbProbeMissStage=${ShippingCoreConfig.dcacheNbProbeMissStage} " +
             s"dcacheVictimLutram=${ShippingCoreConfig.dcacheVictimLutram} " +
             s"icachePfFilledLutram=${ShippingCoreConfig.icachePfFilledLutram} " +
+            s"iqPositionLutram=${ShippingCoreConfig.iqPositionLutram} " +
             s"prfReadTrim=${ShippingCoreConfig.prfReadTrim} " +
             s"prfTrimDivH=${ShippingCoreConfig.prfTrimDivH} " +
             s"prfTrimBrIdx=${ShippingCoreConfig.prfTrimBrIdx} " +
