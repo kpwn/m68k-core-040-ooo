@@ -709,6 +709,10 @@ object GenSocketTopVerilog {
             s"alignMaskNoRst=${ShippingCoreConfig.alignMaskNoRst} " +
             s"immCone=${ShippingCoreConfig.immCone} " +
             s"uopCone=${ShippingCoreConfig.uopCone} " +
+            s"decStashShare=${ShippingCoreConfig.decStashShare} " +
+            s"decPendShare=${ShippingCoreConfig.decPendShare} " +
+            s"ucCtxNarrow=${ShippingCoreConfig.ucCtxNarrow} " +
+            s"ucEaDispFold=${ShippingCoreConfig.ucEaDispFold} " +
             s"feRedirectCmd=${ShippingCoreConfig.feRedirectCmd} " +
             s"beRetime=${ShippingCoreConfig.beRetime} " +
             s"tc3Retime=${ShippingCoreConfig.tc3Retime} " +
