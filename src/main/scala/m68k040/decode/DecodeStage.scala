@@ -43,7 +43,17 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
                     * aligner's slot-1 zero-fill on the registered side of `raw`. */
                   alignMaskNoRst: Boolean = m68k040.top.ShippingCoreConfig.alignMaskNoRst,
                   /** `ShippingCoreConfig.immCone` (CPU_IMM_CONE): one-hot atom imm cone. */
-                  immCone: Boolean = m68k040.top.ShippingCoreConfig.immCone) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
+                  immCone: Boolean = m68k040.top.ShippingCoreConfig.immCone,
+                  /** `ShippingCoreConfig.uopCone` (CPU_UOP_CONE): one-hot crack-tree select. */
+                  uopCone: Boolean = m68k040.top.ShippingCoreConfig.uopCone,
+                  /** `ShippingCoreConfig.decStashShare` (CPU_DEC_STASH_SHARE). */
+                  decStashShare: Boolean = m68k040.top.ShippingCoreConfig.decStashShare,
+                  /** `ShippingCoreConfig.decPendShare` (CPU_DEC_PEND_SHARE). */
+                  decPendShare: Boolean = m68k040.top.ShippingCoreConfig.decPendShare,
+                  /** `ShippingCoreConfig.ucCtxNarrow` (CPU_UC_CTX_NARROW). */
+                  ucCtxNarrow: Boolean = m68k040.top.ShippingCoreConfig.ucCtxNarrow,
+                  /** `ShippingCoreConfig.ucEaDispFold` (CPU_UC_EADISP_FOLD). */
+                  ucEaDispFold: Boolean = m68k040.top.ShippingCoreConfig.ucEaDispFold) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
                                        with FpImmTableService with FpTrapImmediateService
                                        with m68k040.services.DecodeRasSnapService {
 
@@ -354,8 +364,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `a0Ia`/`a1Ia` hold the per-packet atoms that rebuild the 32-bit GROUP-bank values (the
     // only consumer of the assembled `imm`, see wideImm). Flag OFF: the original assembler.
     def asmPair(i: Int): (MicroOpAssembler.AssembledUops, ImmAtoms) =
-      if (immCone) MicroOpAssembler.assembleAtoms(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime)
-      else (MicroOpAssembler.assemble(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime), null)
+      if (immCone) MicroOpAssembler.assembleAtoms(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime, uopCone)
+      else (MicroOpAssembler.assemble(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime, uopCone), null)
     val (a0, a0Ia)    = asmPair(0)
     val (a1raw, a1Ia) = asmPair(1)
 
@@ -818,7 +828,18 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // Pack: positions 0..2 = head instruction's µops; the slot1 µops follow at nCur..
     // (only when slot1Emit, where nCur<=2 and n1<=2, so max position 3; with
     // CPU_DECODE_PAIR_3P1 also nCur==3 && n1==1, slot1's uop 0 at position 3).
-    def headUop(i: Int): DecodedUop = Mux(stashValid, stashUops(i), a0n(i))
+    // CPU_DEC_STASH_SHARE: pc/lenWords/brPredTag/valid are per-INSTRUCTION (equal across the
+    // three assembled uops, StashShareSpec), so stash positions 1/2 take them from position 0.
+    val stashRead: Seq[DecodedUop] = (0 until 3).map { i =>
+      if (!decStashShare || i == 0) stashUops(i) else {
+        val u = CombInit(stashUops(i))
+        u.pc.allowOverride; u.lenWords.allowOverride; u.brPredTag.allowOverride; u.valid.allowOverride
+        u.pc := stashUops(0).pc; u.lenWords := stashUops(0).lenWords
+        u.brPredTag := stashUops(0).brPredTag; u.valid := stashUops(0).valid
+        u
+      }
+    }
+    def headUop(i: Int): DecodedUop = Mux(stashValid, stashRead(i), a0n(i))
 
     val totalCount = (nCur +^ n1).resize(3)            // 1..4
 
@@ -1325,7 +1346,11 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     ucActive.simPublic(); ucPendValid.simPublic()
     val slot1IsMovem = slot1IsMovemEarly   // slot1's MOVEM marker (decoded above, shared via CSE)
     val movemPendValid = RegInit(False)
-    val movemPendPkt   = Reg(DecodePacket())
+    // CPU_DEC_PEND_SHARE: the four slot-1 pend packets are ONE register (see the capture
+    // block at the end of this Area).
+    val sharedPendPkt  = if (decPendShare) Reg(DecodePacket()) else null
+    def pendPktReg(): DecodePacket = if (decPendShare) sharedPendPkt else Reg(DecodePacket())
+    val movemPendPkt   = pendPktReg()
     // t200-dec: the original per-arm write enable of the pend packet registers, kept only
     // as a wire for the sim proof at the end of this Area (see `pendCapture`).
     val movemPendLoad  = Bool(); movemPendLoad := False
@@ -1342,7 +1367,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // Slot1 entry (2026-09-10): the stash that the comment above used to say did not
     // exist. Mirrors movemPendValid/movemPendPkt verbatim.
     val fmovemxPendValid = RegInit(False)
-    val fmovemxPendPkt   = Reg(DecodePacket())
+    val fmovemxPendPkt   = pendPktReg()
     val fmovemxPendLoad  = Bool(); fmovemxPendLoad := False
     when(pipeFlush) { fmovemxPendValid := False }
 
@@ -1470,7 +1495,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
 
     // MOVEP entry: a pending slot1 MOVEP (movepPendValid), else slot0. Decode Dx/Ay/disp16.
     // movepPendValid declared above (hoisted).
-    val movepPendPkt   = Reg(DecodePacket())
+    val movepPendPkt   = pendPktReg()
     val movepPendLoad  = Bool(); movepPendLoad := False
     when(pipeFlush) { movepPendValid := False }
     val movepEntryPkt  = Mux(movepPendValid, movepPendPkt, fed.payload.packets(0))
@@ -1801,7 +1826,36 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // mirroring `OpSpec.ucEntry`'s identical widening (DecodeContracts.scala).
     val ucPc     = Reg(UInt(Microcode.upcBits bits))
     ucPc.simPublic()
-    val ucCtx    = Reg(Microcode.Ctx())
+    // CPU_UC_CTX_NARROW: `ucCtxR` is the register; `ucCtx` re-derives the fields that are a
+    // sign extension of a few low bits (An deltas, PACK adj16) or a +4 of another latched
+    // field (pc+4, bfMiDispLo+4) from it, so those upper/derived flops go unloaded. Exact:
+    // checked on every load in simulation (ucCtxNarrowCheck below).
+    val ucCtxWire = ucCtxNarrow || ucEaDispFold
+    val ucCtx    = if (!ucCtxWire) Reg(Microcode.Ctx()) else Microcode.Ctx()
+    val ucCtxR   = if (!ucCtxWire) ucCtx else Reg(Microcode.Ctx())
+    // CPU_UC_EADISP_FOLD: ucCtxR.eaDispLo holds only the EA displacement A; the pc-relative
+    // fold `+ (P ? pc : 0) + K` (K <= 6) is done here, AFTER the register, instead of by
+    // three entry-side adders in front of a 5-way priority chain (decode's worst OOC path).
+    val ucEaP    = if (ucEaDispFold) Reg(Bool()) else null
+    val ucEaK    = if (ucEaDispFold) Reg(UInt(3 bits)) else null
+    if (ucCtxWire) ucCtx := ucCtxR
+    if (ucEaDispFold) {
+      ucCtxR.eaDispLo.allowOverride
+      ucCtx.eaDispLo.allowOverride
+      ucCtx.eaDispLo := (ucCtxR.eaDispLo.asUInt + Mux(ucEaP, ucCtxR.pc, U(0, 32 bits)) + ucEaK.resize(32)).asBits
+    }
+    if (ucCtxNarrow) {
+      val c = ucCtx
+      def sx(b: Bits, w: Int): Bits = b(w - 1 downto 0).asSInt.resize(32).asBits
+      Seq(c.movesDelta, c.fpAutoDelta, c.fpCtrlDelta, c.packAdj, c.bfPcRelConst, c.bfMiDispHi, c.nextPc).foreach(_.allowOverride)
+      c.movesDelta   := sx(ucCtxR.movesDelta, 4)
+      c.fpAutoDelta  := sx(ucCtxR.fpAutoDelta, 5)
+      c.fpCtrlDelta  := sx(ucCtxR.fpCtrlDelta, 5)
+      c.packAdj      := sx(ucCtxR.packAdj, 16)
+      c.bfPcRelConst := (ucCtxR.pc + U(4, 32 bits)).asBits
+      c.bfMiDispHi   := (ucCtxR.bfMiDispLo.asUInt + U(4, 32 bits)).asBits
+      c.nextPc       := (ucCtxR.pc + (ucCtxR.lenWords << 1).resize(32)).resize(32)
+    }
     ucCtx.miOther.simPublic(); ucCtx.miOtherValid.simPublic()  // debug-only (task #144)
     when(pipeFlush) { ucActive := False }
 
@@ -1809,7 +1863,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // NORMAL instruction and slot1 IS microcoded, slot0 emits this cycle and the slot1
     // PACKET is stashed; the engine enters from it next cycle. `fed` was already consumed
     // when the slot1 was stashed (the FOLLOWING group is held until the engine finishes).
-    val ucPendPkt   = Reg(DecodePacket())
+    val ucPendPkt   = pendPktReg()
     val ucPendLoad  = Bool(); ucPendLoad := False
     // FMAX "LEVER U1" (docs/superpowers/specs/2026-08-08-fmax-leveru1-ucpendpkt-reuse-design.md,
     // .../plans/2026-08-08-fmax-leveru1-ucpendpkt-reuse-plan.md): the stashed slot-1 packet's
@@ -2423,13 +2477,26 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val ucComplexResumeTarget =
       Mux(movemPcIdxResumeFire, movemPcIdxRealNextPc, ucMoveRealNextPc)
     val ucComplexResumeValidReg = Reg(Bool()) init False
-    val ucComplexResumeTargetReg = Reg(UInt(32 bits)) init 0
+    val ucComplexResumeTargetReg = if (!ucEaDispFold) Reg(UInt(32 bits)) init 0 else UInt(32 bits)
     // FMAX 200 MHz (t200-dec): the target is captured UNCONDITIONALLY (no CE). Its only
     // reader is `ucComplexResume.payload`, consumed solely under `ucComplexResume.valid`
     // (= ValidReg, which is set exactly on the cycle after a kept detect -- the very cycle
     // whose capture this is); the detect-gated CE carried ucBegin/movemBegin and the
     // whole slot0 classifier cone onto 32 flop CEs.
-    ucComplexResumeTargetReg := ucComplexResumeTarget
+    // CPU_UC_EADISP_FOLD: register {base pc, K <= 22} and add after the register (the target
+    // only feeds the wiring plugin's ComplexResumeActionPipe register). Exact; init 0+0.
+    if (!ucEaDispFold) ucComplexResumeTargetReg := ucComplexResumeTarget
+    else {
+      val baseR = RegNext(Mux(movemPcIdxResumeFire, ePc, ucEntryPkt.pc)) init 0
+      val kR    = RegNext(Mux(movemPcIdxResumeFire, U(6, 5 bits), (ucMoveRealLenWords << 1).resize(5))) init 0
+      ucComplexResumeTargetReg := baseR + kR.resize(32)
+      GenerationFlags.simulation {
+        assert(ucMoveRealLenWords <= U(15, 5 bits), "DecodeStage: MOVE real length > 15 words", FAILURE)
+        assert((Mux(movemPcIdxResumeFire, ePc, ucEntryPkt.pc) +
+                Mux(movemPcIdxResumeFire, U(6, 5 bits), (ucMoveRealLenWords << 1).resize(5)).resize(32)) === ucComplexResumeTarget,
+          "DecodeStage: CPU_UC_EADISP_FOLD complex-resume {base,K} != target", FAILURE)
+      }
+    }
     when(pipeFlush) {
       ucComplexResumeValidReg := False
     } otherwise {
@@ -2966,6 +3033,36 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     }
     // debug-only observability (ported-tests triage: move_l_abs_memind_dst / MI_MOVE_EAEA_REV)
     ucEntryCtx.eaBase.simPublic(); ucEntryCtx.eaBaseValid.simPublic(); ucEntryCtx.eaDispLo.simPublic()
+    // CPU_UC_EADISP_FOLD: the same priority chain as `ucEntryCtx.eaDispLo` above, as
+    // {A, P, K} with eaDispLo = A + (P ? pc : 0) + K (exact mod 2^32; checked below in sim).
+    val ucEntEaA = if (ucEaDispFold) Bits(32 bits) else null
+    val ucEntEaP = if (ucEaDispFold) Bool() else null
+    val ucEntEaK = if (ucEaDispFold) UInt(3 bits) else null
+    if (ucEaDispFold) {
+      val bfMi = ucBfEaDec.klass === EaClass.MEMINDIRECT
+      ucEntEaA := ucBfEaDec.disp
+      ucEntEaP := bfMi && ucBfEaDec.pcRel
+      ucEntEaK := Mux(bfMi, Mux(ucBfEaDec.pcRel, U(4, 3 bits), U(0, 3 bits)), ucBfByteOff.resize(3))
+      when(ucIsFpMem) {
+        ucEntEaP := ucBfEaDec.pcRel
+        ucEntEaK := Mux(ucBfEaDec.pcRel, U(4, 3 bits), U(0, 3 bits))
+      }
+      when(ucIsMemInd) {
+        ucEntEaA := ucMiEa.disp
+        ucEntEaP := ucMiEa.pcRel
+        ucEntEaK := Mux(ucMiEa.pcRel,
+          (U(2, 3 bits) + Mux(ucImmDstMi && !ucIsMove, (ucImmWords << 1).resize(3), U(0, 3 bits))).resize(3),
+          U(0, 3 bits))
+      }
+      when((ucIsCas && !ucIsCas2) || ucIsMoves) {
+        ucEntEaA := ucCasEaDec.disp; ucEntEaP := False; ucEntEaK := 0
+      }
+      GenerationFlags.simulation {
+        assert((ucEntEaA.asUInt + Mux(ucEntEaP, ucEntryCtx.pc, U(0, 32 bits)) + ucEntEaK.resize(32)).asBits === ucEntryCtx.eaDispLo,
+          "DecodeStage: CPU_UC_EADISP_FOLD {A,P,K} != eaDispLo", FAILURE)
+        assert(ucBfByteOff <= U(3, ucBfByteOff.getWidth bits), "DecodeStage: bf byteOff > 3", FAILURE)
+      }
+    }
     ucEntryCtx.miOd.simPublic(); ucEntryCtx.miPost.simPublic()
     ucEntryCtx.miOtherEaBase.simPublic(); ucEntryCtx.miOtherEaBaseValid.simPublic()
     ucEntryCtx.miOtherEaDispLo.simPublic()
@@ -3894,7 +3991,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       // from the latched bfNeedHi (4-byte vs 5-byte chain), since OperationDecoder is
       // ext-word-free and emitted only the 4-byte default.
       ucActive := True
-      ucCtx    := ucEntryCtx
+      ucCtxR   := ucEntryCtx
+      if (ucEaDispFold) { ucCtxR.eaDispLo := ucEntEaA; ucEaP := ucEntEaP; ucEaK := ucEntEaK }
       // A pending slot1 microcoded op is now consumed by this entry.
       when(ucPendValid) { ucPendValid := False }
       // Entering a slot0 microcoded op: STASH its slot1 (if any) so it is not lost when `fed`
@@ -4035,12 +4133,35 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `!*PendValid` / `!*Active` / `!*Begin` terms and, for its own engine, by
     // `*EnterSlot0 = *Begin && !*PendValid`). The CE is now a single register (the flag).
     // Checked live in simulation below.
+    // CPU_DEC_PEND_SHARE: the four engines' pend flags are mutually exclusive and each is
+    // SET only while the other three are clear (asserted below), so one register loaded
+    // while ALL four are clear holds, whenever any one flag is set, exactly the packet that
+    // engine's own register would hold (shadow-checked below in simulation).
+    if (decPendShare) {
+      when(!movemPendValid && !movepPendValid && !fmovemxPendValid && !ucPendValid) {
+        sharedPendPkt := fed.payload.packets(1)
+      }
+      when(!ucPendValid) { ucPendSpecReg := fed.payload.specs(1).spec }
+      GenerationFlags.simulation {
+        val flags = Seq(movemPendValid, movepPendValid, fmovemxPendValid, ucPendValid)
+        val loads = Seq(movemPendLoad, movepPendLoad, fmovemxPendLoad, ucPendLoad)
+        for (i <- 0 until 4) {
+          val shadow = Reg(DecodePacket())
+          when(!flags(i)) { shadow := fed.payload.packets(1) }
+          assert(!flags(i) || shadow.asBits === sharedPendPkt.asBits,
+            s"DecodeStage: CPU_DEC_PEND_SHARE shared pend packet differs from pend[$i]'s own", FAILURE)
+          assert(!loads(i) || !flags.zipWithIndex.filter(_._2 != i).map(_._1).reduce(_ || _),
+            s"DecodeStage: CPU_DEC_PEND_SHARE pend[$i] set while another pend flag is set", FAILURE)
+        }
+      }
+    } else {
     when(!movemPendValid)   { movemPendPkt   := fed.payload.packets(1) }
     when(!movepPendValid)   { movepPendPkt   := fed.payload.packets(1) }
     when(!fmovemxPendValid) { fmovemxPendPkt := fed.payload.packets(1) }
     when(!ucPendValid) {
       ucPendPkt     := fed.payload.packets(1)
       ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: paired with ucPendPkt
+    }
     }
     GenerationFlags.simulation {
       def pendCapture(name: String, load: Bool, v: Bool): Unit =
@@ -4050,6 +4171,19 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       pendCapture("movepPend",   movepPendLoad,   movepPendValid)
       pendCapture("fmovemxPend", fmovemxPendLoad, fmovemxPendValid)
       pendCapture("ucPend",      ucPendLoad,      ucPendValid)
+    }
+
+    // CPU_UC_CTX_NARROW proof obligation (ucCtxNarrowCheck): the entry context the register
+    // loads always satisfies the relations `ucCtx` re-derives (structural for ANY packet).
+    if (ucCtxNarrow) GenerationFlags.simulation {
+      def sx(b: Bits, w: Int): Bits = b(w - 1 downto 0).asSInt.resize(32).asBits
+      val e = ucEntryCtx
+      assert(e.movesDelta === sx(e.movesDelta, 4) && e.fpAutoDelta === sx(e.fpAutoDelta, 5) &&
+             e.fpCtrlDelta === sx(e.fpCtrlDelta, 5) && e.packAdj === sx(e.packAdj, 16) &&
+             e.bfPcRelConst === (e.pc + U(4, 32 bits)).asBits &&
+             e.bfMiDispHi === (e.bfMiDispLo.asUInt + U(4, 32 bits)).asBits &&
+             e.nextPc === (e.pc + (e.lenWords << 1).resize(32)).resize(32),
+        "DecodeStage: CPU_UC_CTX_NARROW entry context violates a narrowed-field relation", FAILURE)
     }
 
     // ── Rename-facing output ───────────────────────────────────────────────────

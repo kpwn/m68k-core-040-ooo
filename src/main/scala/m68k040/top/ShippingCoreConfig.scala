@@ -576,6 +576,37 @@ object ShippingCoreConfig {
     * Bit-identical immediates, cycle-identical. Producer of nothing in `Global`. Echoed in
     * `SHIPPING_CONFIG`. */
   val immCone: Boolean = envFlag("CPU_IMM_CONE", true)
+  /** Decode crack tree as a one-hot BUILDER select (`CPU_UOP_CONE`, default OFF). The
+    * assembler's crack-position `when` chain steers a one-hot code over the ~40 builder
+    * uops and each position is one AND-OR over the builders that reach it
+    * (decode/UopCone.scala). Bit-identical uops, cycle-identical. Producer of nothing in
+    * `Global`. Echoed in `SHIPPING_CONFIG`. */
+  val uopCone: Boolean = envFlag("CPU_UOP_CONE", true)
+  /** Slot-1 stash keeps ONE copy of the per-instruction uop fields (`CPU_DEC_STASH_SHARE`,
+    * default OFF): pc, lenWords, brPredTag and valid are the same for all three assembled
+    * uops of an instruction (StashShareSpec), so stash positions 1/2 read them from position
+    * 0 and their own copies (kept by -keep_equivalent_registers) go unloaded. Bit-identical,
+    * cycle-identical. Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
+  val decStashShare: Boolean = envFlag("CPU_DEC_STASH_SHARE", true)
+  /** ONE slot-1 pend packet register for the MOVEM/MOVEP/FMOVEM.X/microcode engines
+    * (`CPU_DEC_PEND_SHARE`, default OFF) instead of four copies of `fed.packets(1)`: the
+    * pend flags are mutually exclusive and each is set only while the others are clear, so
+    * the shared register holds each engine's packet whenever that engine's flag is set
+    * (simulation shadow check). Cycle-identical. Producer of nothing in `Global`. Echoed in
+    * `SHIPPING_CONFIG`. */
+  val decPendShare: Boolean = envFlag("CPU_DEC_PEND_SHARE", true)
+  /** Microcode context register keeps only the significant bits of its sign-extended small
+    * fields (An deltas, PACK adj16) and re-derives pc+4 / bfMiDispLo+4 / nextPc (= pc +
+    * 2*lenWords, also for the MOVE real-length override) from the latched pc / bfMiDispLo /
+    * lenWords (`CPU_UC_CTX_NARROW`, default OFF). Bit-identical `ucCtx`,
+    * cycle-identical. Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
+  val ucCtxNarrow: Boolean = envFlag("CPU_UC_CTX_NARROW", true)
+  /** Microcode-entry pc folds after the register (`CPU_UC_EADISP_FOLD`, default OFF):
+    * context `eaDispLo` latched as {disp, +pc?, +K<=6} (replacing three entry-side
+    * pc/byteOff adders in front of a 5-way priority chain), and the complex-packet resume
+    * target latched as {base pc, +K<=22}; each gets one add after its register. Bit-identical `ucCtx`,
+    * cycle-identical. Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
+  val ucEaDispFold: Boolean = envFlag("CPU_UC_EADISP_FOLD", true)
   /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
     * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
     * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,
