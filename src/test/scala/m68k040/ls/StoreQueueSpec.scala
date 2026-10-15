@@ -908,12 +908,17 @@ class StoreQueueSpec extends AnyFunSuite {
         vaddr = 0x20000100L, cacheMode = m68k040.cache.CacheMode.COPYBACK,
         supervisor = true, precise = true)
       sleep(1)
+      // vaddrA/supervisor live in flops or (CPU_SQ_VADDR_LUTRAM) in faultInfoMem.
+      def vaddrA(i: Int): Long =
+        if (dut.vaddrLutram) (dut.faultInfoMem.getBigInt(i) & 0xFFFFFFFFL).toLong else dut.vaddrAs(i).toLong
+      def sup(i: Int): Boolean =
+        if (dut.vaddrLutram) dut.faultInfoMem.getBigInt(i).testBit(32) else dut.supervisors(i).toBoolean
       val head = dut.head.toInt
-      assert(dut.vaddrAs(head).toLong == 0x20000100L,
-        s"vaddrA mismatch: ${dut.vaddrAs(head).toLong.toHexString}")
+      assert(vaddrA(head) == 0x20000100L,
+        s"vaddrA mismatch: ${vaddrA(head).toHexString}")
       assert(dut.cacheModes(head).toEnum == m68k040.cache.CacheMode.COPYBACK,
         s"cacheMode mismatch: ${dut.cacheModes(head).toEnum}")
-      assert(dut.supervisors(head).toBoolean, "supervisor bit not stored")
+      assert(sup(head), "supervisor bit not stored")
       assert(dut.precises(head).toBoolean, "precise bit not stored")
 
       // a second, non-supervisor/fast entry -> fields must be independently tracked
@@ -923,14 +928,14 @@ class StoreQueueSpec extends AnyFunSuite {
         supervisor = false, precise = false)
       sleep(1)
       val head2 = (head + 1) & 7
-      assert(dut.vaddrAs(head2).toLong == 0x30000200L,
-        s"second entry vaddrA mismatch: ${dut.vaddrAs(head2).toLong.toHexString}")
+      assert(vaddrA(head2) == 0x30000200L,
+        s"second entry vaddrA mismatch: ${vaddrA(head2).toHexString}")
       assert(dut.cacheModes(head2).toEnum == m68k040.cache.CacheMode.WRITETHROUGH,
         s"second entry cacheMode mismatch: ${dut.cacheModes(head2).toEnum}")
-      assert(!dut.supervisors(head2).toBoolean, "second entry supervisor should be false")
+      assert(!sup(head2), "second entry supervisor should be false")
       assert(!dut.precises(head2).toBoolean, "second entry precise should be false")
       // the FIRST entry's fields must be unaffected by the second alloc.
-      assert(dut.supervisors(head).toBoolean, "first entry supervisor clobbered by second alloc")
+      assert(sup(head), "first entry supervisor clobbered by second alloc")
       assert(dut.precises(head).toBoolean, "first entry precise clobbered by second alloc")
       cd.waitSampling(2)
     }

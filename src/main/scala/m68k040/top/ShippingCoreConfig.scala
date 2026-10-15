@@ -994,4 +994,28 @@ object ShippingCoreConfig {
     * Advertised as OFF_FEATURES bit 26 (`dbg_lite`). Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val dbgLite: Boolean = envFlag("CPU_DBG_LITE", false)
+  /** `CPU_FPU_NORM_SHARE` (fable-fpuarea; zero-cycle, zero-function, default OFF = identical
+    * netlist): FpDivSqrtCore reads FpMulPipe's M0 operand registers in S_CLZ and M1's
+    * pre-normalised significands/exponents in S_NORM, deleting its private operand
+    * registers, two 64-bit LZCs and two 64-bit normalising shifters. Read as `FpuCore`'s
+    * constructor default. Echoed in `SHIPPING_CONFIG`. */
+  val fpuNormShare: Boolean    = envFlag("CPU_FPU_NORM_SHARE", true)
+  /** `CPU_FPU_ITER_SUB_SHARE`: the FDIV and FSQRT restoring steps share one subtractor whose
+    * borrow-out is the `>=` compare (zero-cycle; default OFF = identical netlist). Read as
+    * `FpuCore`'s constructor default. Echoed in `SHIPPING_CONFIG`. */
+  val fpuIterSubShare: Boolean = envFlag("CPU_FPU_ITER_SUB_SHARE", true)
+  /** `CPU_FPU_ADD_ONE_ADDER`: FpAddPipe A4's magnitude add and subtract share one carry chain
+    * (zero-cycle; default OFF = identical netlist). Read as `FpuCore`'s constructor default.
+    * Echoed in `SHIPPING_CONFIG`. */
+  val fpuAddOneAdder: Boolean  = envFlag("CPU_FPU_ADD_ONE_ADDER", true)
+  /** `CPU_FPU_NARROW_SHARE`: FpNarrowPack (FMOVE FPn,<ea> conversion) uses one variable
+    * shift-jam and one increment adder for its integer/single/double rows instead of three
+    * each; `fmt` selects the row, and every output is gated by the same row. Zero-cycle;
+    * default OFF = identical netlist. Echoed in `SHIPPING_CONFIG`. */
+  val fpuNarrowShare: Boolean  = envFlag("CPU_FPU_NARROW_SHARE", true)
+  /** `CPU_SQ_VADDR_LUTRAM`: StoreQueue's fault-report-only fields (vaddrA, supervisor:
+    * written only at alloc/tail, read only at head) live in a LUTRAM, not per-entry flops.
+    * Zero-cycle; default OFF = identical netlist. Read as StoreQueue's constructor default.
+    * Echoed in `SHIPPING_CONFIG`. */
+  val sqVaddrLutram: Boolean   = envFlag("CPU_SQ_VADDR_LUTRAM", true)
 }

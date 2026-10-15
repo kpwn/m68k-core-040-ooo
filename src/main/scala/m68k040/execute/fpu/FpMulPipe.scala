@@ -59,7 +59,7 @@ object FpMulPipe { val Latency = 10 }
   * preserve is the one MulCore's comment calls out: NO PER-STAGE CLOCK ENABLE on the
   * opA0/opA1/mulP/prd* chain -- the data shifts unconditionally and the parallel valid chain
   * qualifies it. */
-class FpMulPipe extends Component {
+class FpMulPipe(exportNorm: Boolean = false) extends Component {
   val io = new Bundle {
     val start    = in Bool ()
     val dst      = in Bits (80 bits)
@@ -68,6 +68,16 @@ class FpMulPipe extends Component {
     val precision = in Bits (2 bits)     // effective FPCR.PREC / forced FSMUL,FDMUL
     val outValid = out Bool ()
     val outReq   = out(FpRoundReq())
+    // CPU_FPU_NORM_SHARE: M0's operand registers (valid the cycle after `start`) and M1's
+    // pre-normalised significands/exponents (valid two cycles after `start`). They are
+    // unconditional RegNexts of io.dst/io.src, so FpDivSqrtCore can read them for its own
+    // S_CLZ/S_NORM instead of keeping a private copy of the same registers and shifters.
+    val nDst  = exportNorm generate out(Bits(80 bits))
+    val nSrc  = exportNorm generate out(Bits(80 bits))
+    val nDSig = exportNorm generate out(UInt(64 bits))
+    val nSSig = exportNorm generate out(UInt(64 bits))
+    val nDExp = exportNorm generate out(SInt(18 bits))
+    val nSExp = exportNorm generate out(SInt(18 bits))
   }
 
   // -- M0: unpack, classify, count leading zeros of both significands -----------
@@ -123,6 +133,12 @@ class FpMulPipe extends Component {
 
     val vld  = RegNext(m0.vld) init False
     val rReq = RegNext(req); val rA = RegNext(dSig); val rB = RegNext(sSig)
+  }
+
+  if (exportNorm) {
+    io.nDst := m0.dst; io.nSrc := m0.src
+    io.nDSig := m1.rA; io.nSSig := m1.rB
+    io.nDExp := RegNext(m1.dExp); io.nSExp := RegNext(m1.sExp)
   }
 
   // -- M2..M8: the DSP chain. MulCore.scala:53-74's idiom, unconditional shift, no CE. --

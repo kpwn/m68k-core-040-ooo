@@ -12,7 +12,13 @@ class StoreQueuePayloadResetSpec extends AnyFunSuite {
   class CheckedQueue(reserved: Boolean, bypass: Boolean)
       extends StoreQueue(8, subwordForwarding = true, reserveLateStore = reserved,
         forwardOnPublish = bypass) {
-    Seq(paddrs, paddrBs, vaddrAs, vaddrBs).foreach(_.foreach(_.simPublic()))
+    Seq(paddrs, paddrBs, vaddrBs).foreach(_.foreach(_.simPublic()))
+    if (vaddrLutram) faultInfoMem.simPublic() else vaddrAs.foreach(_.simPublic())
+    // vaddrA lives in flops or (CPU_SQ_VADDR_LUTRAM) in faultInfoMem's low 32 bits.
+    def pokeVaddrA(i: Int, v: Long): Unit =
+      if (vaddrLutram) faultInfoMem.setBigInt(i, BigInt(v)) else vaddrAs(i) #= v
+    def peekVaddrA(i: Int): Long =
+      if (vaddrLutram) (faultInfoMem.getBigInt(i) & 0xFFFFFFFFL).toLong else vaddrAs(i).toLong
     Seq(datas, maskAs, maskBs).foreach(_.foreach(_.simPublic()))
     if (reserved) dataReady.foreach(_.simPublic())
   }
@@ -76,7 +82,7 @@ class StoreQueuePayloadResetSpec extends AnyFunSuite {
           for (i <- 0 until 8 if !d.valids(i).toBoolean) {
             val p = 0xa5000000L | (resets.toLong << 16) | ((cycles & 255).toLong << 8) | i
             d.paddrs(i) #= p; d.paddrBs(i) #= (p ^ 0x11000000L)
-            d.vaddrAs(i) #= (p ^ 0x22000000L); d.vaddrBs(i) #= (p ^ 0x33000000L)
+            d.pokeVaddrA(i, p ^ 0x22000000L); d.vaddrBs(i) #= (p ^ 0x33000000L)
             d.datas(i) #= (p ^ 0x44000000L)
             d.maskAs(i) #= (0x5a5a ^ i); d.maskBs(i) #= (0xa5a5 ^ i)
           }
@@ -84,7 +90,7 @@ class StoreQueuePayloadResetSpec extends AnyFunSuite {
         def checkOwned(): Unit = {
           for (i <- 0 until 8 if d.valids(i).toBoolean) {
             val e = shadow(i).getOrElse(fail(s"SQ exposed unallocated row $i"))
-            val got = Seq(d.paddrs(i).toLong, d.paddrBs(i).toLong, d.vaddrAs(i).toLong,
+            val got = Seq(d.paddrs(i).toLong, d.paddrBs(i).toLong, d.peekVaddrA(i),
               d.vaddrBs(i).toLong, d.datas(i).toLong, d.maskAs(i).toLong, d.maskBs(i).toLong)
             val expected = Seq(e.pa, e.pb, e.va, e.vb, e.data, e.ma.toLong, e.mb.toLong)
             assert(got == expected,

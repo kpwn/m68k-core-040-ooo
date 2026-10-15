@@ -113,3 +113,26 @@ object GenFpuCoreSynthVerilog {
     println("Generated generated/M68kFpuCoreSynth.v")
   }
 }
+
+/** OOC area census of FpNarrowPack (DivEuPlugin's FMOVE FPn,<ea> converter) on its own. */
+object GenFpNarrowPackSynthVerilog {
+  def main(args: Array[String]): Unit = {
+    M68kSpinalConfig(targetDirectory = "generated")
+      .generateVerilog(new m68k040.execute.fpu.FpNarrowPack().setDefinitionName("M68kFpNarrowSynth"))
+    println("Generated generated/M68kFpNarrowSynth.v")
+  }
+}
+
+/** OOC area census of the StoreQueue on its own, with the LS EU's shipping-shaped knobs
+  * (late-store reservation + publish forwarding + subword forwarding, D4 barrier, P3 line
+  * probe, parked-retime outputs). An approximation of the in-core instance for A/B use. */
+object GenStoreQueueSynthVerilog {
+  def main(args: Array[String]): Unit = {
+    M68kSpinalConfig(targetDirectory = "generated")
+      .generateVerilog(new m68k040.ls.StoreQueue(8, subwordForwarding = true,
+        reserveLateStore = true, forwardOnPublish = true, retireWidth = 2,
+        inhibitedFullBarrier = true, p3LineProbe = true, anyInhibitedOut = true,
+        barrierP3Out = true).setDefinitionName("M68kStoreQueueSynth"))
+    println("Generated generated/M68kStoreQueueSynth.v")
+  }
+}

@@ -785,7 +785,12 @@ object GenSocketTopVerilog {
             s"walkSqCheck=${ShippingCoreConfig.walkSqCheck} " +
             s"umAtomic=${ShippingCoreConfig.umAtomic} " +
             s"umLoadOrder=${ShippingCoreConfig.umLoadOrder} " +
-            s"dbgLite=${ShippingCoreConfig.dbgLite}")
+            s"dbgLite=${ShippingCoreConfig.dbgLite} " +
+            s"fpuNormShare=${ShippingCoreConfig.fpuNormShare} " +
+            s"fpuIterSubShare=${ShippingCoreConfig.fpuIterSubShare} " +
+            s"fpuAddOneAdder=${ShippingCoreConfig.fpuAddOneAdder} " +
+            s"fpuNarrowShare=${ShippingCoreConfig.fpuNarrowShare} " +
+            s"sqVaddrLutram=${ShippingCoreConfig.sqVaddrLutram}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

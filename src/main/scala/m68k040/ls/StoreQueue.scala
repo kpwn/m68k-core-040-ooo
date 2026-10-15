@@ -119,7 +119,11 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  /** `ShippingCoreConfig.tc3Retime`: a second, independent age-qualified
                    * barrier query (`io.barrierP3`) so the LS EU can register the verdict for
                    * the op about to enter P4. False elaborates nothing. */
-                 barrierP3Out: Boolean = false) extends Component {
+                 barrierP3Out: Boolean = false,
+                 /** `CPU_SQ_VADDR_LUTRAM`: hold the fault-report-only fields (vaddrA,
+                   * supervisor; written only at `tail`, read only at `head`) in a LUTRAM
+                   * instead of per-entry flops. */
+                 val vaddrLutram: Boolean = m68k040.top.ShippingCoreConfig.sqVaddrLutram) extends Component {
   require(isPow2(depth))
   require(!coalesceLines || depth >= 4, "full-line coalescing needs a ring of at least 4")
   require(Set(2, 4, 8, 16)(retireWidth))
@@ -361,11 +365,13 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // for this entry, at head, is observed). All inert until later P2 tasks wire
   // consumers -- populated at alloc below, same indexing convention as the
   // existing per-entry Vecs. ----
-  val vaddrAs    = Vec.fill(depth)(Reg(UInt(32 bits)))
+  val vaddrAs    = if (vaddrLutram) null else Vec.fill(depth)(Reg(UInt(32 bits)))
+  // {supervisor, vaddrA}: one write port (alloc @ tail), one async read port (@ head).
+  val faultInfoMem = if (vaddrLutram) Mem(Bits(33 bits), depth) else null
   val vaddrBs    = Vec.fill(depth)(Reg(UInt(32 bits)))
   val cacheModes = Vec.fill(depth)(RegInit(CacheMode.WRITETHROUGH))
   val cacheModesB= Vec.fill(depth)(RegInit(CacheMode.WRITETHROUGH))
-  val supervisors= Vec.fill(depth)(RegInit(False))
+  val supervisors= if (vaddrLutram) null else Vec.fill(depth)(RegInit(False))
   val precises   = Vec.fill(depth)(RegInit(False))
   // ---- ORPHANED entry (Part 127, defect SS8(b) of Part 126) ----------------------
   // Set on the ONE entry a flush deliberately KEEPS via `headDrainInFlight` (see the
@@ -1234,6 +1240,9 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
       }
     }
   }
+  if (vaddrLutram) faultInfoMem.write(tail,
+    io.alloc.payload.supervisor ## io.alloc.payload.vaddr.asBits,
+    enable = io.alloc.valid && !io.flush)
   when(io.alloc.valid && !io.flush) {
     if(reserveLateStore) dataReady(tail) := !io.reserveOnly
     valids(tail)    := True
@@ -1263,11 +1272,11 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                                             io.alloc.payload.nbytesB)(15 downto 0),
                             B(0, 16 bits))
     // (strbA/lineDataA/strbB/lineDataB no longer stored -- derived at drain, task #252.)
-    vaddrAs(tail)     := io.alloc.payload.vaddr
+    if (!vaddrLutram) vaddrAs(tail) := io.alloc.payload.vaddr
     vaddrBs(tail)     := io.alloc.payload.vaddrB
     cacheModes(tail)  := io.alloc.payload.cacheMode
     cacheModesB(tail) := io.alloc.payload.cacheModeB
-    supervisors(tail) := io.alloc.payload.supervisor
+    if (!vaddrLutram) supervisors(tail) := io.alloc.payload.supervisor
     precises(tail)    := io.alloc.payload.precise
     orphans(tail)     := False   // fresh entry: never inherit a prior occupant's orphan mark
     // Drive the sim-only shadow of the deleted magnitude-comparator geometry, in the
@@ -1331,10 +1340,11 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   io.sqCompletionOrphan   := orphans(head)
   io.sqFaultCompletion.valid           := False
   io.sqFaultCompletion.payload.robId   := robIds(head)
-  io.sqFaultCompletion.payload.faultAddr  := vaddrAs(head)
+  val faultInfoHead = if (vaddrLutram) faultInfoMem.readAsync(head) else null
+  io.sqFaultCompletion.payload.faultAddr  := (if (vaddrLutram) faultInfoHead(31 downto 0).asUInt else vaddrAs(head))
   io.sqFaultCompletion.payload.write      := True
   io.sqFaultCompletion.payload.sizeBits   := sizeBitsOf(sizes(head))
-  io.sqFaultCompletion.payload.supervisor := supervisors(head)
+  io.sqFaultCompletion.payload.supervisor := (if (vaddrLutram) faultInfoHead(32) else supervisors(head))
   io.sqFaultCompletion.payload.atc        := False   // a physical bus error, never MMU/ATC
 
   val drainAckFire = io.drainAck && drainBusy
@@ -1685,9 +1695,11 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   robIds.foreach(_.simPublic())
   // P2.1: per-entry precise-path storage (vaddr/cacheMode/supervisor/precise), tapped
   // so directed alloc-then-inspect tests can verify the ring stored what was allocated.
-  vaddrAs.foreach(_.simPublic()); vaddrBs.foreach(_.simPublic())
+  if (vaddrLutram) faultInfoMem.simPublic()
+  else { vaddrAs.foreach(_.simPublic()); supervisors.foreach(_.simPublic()) }
+  vaddrBs.foreach(_.simPublic())
   cacheModes.foreach(_.simPublic()); cacheModesB.foreach(_.simPublic())
-  supervisors.foreach(_.simPublic()); precises.foreach(_.simPublic())
+  precises.foreach(_.simPublic())
   orphans.foreach(_.simPublic())   // Part 127
   // Part 127: these two are read by directed tests through a NESTED instance (the
   // LS-EU DUT), where a bare IO port is not reachable -- same reason `io.flush` above

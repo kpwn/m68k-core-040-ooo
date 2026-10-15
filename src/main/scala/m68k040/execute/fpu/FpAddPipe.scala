@@ -92,7 +92,7 @@ object FpAddPipe {
   * subnormal necessarily has `S < 2^63 <= S'`, so the significand tie-break picks the same
   * operand SoftFloat's raw compare does. Pseudo-denormals (exp 0 with the integer bit set)
   * are the one exception -- see design-spec Divergence Register D5. */
-class FpAddPipe extends Component {
+class FpAddPipe(oneAdder: Boolean = false) extends Component {
   val io = new Bundle {
     val start    = in Bool ()
     val op       = in(FpOp())
@@ -235,8 +235,18 @@ class FpAddPipe extends Component {
     val dif  = bigW - a3.rW                                  // never negative (ordered above)
     val vld  = RegNext(a3.vld) init False
     val rReq = RegNext(a3.rReq)
-    val rW   = RegNext(Mux(a3.rEffAdd, sumN, dif))
-    val rExpAdj = RegNext(Mux(a3.rEffAdd && sum(67), S(1, 18 bits), S(0, 18 bits)))
+    // CPU_FPU_ADD_ONE_ADDER: bigW + (effAdd ? W : ~W) + !effAdd -- one carry chain.
+    // For the subtract, s(66:0) is bigW - W and s(67) is the (ignored) no-borrow bit.
+    class OneAdd extends Area {
+      val opnd = Mux(a3.rEffAdd, a3.rW, ~a3.rW)
+      val s    = bigW +^ opnd + (!a3.rEffAdd).asUInt.resize(68)
+      val cy   = a3.rEffAdd && s(67)
+      val w    = Mux(cy, (s(67 downto 2) ## (s(1) | s(0))).asUInt, s(66 downto 0))
+    }
+    val one = if (oneAdder) new OneAdd else null
+    val rW   = if (oneAdder) RegNext(one.w) else RegNext(Mux(a3.rEffAdd, sumN, dif))
+    val rExpAdj = if (oneAdder) RegNext(Mux(one.cy, S(1, 18 bits), S(0, 18 bits)))
+                  else RegNext(Mux(a3.rEffAdd && sum(67), S(1, 18 bits), S(0, 18 bits)))
   }
 
   // -- A5: leading-zero count (own stage; never in series with a shifter) --------

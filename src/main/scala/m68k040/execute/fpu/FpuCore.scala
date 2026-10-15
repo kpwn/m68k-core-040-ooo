@@ -101,7 +101,9 @@ object FpuCore {
   * NO BACKPRESSURE ON THE FIXED SIDE. `doneFixed` is an unconditional 1-cycle pulse
   * FixedLatency after an accepted `start`, identical to MulCore. The EU MUST reserve result
   * capacity before asserting `start` (2026-08-09 spec §3). */
-class FpuCore extends Component {
+class FpuCore(normShare: Boolean = m68k040.top.ShippingCoreConfig.fpuNormShare,
+              iterSubShare: Boolean = m68k040.top.ShippingCoreConfig.fpuIterSubShare,
+              addOneAdder: Boolean = m68k040.top.ShippingCoreConfig.fpuAddOneAdder) extends Component {
   val io = new Bundle {
     // -- request --
     val start   = in Bool ()
@@ -141,10 +143,10 @@ class FpuCore extends Component {
   val isMul   = io.op === FpOp.FMUL
   val isCheap = !isIter && !isAdd && !isMul
 
-  val addPipe   = new FpAddPipe
-  val mulPipe   = new FpMulPipe
+  val addPipe   = new FpAddPipe(oneAdder = addOneAdder)
+  val mulPipe   = new FpMulPipe(exportNorm = normShare)
   val cheapPipe = new FpCheapPipe
-  val iterCore  = new FpDivSqrtCore
+  val iterCore  = new FpDivSqrtCore(sharedNorm = normShare, sharedSub = iterSubShare)
   val roundPack = new FpRoundPack
 
   addPipe.io.start := io.start && isAdd
@@ -174,6 +176,11 @@ class FpuCore extends Component {
   iterCore.io.rmode  := io.rmode
   iterCore.io.precision := io.precision
   iterCore.io.ack    := io.iterAck
+  if (normShare) {
+    iterCore.io.nDst  := mulPipe.io.nDst;  iterCore.io.nSrc  := mulPipe.io.nSrc
+    iterCore.io.nDSig := mulPipe.io.nDSig; iterCore.io.nSSig := mulPipe.io.nSSig
+    iterCore.io.nDExp := mulPipe.io.nDExp; iterCore.io.nSExp := mulPipe.io.nSExp
+  }
 
   // Mutually exclusive by construction (one `start` port, three equal-depth fronts).
   GenerationFlags.simulation {
