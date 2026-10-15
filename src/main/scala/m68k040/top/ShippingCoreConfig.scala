@@ -1008,4 +1008,9 @@ object ShippingCoreConfig {
     * (zero-cycle; default OFF = identical netlist). Read as `FpuCore`'s constructor default.
     * Echoed in `SHIPPING_CONFIG`. */
   val fpuAddOneAdder: Boolean  = envFlag("CPU_FPU_ADD_ONE_ADDER", false)
+  /** `CPU_FPU_NARROW_SHARE`: FpNarrowPack (FMOVE FPn,<ea> conversion) uses one variable
+    * shift-jam and one increment adder for its integer/single/double rows instead of three
+    * each; `fmt` selects the row, and every output is gated by the same row. Zero-cycle;
+    * default OFF = identical netlist. Echoed in `SHIPPING_CONFIG`. */
+  val fpuNarrowShare: Boolean  = envFlag("CPU_FPU_NARROW_SHARE", false)
 }

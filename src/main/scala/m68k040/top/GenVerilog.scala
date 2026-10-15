@@ -113,3 +113,12 @@ object GenFpuCoreSynthVerilog {
     println("Generated generated/M68kFpuCoreSynth.v")
   }
 }
+
+/** OOC area census of FpNarrowPack (DivEuPlugin's FMOVE FPn,<ea> converter) on its own. */
+object GenFpNarrowPackSynthVerilog {
+  def main(args: Array[String]): Unit = {
+    M68kSpinalConfig(targetDirectory = "generated")
+      .generateVerilog(new m68k040.execute.fpu.FpNarrowPack().setDefinitionName("M68kFpNarrowSynth"))
+    println("Generated generated/M68kFpNarrowSynth.v")
+  }
+}

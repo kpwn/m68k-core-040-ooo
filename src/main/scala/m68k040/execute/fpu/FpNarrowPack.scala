@@ -84,7 +84,7 @@ object FpNarrowPack {
   val Latency = 1
 }
 
-class FpNarrowPack extends Component {
+class FpNarrowPack(share: Boolean = m68k040.top.ShippingCoreConfig.fpuNarrowShare) extends Component {
   val io = new Bundle {
     /** The 80-bit source register (FPn). */
     val src   = in Bits (80 bits)
@@ -145,9 +145,21 @@ class FpNarrowPack extends Component {
     val intScRaw = S(0x4037, 17 bits) - aExp.resize(17).asSInt
     val intSc    = Mux(intScRaw <= S(0, 17 bits), U(1, 7 bits),
                    Mux(intScRaw >= S(64, 17 bits), U(64, 7 bits), intScRaw.asUInt.resize(7)))
-    val intSigSh = jam(aSig, intSc)
+    // CPU_FPU_NARROW_SHARE: ONE variable shift-jam and ONE increment adder serve the
+    // integer, single and double rows. Exactly one row is selected by `fmt`, and every
+    // output (word and each exception flag) is gated by that same row, so the other rows'
+    // values are never observed.
+    val shared = share generate new Area {
+      val fIsSgl = io.fmt === B"3'b001"
+      val fIsDbl = io.fmt === B"3'b101"
+      val intIncr = incrFor(intSign, 0x40, 0x7F, 8)
+      val sh = UInt(64 bits)
+      val sum = UInt(65 bits)
+    }
+    val intSigSh = if (share) shared.sh else jam(aSig, intSc)
     val intRb    = intSigSh(6 downto 0)
-    val intShr   = ((intSigSh +^ incrFor(intSign, 0x40, 0x7F, 8).resize(64)) >> 7).resize(58)
+    val intShr   = if (share) (shared.sum >> 7).resize(58)
+                   else ((intSigSh +^ incrFor(intSign, 0x40, 0x7F, 8).resize(64)) >> 7).resize(58)
     val intTie   = (intRb === U(0x40, 7 bits)) && rn      // round-half-to-EVEN LSB clear
     val intAbs   = Mux(intTie, intShr & ~U(1, 58 bits), intShr)
 
@@ -181,14 +193,16 @@ class FpNarrowPack extends Component {
     // value is `(0x3F81 - aExp) mod 128 = (1 - aExp[6:0]) mod 128` -- independent of every
     // high bit. The two now evaluate in parallel from `aExp` and meet at one mux.
     val f32Cnt  = Mux(aExp <= U(0x3F81 - 64, 15 bits), U(64, 7 bits), cntLow7)
-    val f32Sig  = Mux(f32Sub, jam(f32Sig0.resize(64), f32Cnt)(31 downto 0), f32Sig0)
+    val f32Sig  = if (share) shared.sh(31 downto 0)
+                  else Mux(f32Sub, jam(f32Sig0.resize(64), f32Cnt)(31 downto 0), f32Sig0)
     val f32ExpS = Mux(f32Sub, S(0, 18 bits), f32Exp0)
     val f32Rb   = f32Sig(6 downto 0)
     // `float_detect_tininess` is after-rounding for this SoftFloat build
     // (softfloat-specialize:43, the same constant FpRoundPack already relies on), so the
     // first of SoftFloat's three isTiny terms is constant-false.
     val f32Tiny = (f32Exp0 < S(-1, 18 bits)) || !f32PreSum(31)
-    val f32Shr  = ((f32Sig +^ f32Incr.resize(32)) >> 7).resize(26)
+    val f32Shr  = if (share) (shared.sum >> 7).resize(26)
+                  else ((f32Sig +^ f32Incr.resize(32)) >> 7).resize(26)
     val f32Tie  = (f32Rb === U(0x40, 7 bits)) && rn
     val f32SigR = Mux(f32Tie, f32Shr & ~U(1, 26 bits), f32Shr)
 
@@ -228,11 +242,12 @@ class FpNarrowPack extends Component {
     // Replaces an 18-bit negate feeding an 18-bit compare -- two serial carry chains --
     // with a 15-bit compare and a 7-bit subtract that run side by side.
     val f64Cnt  = Mux(aExp <= U(0x3C01 - 64, 15 bits), U(64, 7 bits), cntLow7)
-    val f64Sig  = Mux(f64Sub, jam(f64Sig0, f64Cnt), f64Sig0)
+    val f64Sig  = if (share) shared.sh else Mux(f64Sub, jam(f64Sig0, f64Cnt), f64Sig0)
     val f64ExpS = Mux(f64Sub, S(0, 18 bits), f64Exp0)
     val f64Rb   = f64Sig(9 downto 0)
     val f64Tiny = (f64Exp0 < S(-1, 18 bits)) || !f64PreSum(63)
-    val f64Shr  = ((f64Sig +^ f64Incr.resize(64)) >> 10).resize(55)
+    val f64Shr  = if (share) (shared.sum >> 10).resize(55)
+                  else ((f64Sig +^ f64Incr.resize(64)) >> 10).resize(55)
     val f64Tie  = (f64Rb === U(0x200, 10 bits)) && rn
     val f64SigR = Mux(f64Tie, f64Shr & ~U(1, 55 bits), f64Shr)
 
@@ -240,6 +255,17 @@ class FpNarrowPack extends Component {
     // ea+0 = the sign+exponent word, ea+2 = a written ZERO (the reserved word the load
     // direction skips), ea+4 = mantissa[63:32], ea+8 = mantissa[31:0]. Chunk 0 is one LONG
     // store of {sign+exp, 0x0000}, byte-for-byte the pair of 16-bit writes Musashi does.
+    if (share) {
+      // Single: f32Sig0 has zeros above bit 31 and a right shift keeps them zero, so the
+      // 65-bit sum's bits [32:7] are the 33-bit single sum's. A count of 0 is identity.
+      import shared._
+      val shIn  = Mux(fIsSgl, f32Sig0.resize(64), Mux(fIsDbl, f64Sig0, aSig))
+      val shCnt = Mux(fIsSgl, Mux(f32Sub, f32Cnt, U(0, 7 bits)),
+                  Mux(fIsDbl, Mux(f64Sub, f64Cnt, U(0, 7 bits)), intSc))
+      sh  := jam(shIn, shCnt)
+      sum := sh +^ Mux(fIsSgl, f32Incr.resize(64),
+                   Mux(fIsDbl, f64Incr.resize(64), intIncr.resize(64)))
+    }
     val extWord = io.chunk.mux(
       U(0, 2 bits) -> (io.src(79 downto 64) ## B(0, 16 bits)),
       U(1, 2 bits) -> io.src(63 downto 32),
