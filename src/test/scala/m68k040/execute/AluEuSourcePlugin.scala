@@ -37,15 +37,15 @@ class AluEuSourcePlugin extends FiberPlugin {
     val iPsrcA    = in UInt (6 bits); val iPsrcAValid = in Bool ()
     val iPsrcB    = in UInt (6 bits); val iPsrcBValid = in Bool ()
     val iPdst     = in UInt (6 bits); val iPdstValid  = in Bool ()
-    val iWritesNz = in Bool ();       val iPNzvcDst   = in UInt (4 bits)
-    val iWritesX  = in Bool ();       val iPXDst      = in UInt (4 bits)
+    val iWritesNz = in Bool ();       val iPNzvcDst   = in UInt (m68k040.Global.PHYS_NZVC_ID_W bits)
+    val iWritesX  = in Bool ();       val iPXDst      = in UInt (m68k040.Global.PHYS_X_ID_W bits)
     val iRobId    = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     val iReady    = out Bool ()
     // shift / CCR-RMW / flag-source controls (slow path)
     val iShiftOp  = in Bits (2 bits); val iShiftDir = in Bool ()
     val iToCcr    = in Bool ()
-    val iReadsNz  = in Bool ();        val iPNzvcSrc  = in UInt (4 bits)
-    val iReadsX   = in Bool ();        val iPXSrc     = in UInt (4 bits)
+    val iReadsNz  = in Bool ();        val iPNzvcSrc  = in UInt (m68k040.Global.PHYS_NZVC_ID_W bits)
+    val iReadsX   = in Bool ();        val iPXSrc     = in UInt (m68k040.Global.PHYS_X_ID_W bits)
 
     val ctx = IqContext()
     val uop = ctx.uop
@@ -118,9 +118,9 @@ class AluEuSourcePlugin extends FiberPlugin {
     // PRF observation reads
     val obsIntAddr  = in UInt (6 bits); obsInt.addr := obsIntAddr
     val obsIntData  = out Bits (32 bits); obsIntData := obsInt.data
-    val obsNzvcAddr = in UInt (4 bits); obsNzvc.addr := obsNzvcAddr
+    val obsNzvcAddr = in UInt (m68k040.Global.PHYS_NZVC_ID_W bits); obsNzvc.addr := obsNzvcAddr
     val obsNzvcData = out Bits (4 bits); obsNzvcData := obsNzvc.data
-    val obsXAddr    = in UInt (4 bits); obsX.addr := obsXAddr
+    val obsXAddr    = in UInt (m68k040.Global.PHYS_X_ID_W bits); obsX.addr := obsXAddr
     val obsXData    = out Bits (1 bits); obsXData := obsX.data
   }
 }
