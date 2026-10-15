@@ -994,4 +994,10 @@ object ShippingCoreConfig {
     * Advertised as OFF_FEATURES bit 26 (`dbg_lite`). Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val dbgLite: Boolean = envFlag("CPU_DBG_LITE", false)
+  /** `CPU_FPU_NORM_SHARE` (fable-fpuarea; zero-cycle, zero-function, default OFF = identical
+    * netlist): FpDivSqrtCore reads FpMulPipe's M0 operand registers in S_CLZ and M1's
+    * pre-normalised significands/exponents in S_NORM, deleting its private operand
+    * registers, two 64-bit LZCs and two 64-bit normalising shifters. Read as `FpuCore`'s
+    * constructor default. Echoed in `SHIPPING_CONFIG`. */
+  val fpuNormShare: Boolean    = envFlag("CPU_FPU_NORM_SHARE", false)
 }

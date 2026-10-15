@@ -99,7 +99,7 @@ object FpDivSqrtCore {
   * that "a non-backpressured completion Flow is not permission to drop either result": if the
   * EU's arbiter grants the fixed lane this cycle, the iterative result is still there next
   * cycle. */
-class FpDivSqrtCore extends Component {
+class FpDivSqrtCore(sharedNorm: Boolean = false) extends Component {
   val io = new Bundle {
     val start  = in Bool ()
     val isSqrt = in Bool ()
@@ -111,6 +111,14 @@ class FpDivSqrtCore extends Component {
     val done   = out Bool ()
     val ack    = in Bool ()
     val res    = out(FpResult())
+    // CPU_FPU_NORM_SHARE: FpMulPipe's M0 operand registers (read in S_CLZ) and M1
+    // pre-normalised significands/exponents (read in S_NORM). See FpMulPipe.exportNorm.
+    val nDst  = sharedNorm generate in(Bits(80 bits))
+    val nSrc  = sharedNorm generate in(Bits(80 bits))
+    val nDSig = sharedNorm generate in(UInt(64 bits))
+    val nSSig = sharedNorm generate in(UInt(64 bits))
+    val nDExp = sharedNorm generate in(SInt(18 bits))
+    val nSExp = sharedNorm generate in(SInt(18 bits))
   }
 
   val S_IDLE = 0; val S_CLZ = 1; val S_NORM = 2; val S_SETUP = 3
@@ -118,12 +126,17 @@ class FpDivSqrtCore extends Component {
   val state = RegInit(U(S_IDLE, 3 bits))
 
   val sqrtR  = RegInit(False)
-  val dstR   = Reg(Bits(80 bits)) init 0; val srcR = Reg(Bits(80 bits)) init 0
+  // S_CLZ always follows the accepting IDLE cycle by exactly one cycle, so FpMulPipe's
+  // unconditional M0 RegNext(io.dst/io.src) holds the accepted operands in S_CLZ.
+  val dstR: Bits = if (sharedNorm) io.nDst else Reg(Bits(80 bits)) init 0
+  val srcR: Bits = if (sharedNorm) io.nSrc else Reg(Bits(80 bits)) init 0
   val aSig   = Reg(UInt(64 bits)) init 0; val bSig = Reg(UInt(64 bits)) init 0
   val aExp   = Reg(SInt(18 bits)) init 0; val bExp = Reg(SInt(18 bits)) init 0
   val zSign  = RegInit(False);            val zExp = Reg(SInt(18 bits)) init 0
-  val aClz   = Reg(UInt(7 bits)) init 0;  val bClz = Reg(UInt(7 bits)) init 0
-  val aSubR  = RegInit(False);            val bSubR = RegInit(False)
+  val aClz   = (!sharedNorm) generate (Reg(UInt(7 bits)) init 0)
+  val bClz   = (!sharedNorm) generate (Reg(UInt(7 bits)) init 0)
+  val aSubR  = (!sharedNorm) generate RegInit(False)
+  val bSubR  = (!sharedNorm) generate RegInit(False)
   val rmodeR = Reg(Bits(2 bits)) init 0   // FPCR[5:4] latched at accept
   val precR  = Reg(Bits(2 bits)) init 0   // effective rounding precision, latched at accept
 
@@ -151,7 +164,9 @@ class FpDivSqrtCore extends Component {
   switch(state) {
     is(U(S_IDLE, 3 bits)) {
       when(io.start) {
-        sqrtR := io.isSqrt; dstR := io.dst; srcR := io.src; rmodeR := io.rmode
+        sqrtR := io.isSqrt
+        if (!sharedNorm) { dstR := io.dst; srcR := io.src }
+        rmodeR := io.rmode
         precR := io.precision
         state := U(S_CLZ, 3 bits)
       }
@@ -196,19 +211,28 @@ class FpDivSqrtCore extends Component {
       }
 
       bypReq := r; bypass := takeBypass; zSign := sgn
-      aSig := Fp80.sig(a); bSig := Fp80.sig(b)
-      aExp := Fp80.exp(a).resize(18).asSInt; bExp := Fp80.exp(b).resize(18).asSInt
-      aSubR := Fp80.exp(a) === 0; bSubR := Fp80.exp(b) === 0
-      aClz := Fp80.clz(a(63 downto 0)).resize(7)
-      bClz := Fp80.clz(b(63 downto 0)).resize(7)
+      if (!sharedNorm) {
+        aSig := Fp80.sig(a); bSig := Fp80.sig(b)
+        aExp := Fp80.exp(a).resize(18).asSInt; bExp := Fp80.exp(b).resize(18).asSInt
+        aSubR := Fp80.exp(a) === 0; bSubR := Fp80.exp(b) === 0
+        aClz := Fp80.clz(a(63 downto 0)).resize(7)
+        bClz := Fp80.clz(b(63 downto 0)).resize(7)
+      }
       state := Mux(takeBypass, U(S_ROUND, 3 bits), U(S_NORM, 3 bits))
     }
 
     // -- S_NORM: pre-normalise subnormal operands (normalizeFloatx80Subnormal) --
     is(U(S_NORM, 3 bits)) {
-      when(aSubR) { aSig := aSig |<< aClz; aExp := S(1, 18 bits) - aClz.resize(18).asSInt }
-      when(bSubR && !sqrtR) {
-        bSig := bSig |<< bClz; bExp := S(1, 18 bits) - bClz.resize(18).asSInt
+      if (sharedNorm) {
+        // Same normalizeFloatx80Subnormal, computed by FpMulPipe's M1 on the same operands.
+        // FSQRT's operand is `src`; bSig/bExp are not read by FSQRT.
+        aSig := Mux(sqrtR, io.nSSig, io.nDSig); aExp := Mux(sqrtR, io.nSExp, io.nDExp)
+        bSig := io.nSSig;                        bExp := io.nSExp
+      } else {
+        when(aSubR) { aSig := aSig |<< aClz; aExp := S(1, 18 bits) - aClz.resize(18).asSInt }
+        when(bSubR && !sqrtR) {
+          bSig := bSig |<< bClz; bExp := S(1, 18 bits) - bClz.resize(18).asSInt
+        }
       }
       state := U(S_SETUP, 3 bits)
     }
