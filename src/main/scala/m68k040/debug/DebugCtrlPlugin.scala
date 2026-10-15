@@ -309,6 +309,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // at -2.064 ns, with 2.312 ns on the first address net alone. Capture this
       // full-address match alongside awAddr, without moving the write edge.
       val awIsArchApply = RegInit(False); awIsArchApply.simPublic()
+      // `CPU_DBG_APPLY_NOSNAP`: the AW address is an architectural shadow data word
+      // (OFF_ARCH_D0..DFC except APPLY/STATUS) or OFF_DBG_RESET_CTL (whose cfg wipe clears
+      // the shadows). Such a write is HELD while an apply is busy, so the apply can read
+      // the shadows in place instead of a 1024-flop start-of-apply snapshot.
+      val applyNoSnap = stage >= 3 && !lite && m68k040.top.ShippingCoreConfig.dbgApplyNoSnap
+      val awIsArchHold: Bool = if (applyNoSnap) RegInit(False) else False
+      val archHoldNow: Bool = if (applyNoSnap) Bool() else False
+      if (applyNoSnap) archHoldNow := False   // driven by the apply FSM below
 
       /** FMAX companion to `awIsHaltAfter`: `wStrb.orR` precomputed on the edge that
         * captures `wStrb`. Together the two turn `haltAfterInvalidate` into a single
@@ -1178,6 +1186,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         awIsHaltAfter := (dbgAxi.awaddr === DebugRegMap.OFF_HALT_AFTER_LO) ||
                          (dbgAxi.awaddr === DebugRegMap.OFF_HALT_AFTER_HI)
         awIsArchApply := dbgAxi.awaddr === DebugRegMap.OFF_ARCH_APPLY
+        if (applyNoSnap) awIsArchHold :=
+          ((dbgAxi.awaddr >= DebugRegMap.OFF_ARCH_D0) && (dbgAxi.awaddr <= DebugRegMap.OFF_ARCH_DFC) &&
+           (dbgAxi.awaddr =/= DebugRegMap.OFF_ARCH_APPLY) && (dbgAxi.awaddr =/= DebugRegMap.OFF_ARCH_STATUS)) ||
+          (dbgAxi.awaddr === DebugRegMap.OFF_DBG_RESET_CTL)
       }
       when(dbgAxi.wvalid  && dbgAxi.wready)  {
         wPend := True; wData := dbgAxi.wdata; wStrb := dbgAxi.wstrb
@@ -1185,7 +1197,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         wStrbAny := dbgAxi.wstrb.orR
       }
       /** High for exactly one cycle, the cycle in which the captured write is applied. */
-      val doWrite = awPend && wPend && !bPend
+      val doWrite = awPend && wPend && !bPend && !archHoldNow
       doWrite.simPublic()
       when(doWrite)                 { awPend := False; wPend := False; bPend := True }
       when(bPend && dbgAxi.bready)  { bPend := False }
@@ -1475,11 +1487,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val archApplySettle = RegInit(False)   // CPU_BE_RETIME only (constant False otherwise)
       val archApplyDirty = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
       val archApplyRewrite = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
-      val archApplyShadow = if (stage >= 3 && !lite) Vec.fill(32)(Reg(Bits(32 bits)) init 0) else null
+      val archApplyShadow = if (stage >= 3 && !lite && !applyNoSnap) Vec.fill(32)(Reg(Bits(32 bits)) init 0) else null
+      if (applyNoSnap) archHoldNow := awIsArchHold && archApplyBusy
       /** The value an apply writes: the start-of-apply snapshot (full), or the shadow
         * itself (lite; frozen for the apply's duration by `writeArch`). */
-      def applySrc(index: Int): Bits = if (lite) archShadow(index) else archApplyShadow(index)
-      def applySrc(index: UInt): Bits = if (lite) archShadow(index) else archApplyShadow(index)
+      def applySrc(index: Int): Bits = if (lite || applyNoSnap) archShadow(index) else archApplyShadow(index)
+      def applySrc(index: UInt): Bits = if (lite || applyNoSnap) archShadow(index) else archApplyShadow(index)
       val archApplyComplete = if (stage >= 3) Bool() else False
       if (stage >= 3) {
         archApplyBusy.simPublic(); archApplyDone.simPublic(); archApplyRejected.simPublic()
@@ -1670,7 +1683,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             if (m68k040.top.ShippingCoreConfig.beRetime) archApplySettle := False
             archApplyDirty := archDirty
             archApplyRewrite := 0
-            if (!lite) for (i <- 0 until 32) archApplyShadow(i) := archShadow(i)
+            if (!lite && !applyNoSnap) for (i <- 0 until 32) archApplyShadow(i) := archShadow(i)
           }
         }.elsewhen(archApplyBusy) {
           when(!effectiveHalt) {

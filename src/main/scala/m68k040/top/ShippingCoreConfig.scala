@@ -1025,4 +1025,15 @@ object ShippingCoreConfig {
     * cycle; read only under `stS3WriteD1`). L2 TLB filter: a granule register loads while
     * its entry is free. All exact. Default OFF; echoed in `SHIPPING_CONFIG`. */
   val dcFreeCapture: Boolean = envFlag("CPU_DC_FREE_CAPTURE", false)
+  /** Area/fanout (fable `fanout`): the full DebugCtrl's architectural apply reads the
+    * `archShadow` words IN PLACE instead of a 1024-flop start-of-apply copy
+    * (`archApplyShadow`, whose 1024-load clock enable and POR resets go with it). To keep
+    * the full build's semantics -- a host may queue the next transaction while an apply runs
+    * -- an AXI write to a shadow data word (or to OFF_DBG_RESET_CTL, whose cfg wipe clears
+    * the shadows) is HELD (B response delayed) until the apply completes, instead of landing
+    * mid-apply. Final shadow/dirty state, apply results and every other register are
+    * identical; only that write's response latency moves. Writes to OFF_ARCH_APPLY/STATUS
+    * are not held (a busy re-apply is still rejected). Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val dbgApplyNoSnap: Boolean = envFlag("CPU_DBG_APPLY_NOSNAP", false)
 }
