@@ -576,6 +576,12 @@ object ShippingCoreConfig {
     * Bit-identical immediates, cycle-identical. Producer of nothing in `Global`. Echoed in
     * `SHIPPING_CONFIG`. */
   val immCone: Boolean = envFlag("CPU_IMM_CONE", false)
+  /** Decode crack tree as a one-hot BUILDER select (`CPU_UOP_CONE`, default OFF). The
+    * assembler's crack-position `when` chain steers a one-hot code over the ~40 builder
+    * uops and each position is one AND-OR over the builders that reach it
+    * (decode/UopCone.scala). Bit-identical uops, cycle-identical. Producer of nothing in
+    * `Global`. Echoed in `SHIPPING_CONFIG`. */
+  val uopCone: Boolean = envFlag("CPU_UOP_CONE", false)
   /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
     * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
     * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,

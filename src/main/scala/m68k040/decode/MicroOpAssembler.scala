@@ -933,16 +933,18 @@ object MicroOpAssembler {
       o
     })
   def assemble(pkt: DecodePacket, offIn: Offload,
-               fuseLongMoveLoads: Boolean = false, retime: Boolean = false): AssembledUops =
-    assembleImpl(pkt, Some(offIn), fuseLongMoveLoads, retime)
+               fuseLongMoveLoads: Boolean = false, retime: Boolean = false,
+               uopCone: Boolean = false): AssembledUops =
+    assembleImpl(pkt, Some(offIn), fuseLongMoveLoads, retime, uopCone = uopCone)
 
   /** CPU_IMM_CONE form of `assemble`: every `uops(i).imm` is a one-hot ImmAtoms code
     * (width ImmAtoms.WIDTH) and the second result is the per-packet atom registry; rebuild
     * the 32-bit value with its `expand` (or `parts`). See decode/ImmCone.scala. */
   def assembleAtoms(pkt: DecodePacket, offIn: Offload,
-                    fuseLongMoveLoads: Boolean, retime: Boolean): (AssembledUops, ImmAtoms) = {
+                    fuseLongMoveLoads: Boolean, retime: Boolean,
+                    uopCone: Boolean = false): (AssembledUops, ImmAtoms) = {
     val ia = new ImmAtoms(true)
-    (assembleImpl(pkt, Some(offIn), fuseLongMoveLoads, retime, ia), ia)
+    (assembleImpl(pkt, Some(offIn), fuseLongMoveLoads, retime, ia, uopCone), ia)
   }
 
   /** The GROUP-bank write data (`wideImm.grpData` in DecodeStage) for a fed pair. Used by
@@ -970,8 +972,11 @@ object MicroOpAssembler {
   private def assembleImpl(pkt: DecodePacket, offIn: Option[Offload],
                            fuseLongMoveLoads: Boolean = false,
                            retime: Boolean = false,
-                           ia: ImmAtoms = new ImmAtoms(false)): AssembledUops = {
+                           ia: ImmAtoms = new ImmAtoms(false),
+                           uopCone: Boolean = false): AssembledUops = {
     def I(key: String)(v: => Bits): Bits = ia(key)(v)
+    import UopCone.{mx, one}
+    val uc = new UopCone(uopCone, ia.width)
     ia.pc = pkt.pc
     val out = AssembledUops(retime, ia.width)
     out.fpImmAlloc := False            // overridden ONLY by the `F<op>.<fmt> #imm,FPn` arm below
@@ -4301,7 +4306,8 @@ object MicroOpAssembler {
     coldFinalUop.sysOp.allowOverride; coldFinalUop.sysOp := True
     coldFinalUop.sysKind.allowOverride; coldFinalUop.sysKind := SysKind.FMOVEM_DATA
 
-    out.uops(2) := opUop
+    if (uc.enabled) for (k <- 0 until 3) out.uops(k) := uc.res(k)
+    uc.set(out.uops, 2, opUop)
     // CPU_FE_RETIME: the crack tree assigns `cnt`. With `retime`, `cnt` is a PRE-FUSE count
     // (`countPre`) and `out.count` is `countPre` overridden ONLY by the fused-MOVE.L arm
     // below, so `out.count3` (`countPre === 3`) does not depend on that arm's deep
@@ -4313,147 +4319,147 @@ object MicroOpAssembler {
     val cnt = if (retime) countPre else out.count
     when(isDynamicFmovem(pkt)) {
       cnt := 3
-      out.uops(0) := coldMaskUop
-      out.uops(1) := coldAddrUop
-      out.uops(2) := coldFinalUop
+      uc.set(out.uops, 0, coldMaskUop)
+      uc.set(out.uops, 1, coldAddrUop)
+      uc.set(out.uops, 2, coldFinalUop)
     } elsewhen(spec.microcoded) {
       // The DecodeStage µcode SEQUENCER owns emission (like MOVEM): emit a benign single
       // placeholder µop here so the assembler's `bad`/crack never fires. The sequencer
       // gates this off (it does not push the placeholder). opUop is already non-`bad`
       // (spec.illegal False + no USED src/dst EA), so unimplemented stays False.
       cnt   := 1
-      out.uops(0) := opUop
-      out.uops(1) := opUop
+      uc.set(out.uops, 0, opUop)
+      uc.set(out.uops, 1, opUop)
     } elsewhen(pkt.fault) {
       // Fetch fault dominates: a single faulted (vector-2) delivery µop.
       cnt   := 1
-      out.uops(0) := opUop
-      out.uops(1) := opUop
+      uc.set(out.uops, 0, opUop)
+      uc.set(out.uops, 1, opUop)
     } elsewhen(fpCtrlImmEmit) {
       // `FMOVE.L #imm,FPCR/FPSR/FPIAR` cracks into TWO uops -- see fpCtrlIsImm above for
       // why one cannot work (imm carries the register mask, so it cannot also carry the
       // 32-bit datum). uop0 stages the immediate into T0; uop1 is the ordinary
       // register-direct control write sourcing srcB from T0.
       cnt   := 2
-      out.uops(0) := fpCtrlImmUop
-      out.uops(1) := opUop
+      uc.set(out.uops, 0, fpCtrlImmUop)
+      uc.set(out.uops, 1, opUop)
     } elsewhen(bad) {
       cnt   := 1
-      out.uops(0) := opUop
-      out.uops(1) := opUop
+      uc.set(out.uops, 0, opUop)
+      uc.set(out.uops, 1, opUop)
     } elsewhen(isBfMemSpec) {
       // Bit-field MEMORY load-only -> [load.L [byteAddr] -> T0] (opt [load.B [byteAddr+4]
       // -> T1]) [BITFIELD bfMem compute]. needHi (bitOff+width>32) selects the 3-µop span;
       // otherwise 2 µops. Bad EA (non-control) -> illegal (bfmBad forced opUop above).
       when(bfmBad) {
         cnt   := 1
-        out.uops(0) := opUop
-        out.uops(1) := opUop
+        uc.set(out.uops, 0, opUop)
+        uc.set(out.uops, 1, opUop)
       } elsewhen(bfmNeedHi) {
         cnt   := 3
-        out.uops(0) := bfmLoadLo
-        out.uops(1) := bfmLoadHi
-        out.uops(2) := bfmCompute
+        uc.set(out.uops, 0, bfmLoadLo)
+        uc.set(out.uops, 1, bfmLoadHi)
+        uc.set(out.uops, 2, bfmCompute)
       } otherwise {
         cnt   := 2
-        out.uops(0) := bfmLoadLo
-        out.uops(1) := bfmCompute
+        uc.set(out.uops, 0, bfmLoadLo)
+        uc.set(out.uops, 1, bfmCompute)
       }
     } elsewhen(isCmp2Chk2Op) {
       // CMP2/CHK2 -> [load.size [EA] -> T0] [load.size [EA+size] -> T1] [compare].
       // Bad EA (non-control) forced illegal above (c2Bad sets opUop faulted vec4).
       when(c2Bad) {
         cnt   := 1
-        out.uops(0) := opUop
-        out.uops(1) := opUop
+        uc.set(out.uops, 0, opUop)
+        uc.set(out.uops, 1, opUop)
       } otherwise {
         cnt   := 3
-        out.uops(0) := c2Load0
-        out.uops(1) := c2Load1
-        out.uops(2) := c2Cmp
+        uc.set(out.uops, 0, c2Load0)
+        uc.set(out.uops, 1, c2Load1)
+        uc.set(out.uops, 2, c2Cmp)
       }
     } elsewhen(isLeaOp) {
       // LEA -> single address-generate µop (addr -> An). Bad EA forced illegal above.
       cnt   := 1
-      out.uops(0) := Mux(leaBad, opUop, leaUop)
-      out.uops(1) := Mux(leaBad, opUop, leaUop)
+      uc.set(out.uops, 0, mx(leaBad, opUop, leaUop))
+      uc.set(out.uops, 1, mx(leaBad, opUop, leaUop))
     } elsewhen(isPeaOp) {
       // PEA -> [addr -> T0] + [stkPush store T0 -> -(A7)]. Bad EA -> illegal.
       cnt   := Mux(peaBad, U(1, 2 bits), U(2, 2 bits))
-      out.uops(0) := Mux(peaBad, opUop, peaAddr)
-      out.uops(1) := Mux(peaBad, opUop, peaPush)
+      uc.set(out.uops, 0, mx(peaBad, opUop, peaAddr))
+      uc.set(out.uops, 1, mx(peaBad, opUop, peaPush))
     } elsewhen(isMoveFromSrOp || isMoveFromCcrOp) {
       // MOVE from SR/CCR -> reg dest: single ALU op. mem dest: [op -> T1] + [store.w T1].
       // Bad EA (An/#imm/pcRel/complex) forced illegal above.
       val mfBad = moveFromSrBad || moveFromCcrBad
       cnt   := Mux(mfBad, U(1, 2 bits), Mux(mfDstIsMem, U(2, 2 bits), U(1, 2 bits)))
-      out.uops(0) := opUop
-      out.uops(1) := Mux(mfBad, opUop, Mux(mfDstIsMem, rmwStUop, opUop))
+      uc.set(out.uops, 0, opUop)
+      uc.set(out.uops, 1, mx(mfBad, opUop, mx(mfDstIsMem, rmwStUop, opUop)))
     } elsewhen(isDivLOp) {
       when(!divLOk) {
         cnt   := 1
-        out.uops(0) := opUop      // forced illegal (vector 4) above
-        out.uops(1) := opUop
+        uc.set(out.uops, 0, opUop)      // forced illegal (vector 4) above
+        uc.set(out.uops, 1, opUop)
       } elsewhen(divlDivisorIsMem) {
         // memSimple divisor (task #180): [load.L <ea> -> T0] prepended. divlUop reads
         // T0 (already wired above) instead of a register/immediate.
         when(divlHasRem) {
           cnt   := 3
-          out.uops(0) := divlLoadUop
-          out.uops(1) := divlUop      // quotient -> Dq
-          out.uops(2) := divremUop    // remainder -> Dr
+          uc.set(out.uops, 0, divlLoadUop)
+          uc.set(out.uops, 1, divlUop)      // quotient -> Dq
+          uc.set(out.uops, 2, divremUop)    // remainder -> Dr
         } otherwise {
           cnt   := 2
-          out.uops(0) := divlLoadUop
-          out.uops(1) := divlUop      // quotient-only (Dr==Dq)
+          uc.set(out.uops, 0, divlLoadUop)
+          uc.set(out.uops, 1, divlUop)      // quotient-only (Dr==Dq)
         }
       } elsewhen(divlHasRem) {
         cnt   := 2
-        out.uops(0) := divlUop      // quotient -> Dq
-        out.uops(1) := divremUop    // remainder -> Dr
+        uc.set(out.uops, 0, divlUop)      // quotient -> Dq
+        uc.set(out.uops, 1, divremUop)    // remainder -> Dr
       } otherwise {
         cnt   := 1
-        out.uops(0) := divlUop      // quotient-only (Dr==Dq)
-        out.uops(1) := divlUop
+        uc.set(out.uops, 0, divlUop)      // quotient-only (Dr==Dq)
+        uc.set(out.uops, 1, divlUop)
       }
     } elsewhen(isMulLOp) {
       when(!mulLOk) {
         cnt   := 1
-        out.uops(0) := opUop        // forced illegal (vector 4) above
-        out.uops(1) := opUop
+        uc.set(out.uops, 0, opUop)        // forced illegal (vector 4) above
+        uc.set(out.uops, 1, opUop)
       } elsewhen(mullMulIsMem) {
         // memSimple multiplier (task #180): [load.L <ea> -> T0] prepended. mullUop
         // reads T0 (already wired above) instead of a register/immediate.
         when(mull64) {
           cnt   := 3
-          out.uops(0) := mullLoadUop
-          out.uops(1) := mullUop      // low product -> Dl
-          out.uops(2) := mulhiUop     // high product -> Dh
+          uc.set(out.uops, 0, mullLoadUop)
+          uc.set(out.uops, 1, mullUop)      // low product -> Dl
+          uc.set(out.uops, 2, mulhiUop)     // high product -> Dh
         } otherwise {
           cnt   := 2
-          out.uops(0) := mullLoadUop
-          out.uops(1) := mullUop      // 32x32->32 (single dest Dl)
+          uc.set(out.uops, 0, mullLoadUop)
+          uc.set(out.uops, 1, mullUop)      // 32x32->32 (single dest Dl)
         }
       } elsewhen(mull64) {
         cnt   := 2
-        out.uops(0) := mullUop      // low product -> Dl
-        out.uops(1) := mulhiUop     // high product -> Dh
+        uc.set(out.uops, 0, mullUop)      // low product -> Dl
+        uc.set(out.uops, 1, mulhiUop)     // high product -> Dh
       } otherwise {
         cnt   := 1
-        out.uops(0) := mullUop      // 32x32->32 (single dest Dl)
-        out.uops(1) := mullUop
+        uc.set(out.uops, 0, mullUop)      // 32x32->32 (single dest Dl)
+        uc.set(out.uops, 1, mullUop)
       }
     } elsewhen(isJmpOp) {
       // JMP -> a single indirect branch to the EA address (bad EA forced illegal above).
       // CPU_PRF_TRIM_BRIDX indexed EA: [T0 := EA] + [ibranch -> (T0)].
       cnt   := Mux(brIdxCrack, U(2, 2 bits), U(1, 2 bits))
-      out.uops(0) := Mux(jmpBad, opUop, Mux(brIdxCrack, brIdxAddr, ibrUop))
-      out.uops(1) := Mux(jmpBad, opUop, ibrUop)
+      uc.set(out.uops, 0, mx(jmpBad, opUop, mx(brIdxCrack, brIdxAddr, ibrUop)))
+      uc.set(out.uops, 1, mx(jmpBad, opUop, ibrUop))
     } elsewhen(fsvCracks) {
       // FSAVE/FRESTORE <computed ea> -> [T0 := EA] + [the sysOp reading T0].
       cnt   := 2
-      out.uops(0) := fsvAddrUop
-      out.uops(1) := opUop
+      uc.set(out.uops, 0, fsvAddrUop)
+      uc.set(out.uops, 1, opUop)
     } elsewhen(isJsrOp) {
       // JSR -> [push.l retPC -> -(A7)] + [ibranch -> EA addr]. Bad EA -> illegal.
       // JSR (A7) additionally prepends [T0 := A7] so the branch sees the PRE-push
@@ -4461,59 +4467,59 @@ object MicroOpAssembler {
       // CPU_PRF_TRIM_BRIDX indexed EA: [T0 := EA] + [push] + [ibranch -> (T0)].
       cnt   := Mux(jsrBad, U(1, 2 bits),
                      Mux(jsrNeedsSnap || brIdxCrack, U(3, 2 bits), U(2, 2 bits)))
-      out.uops(0) := Mux(jsrBad, opUop, Mux(brIdxCrack, brIdxAddr, Mux(jsrNeedsSnap, jsrSnap, jsrPush)))
-      out.uops(1) := Mux(jsrBad, opUop, Mux(jsrNeedsSnap || brIdxCrack, jsrPush, ibrUop))
-      out.uops(2) := ibrUop
+      uc.set(out.uops, 0, mx(jsrBad, opUop, mx(brIdxCrack, brIdxAddr, mx(jsrNeedsSnap, jsrSnap, jsrPush))))
+      uc.set(out.uops, 1, mx(jsrBad, opUop, mx(jsrNeedsSnap || brIdxCrack, jsrPush, ibrUop)))
+      uc.set(out.uops, 2, ibrUop)
     } elsewhen(isBsr) {
       // BSR -> [push.l retPC -> -(A7)] + [bra pc+2+disp].
       cnt   := 2
-      out.uops(0) := bsrPush
-      out.uops(1) := bsrBranch
+      uc.set(out.uops, 0, bsrPush)
+      uc.set(out.uops, 1, bsrBranch)
     } elsewhen(isRtsOp) {
       // RTS -> [load.l (A7) -> T0] + [ibranch -> T0 ; A7 += 4].
       cnt   := 2
-      out.uops(0) := rtsLoad
-      out.uops(1) := rtsBranch
+      uc.set(out.uops, 0, rtsLoad)
+      uc.set(out.uops, 1, rtsBranch)
     } elsewhen(isRtdOp) {
       // RTD -> [load.l (A7) -> T0] + [A7 := A7 + (4+disp16) (drop)] + [ibranch -> T0].
       cnt   := 3
-      out.uops(0) := rtdLoad
-      out.uops(1) := rtdA7
-      out.uops(2) := rtdBranch
+      uc.set(out.uops, 0, rtdLoad)
+      uc.set(out.uops, 1, rtdA7)
+      uc.set(out.uops, 2, rtdBranch)
     } elsewhen(isRtrOp) {
       // RTR -> [pop.w (A7) -> CCR] + [pop.l (A7+2) -> T0] + [ibranch -> T0 ; A7 += 6].
       cnt   := 3
-      out.uops(0) := rtrCcr
-      out.uops(1) := rtrPc
-      out.uops(2) := rtrBranch
+      uc.set(out.uops, 0, rtrCcr)
+      uc.set(out.uops, 1, rtrPc)
+      uc.set(out.uops, 2, rtrBranch)
     } elsewhen(isLinkOp || isLinkLOp) {
       // LINK(.W disp16 / .L disp32) -> [stkPush store dst=An, push old An] +
       // [A7 := A7+disp (drop)] + [An := A7-disp (kept)]. Same crack for both forms —
       // linkDisp above already picks the right width/source words.
       cnt   := 3
-      out.uops(0) := linkPush
-      out.uops(1) := linkA7
-      out.uops(2) := linkAnU
+      uc.set(out.uops, 0, linkPush)
+      uc.set(out.uops, 1, linkA7)
+      uc.set(out.uops, 2, linkAnU)
     } elsewhen(isUnlkOp) {
       // UNLK -> [load.l (An) -> T0] + [A7 := An+4 (drop)] + [An := T0 (kept)].
       cnt   := 3
-      out.uops(0) := unlkLoad
-      out.uops(1) := unlkA7
-      out.uops(2) := unlkAn
+      uc.set(out.uops, 0, unlkLoad)
+      uc.set(out.uops, 1, unlkA7)
+      uc.set(out.uops, 2, unlkAn)
     } elsewhen(isExgOp) {
       // EXG -> [MOVE.L regA -> T0] + [MOVE.L regB -> regA] + [MOVE.L T0 -> regB] (NO flags).
       cnt   := 3
-      out.uops(0) := exgU0
-      out.uops(1) := exgU1
-      out.uops(2) := exgU2
+      uc.set(out.uops, 0, exgU0)
+      uc.set(out.uops, 1, exgU1)
+      uc.set(out.uops, 2, exgU2)
     } elsewhen(crackStore) {
       // MOVE reg -> mem [-(An)/(An)+]: single STORE; the dest An update is FOLDED into
       // the store (its int dst), so no extra µop (register-source fast path, UNCHANGED).
       // MOVE #imm -> mem (immToMemCase): 2-µop materialize-then-store crack: [opUop
       // writes imm -> T1] [stUop stores T1 -> <ea>].
       cnt   := Mux(immToMemCase, U(2, 2 bits), U(1, 2 bits))
-      out.uops(0) := Mux(immToMemCase, opUop, stUop)
-      out.uops(1) := stUop
+      uc.set(out.uops, 0, mx(immToMemCase, opUop, stUop))
+      uc.set(out.uops, 1, stUop)
     } elsewhen(crackMemMem) {
       // MOVE mem -> mem [-(Ay)/(Ay)+ , -(Ax)/(Ax)+]: [load src -> T0] [src An ADD (drop)]
       // [store T0 -> dst] (+ dest An folded into the store). The SOURCE An update ADD is
@@ -4522,39 +4528,39 @@ object MicroOpAssembler {
       // snapshot. When the source is not auto, only [load, store] (the anUpd slot reuses
       // the store — count 2).
       cnt   := Mux(srcAuto, U(3, 2 bits), U(2, 2 bits))
-      out.uops(0) := ldUop
-      out.uops(1) := Mux(srcAuto, anUpdUop, stUop)
-      out.uops(2) := stUop
+      uc.set(out.uops, 0, ldUop)
+      uc.set(out.uops, 1, mx(srcAuto, anUpdUop, stUop))
+      uc.set(out.uops, 2, stUop)
     } elsewhen(crackRmw) {
       // mem-dest RMW -> [load.sz <ea> -> T0] [op (T0+Dn/#imm) -> T1 + flags] [store.sz T1 -> <ea>]
       // The dest=source An update is FOLDED into the store (one An write for the instr).
       cnt   := 3
-      out.uops(0) := ldUop
-      out.uops(1) := opUop
-      out.uops(2) := rmwStUop
+      uc.set(out.uops, 0, ldUop)
+      uc.set(out.uops, 1, opUop)
+      uc.set(out.uops, 2, rmwStUop)
     } elsewhen(crackClr) {
       // CLR mem -> [CLR -> T1 (=0) + Z/N flags] [store.sz T1 -> <ea>] (NO load); the An
       // update is FOLDED into the store.
       cnt   := 2
-      out.uops(0) := opUop
-      out.uops(1) := rmwStUop
+      uc.set(out.uops, 0, opUop)
+      uc.set(out.uops, 1, rmwStUop)
     } elsewhen(crackLoadOnly) {
       // TST / CMPI / CMP-mem -> [load.sz <ea> -> T0] [op (flags only)] (NO store). A
       // source-EA auto-update rides a dropped ADD ordered AFTER the load (old An) but
       // BEFORE the op (the kept commit) so the running A7 is current at the op's snapshot.
       cnt   := Mux(srcAuto, U(3, 2 bits), U(2, 2 bits))
-      out.uops(0) := ldUop
-      out.uops(1) := Mux(srcAuto, anUpdUop, opUop)
-      out.uops(2) := opUop
+      uc.set(out.uops, 0, ldUop)
+      uc.set(out.uops, 1, mx(srcAuto, anUpdUop, opUop))
+      uc.set(out.uops, 2, opUop)
     } elsewhen(crackLoad) {
       // memSimple SOURCE -> [load -> T0] [op (reads T0)]. A source-EA auto-update rides a
       // dropped ADD ordered AFTER the load (it reads the OLD An) but BEFORE the op (the
       // kept commit), so the running architectural A7 reflects a source-(A7)+ at the op's
       // commit snapshot. (The op reads T0; its psrcA tracks the load via the LS wakeup.)
       cnt   := Mux(srcAuto, U(3, 2 bits), U(2, 2 bits))
-      out.uops(0) := ldUop
-      out.uops(1) := Mux(srcAuto, anUpdUop, opUop)
-      out.uops(2) := opUop
+      uc.set(out.uops, 0, ldUop)
+      uc.set(out.uops, 1, mx(srcAuto, anUpdUop, opUop))
+      uc.set(out.uops, 2, opUop)
       if (fuseLongMoveLoads) {
         // Direct full-width MOVE destination: the LSU already produces both
         // the loaded data and MOVE NZVC. Preserve the old path for partial
@@ -4582,25 +4588,26 @@ object MicroOpAssembler {
     } elsewhen(bfDyn) {
       // Bit-field DYNAMIC offset/width -> [BFRESOLVE -> T0] [BITFIELD bfDynamic (reads T0)].
       cnt   := 2
-      out.uops(0) := bfResolveUop
-      out.uops(1) := opUop
+      uc.set(out.uops, 0, bfResolveUop)
+      uc.set(out.uops, 1, opUop)
     } elsewhen(sccIsMem) {
       // Scc <ea> memory dest (task #160) -> [compute cond -> T1 (branch EU)] [store.b
       // T1 -> <ea>] (rmwStUop; NO leading load, like crackClr). The -(An)/(An)+ side
       // effect (An update) rides the trailing store, same as every other rmwStUop user.
       cnt   := 2
-      out.uops(0) := opUop
-      out.uops(1) := rmwStUop
+      uc.set(out.uops, 0, opUop)
+      uc.set(out.uops, 1, rmwStUop)
     } otherwise {
       cnt   := 1
-      out.uops(0) := opUop
-      out.uops(1) := opUop
+      uc.set(out.uops, 0, opUop)
+      uc.set(out.uops, 1, opUop)
     }
     // FP wide-immediate side channel: the `fpEmit` arm above raised `fpImmAlloc` from the
     // FP decode alone; the crack tree's two HIGHER-priority arms (µcode placeholder, fetch
     // fault) replace uops(0) with something that never reaches DivEu's capture, so no
     // table entry may be allocated for them (it would only be reclaimed by the eventual
     // squash). Squelched here, after the tree, so the arm ordering is stated exactly once.
+    uc.finish()
     when(spec.microcoded || pkt.fault) { out.fpImmAlloc := False }
     if (retime) {
       out.count3 := countPre === U(3, 2 bits)

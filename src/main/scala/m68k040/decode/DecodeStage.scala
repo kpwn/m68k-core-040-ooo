@@ -43,7 +43,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
                     * aligner's slot-1 zero-fill on the registered side of `raw`. */
                   alignMaskNoRst: Boolean = m68k040.top.ShippingCoreConfig.alignMaskNoRst,
                   /** `ShippingCoreConfig.immCone` (CPU_IMM_CONE): one-hot atom imm cone. */
-                  immCone: Boolean = m68k040.top.ShippingCoreConfig.immCone) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
+                  immCone: Boolean = m68k040.top.ShippingCoreConfig.immCone,
+                  /** `ShippingCoreConfig.uopCone` (CPU_UOP_CONE): one-hot crack-tree select. */
+                  uopCone: Boolean = m68k040.top.ShippingCoreConfig.uopCone) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
                                        with FpImmTableService with FpTrapImmediateService
                                        with m68k040.services.DecodeRasSnapService {
 
@@ -354,8 +356,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `a0Ia`/`a1Ia` hold the per-packet atoms that rebuild the 32-bit GROUP-bank values (the
     // only consumer of the assembled `imm`, see wideImm). Flag OFF: the original assembler.
     def asmPair(i: Int): (MicroOpAssembler.AssembledUops, ImmAtoms) =
-      if (immCone) MicroOpAssembler.assembleAtoms(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime)
-      else (MicroOpAssembler.assemble(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime), null)
+      if (immCone) MicroOpAssembler.assembleAtoms(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime, uopCone)
+      else (MicroOpAssembler.assemble(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime, uopCone), null)
     val (a0, a0Ia)    = asmPair(0)
     val (a1raw, a1Ia) = asmPair(1)
 

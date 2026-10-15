@@ -708,6 +708,7 @@ object GenSocketTopVerilog {
             s"feRetime=${ShippingCoreConfig.feRetime} " +
             s"alignMaskNoRst=${ShippingCoreConfig.alignMaskNoRst} " +
             s"immCone=${ShippingCoreConfig.immCone} " +
+            s"uopCone=${ShippingCoreConfig.uopCone} " +
             s"feRedirectCmd=${ShippingCoreConfig.feRedirectCmd} " +
             s"beRetime=${ShippingCoreConfig.beRetime} " +
             s"tc3Retime=${ShippingCoreConfig.tc3Retime} " +
