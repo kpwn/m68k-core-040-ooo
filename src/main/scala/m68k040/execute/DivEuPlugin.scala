@@ -1217,15 +1217,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpSglIn = Mux(fpS1Kind === FpSrcKind.SINGLEIMM, fpS1Imm(31 downto 0), fpS1IntA)
     val fpDblIn = Mux(fpS1Kind === FpSrcKind.DOUBLEIMM, fpS1Imm(63 downto 0),
                                                         fpS1IntA ## fpS1IntB)
-    // CPU_FP_SRC_NORM1: one shared normalizer; the three names then all denote its output
-    // (each fpSrcVal arm below selects exactly the format the shared select picked).
-    val fpSrcNorm1 = m68k040.top.ShippingCoreConfig.fpSrcNorm1
-    val fpSharedIsSgl = (fpS1Kind === FpSrcKind.SINGLEIMM) || ((fpS1Kind === FpSrcKind.INTREG) && (fpFmt === B"3'b001"))
-    val fpSharedIsInt = (fpS1Kind === FpSrcKind.INTIMM) || ((fpS1Kind === FpSrcKind.INTREG) && (fpFmt =/= B"3'b001"))
-    val fpFromShared = if (fpSrcNorm1) FpSource.toExtendedShared(fpSharedIsInt, fpSharedIsSgl, fpIntIn, fpSglIn, fpDblIn) else null
-    val fpFromInt = if (fpSrcNorm1) fpFromShared else FpSource.intToExtended(fpIntIn)
-    val fpFromSgl = if (fpSrcNorm1) fpFromShared else FpSource.singleToExtended(fpSglIn)
-    val fpFromDbl = if (fpSrcNorm1) fpFromShared else FpSource.doubleToExtended(fpDblIn)
+    // (CPU_FP_SRC_NORM1 deliberately NOT applied here: measured +3 logic levels on this
+    // conversion cone, which is a known FS1 critical path; it is applied only at the cold
+    // RobPlugin unimplemented-frame site.)
+    val fpFromInt = FpSource.intToExtended(fpIntIn)
+    val fpFromSgl = FpSource.singleToExtended(fpSglIn)
+    val fpFromDbl = FpSource.doubleToExtended(fpDblIn)
     // Reads `fpS1KindB` (the physical duplicate above), NOT `fpS1Kind`: this is the WIDE
     // 80-bit-output cluster the fanout split separates from the narrow selects above.
     val fpSrcVal = fpS1KindB.mux(

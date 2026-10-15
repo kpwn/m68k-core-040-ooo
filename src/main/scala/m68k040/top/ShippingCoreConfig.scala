@@ -1000,10 +1000,10 @@ object ShippingCoreConfig {
     * Same S1/S1a/S2/S3 stages, same latency; bit-identical (ShifterFunnelEquivSpec).
     * Default OFF; echoed in `SHIPPING_CONFIG`. */
   val shiftFunnel: Boolean = envFlag("CPU_SHIFT_FUNNEL", false)
-  /** CPU_FP_SRC_NORM1 (redundancy hunt 2026-10-15): the int/single/double -> extended
-    * source conversions (DivEuPlugin's FS1 gateway and RobPlugin's unimplemented-frame
-    * immediate) share ONE clz64 + barrel normalizer (`FpSource.toExtendedShared`) instead of
-    * three. Bit-identical (FpSrcNormEquivSpec). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  /** CPU_FP_SRC_NORM1 (redundancy hunt 2026-10-15): RobPlugin's cold unimplemented-frame
+    * immediate conversion (int/single/double -> extended) shares ONE clz64 + barrel
+    * normalizer (`FpSource.toExtendedShared`) instead of three. (Not applied to DivEu's FS1
+    * gateway: +3 logic levels there.) Bit-identical (FpSrcNormEquivSpec). Default OFF; echoed in `SHIPPING_CONFIG`. */
   val fpSrcNorm1: Boolean = envFlag("CPU_FP_SRC_NORM1", false)
   /** CPU_LS_SPLIT_TAIL (redundancy hunt 2026-10-15): a line-crossing load's merge reads
     * only slot A's line bytes 13..15 and slot B's bytes 0..2, so the parked-response lines
