@@ -596,8 +596,9 @@ object ShippingCoreConfig {
     * `SHIPPING_CONFIG`. */
   val decPendShare: Boolean = envFlag("CPU_DEC_PEND_SHARE", false)
   /** Microcode context register keeps only the significant bits of its sign-extended small
-    * fields (An deltas, PACK adj16) and re-derives pc+4 / bfMiDispLo+4 from the latched
-    * pc / bfMiDispLo (`CPU_UC_CTX_NARROW`, default OFF). Bit-identical `ucCtx`,
+    * fields (An deltas, PACK adj16) and re-derives pc+4 / bfMiDispLo+4 / nextPc (= pc +
+    * 2*lenWords, also for the MOVE real-length override) from the latched pc / bfMiDispLo /
+    * lenWords (`CPU_UC_CTX_NARROW`, default OFF). Bit-identical `ucCtx`,
     * cycle-identical. Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
   val ucCtxNarrow: Boolean = envFlag("CPU_UC_CTX_NARROW", false)
   /** Microcode context `eaDispLo` latched as {disp, +pc?, +K<=6} with the single add AFTER

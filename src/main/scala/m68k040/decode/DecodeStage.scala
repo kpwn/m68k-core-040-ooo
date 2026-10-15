@@ -1847,13 +1847,14 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     if (ucCtxNarrow) {
       val c = ucCtx
       def sx(b: Bits, w: Int): Bits = b(w - 1 downto 0).asSInt.resize(32).asBits
-      Seq(c.movesDelta, c.fpAutoDelta, c.fpCtrlDelta, c.packAdj, c.bfPcRelConst, c.bfMiDispHi).foreach(_.allowOverride)
+      Seq(c.movesDelta, c.fpAutoDelta, c.fpCtrlDelta, c.packAdj, c.bfPcRelConst, c.bfMiDispHi, c.nextPc).foreach(_.allowOverride)
       c.movesDelta   := sx(ucCtxR.movesDelta, 4)
       c.fpAutoDelta  := sx(ucCtxR.fpAutoDelta, 5)
       c.fpCtrlDelta  := sx(ucCtxR.fpCtrlDelta, 5)
       c.packAdj      := sx(ucCtxR.packAdj, 16)
       c.bfPcRelConst := (ucCtxR.pc + U(4, 32 bits)).asBits
       c.bfMiDispHi   := (ucCtxR.bfMiDispLo.asUInt + U(4, 32 bits)).asBits
+      c.nextPc       := (ucCtxR.pc + (ucCtxR.lenWords << 1).resize(32)).resize(32)
     }
     ucCtx.miOther.simPublic(); ucCtx.miOtherValid.simPublic()  // debug-only (task #144)
     when(pipeFlush) { ucActive := False }
@@ -4167,7 +4168,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       assert(e.movesDelta === sx(e.movesDelta, 4) && e.fpAutoDelta === sx(e.fpAutoDelta, 5) &&
              e.fpCtrlDelta === sx(e.fpCtrlDelta, 5) && e.packAdj === sx(e.packAdj, 16) &&
              e.bfPcRelConst === (e.pc + U(4, 32 bits)).asBits &&
-             e.bfMiDispHi === (e.bfMiDispLo.asUInt + U(4, 32 bits)).asBits,
+             e.bfMiDispHi === (e.bfMiDispLo.asUInt + U(4, 32 bits)).asBits &&
+             e.nextPc === (e.pc + (e.lenWords << 1).resize(32)).resize(32),
         "DecodeStage: CPU_UC_CTX_NARROW entry context violates a narrowed-field relation", FAILURE)
     }
 
