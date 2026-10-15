@@ -1004,4 +1004,8 @@ object ShippingCoreConfig {
     * borrow-out is the `>=` compare (zero-cycle; default OFF = identical netlist). Read as
     * `FpuCore`'s constructor default. Echoed in `SHIPPING_CONFIG`. */
   val fpuIterSubShare: Boolean = envFlag("CPU_FPU_ITER_SUB_SHARE", false)
+  /** `CPU_FPU_ADD_ONE_ADDER`: FpAddPipe A4's magnitude add and subtract share one carry chain
+    * (zero-cycle; default OFF = identical netlist). Read as `FpuCore`'s constructor default.
+    * Echoed in `SHIPPING_CONFIG`. */
+  val fpuAddOneAdder: Boolean  = envFlag("CPU_FPU_ADD_ONE_ADDER", false)
 }

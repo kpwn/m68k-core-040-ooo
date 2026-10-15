@@ -102,7 +102,8 @@ object FpuCore {
   * FixedLatency after an accepted `start`, identical to MulCore. The EU MUST reserve result
   * capacity before asserting `start` (2026-08-09 spec §3). */
 class FpuCore(normShare: Boolean = m68k040.top.ShippingCoreConfig.fpuNormShare,
-              iterSubShare: Boolean = m68k040.top.ShippingCoreConfig.fpuIterSubShare) extends Component {
+              iterSubShare: Boolean = m68k040.top.ShippingCoreConfig.fpuIterSubShare,
+              addOneAdder: Boolean = m68k040.top.ShippingCoreConfig.fpuAddOneAdder) extends Component {
   val io = new Bundle {
     // -- request --
     val start   = in Bool ()
@@ -142,7 +143,7 @@ class FpuCore(normShare: Boolean = m68k040.top.ShippingCoreConfig.fpuNormShare,
   val isMul   = io.op === FpOp.FMUL
   val isCheap = !isIter && !isAdd && !isMul
 
-  val addPipe   = new FpAddPipe
+  val addPipe   = new FpAddPipe(oneAdder = addOneAdder)
   val mulPipe   = new FpMulPipe(exportNorm = normShare)
   val cheapPipe = new FpCheapPipe
   val iterCore  = new FpDivSqrtCore(sharedNorm = normShare, sharedSub = iterSubShare)
