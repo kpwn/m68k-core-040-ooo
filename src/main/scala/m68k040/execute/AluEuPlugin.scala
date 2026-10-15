@@ -789,24 +789,27 @@ class AluEuPlugin(val lean: Boolean = false,
     // s*Valid) gates issue.
     //
     // S1: stage1a (the cheap count-derived amounts) -> register into S1a.
-    val s1Stage1a = Shifter.stage1a(shiftCmd)
+    // CPU_SHIFT_FUNNEL: the same three stage boundaries around ONE funnel
+    // (`ShifterFunnel`) instead of the per-op barrel shifters.
+    val shiftFunnel = m68k040.top.ShippingCoreConfig.shiftFunnel
     s1aValid     := RegNext(s1Valid && isSlow && !flushPort) init False
-    val s1aStage1a = RegNext(s1Stage1a)
     val s1aCtx     = RegNext(s1Ctx)
     val s1aSrc1    = RegNext(s1Src1)
 
     // ── S1a: stage1b (the wide variable barrel shifts) off the registered amounts ->
     // register the ShiftStage1 midpoint into S2. This is the FMax#3 cut, unchanged: the
     // deep funnel cone is still halved across the S1->S1a boundary. ──
-    val s1Stage1 = Shifter.stage1b(s1aStage1a)
     s2Valid      := RegNext(s1aValid && !flushPort) init False
-    val s2Stage1 = RegNext(s1Stage1)
     val s2Ctx    = RegNext(s1aCtx)
     val s2Src1   = RegNext(s1aSrc1)        // merge source preserved to S3
 
     // SLOW S2: bit-extract + mux on the registered midpoint. Register the finished
     // result/flags into final stage S3.
-    val s2Rsp    = Shifter.stage2(s2Stage1)
+    val s1aStage1a = if (!shiftFunnel) RegNext(Shifter.stage1a(shiftCmd)) else null
+    val s2Stage1   = if (!shiftFunnel) RegNext(Shifter.stage1b(s1aStage1a)) else null
+    val s1aFunnel  = if (shiftFunnel) RegNext(ShifterFunnel.stage1a(shiftCmd)) else null
+    val s2Funnel   = if (shiftFunnel) RegNext(ShifterFunnel.stage1b(s1aFunnel)) else null
+    val s2Rsp: ShiftRsp = if (!shiftFunnel) Shifter.stage2(s2Stage1) else ShifterFunnel.stage2(s2Funnel)
     s3Valid     := RegNext(s2Valid && !flushPort) init False
     val s3Ctx    = RegNext(s2Ctx)
     val s3Src1   = RegNext(s2Src1)

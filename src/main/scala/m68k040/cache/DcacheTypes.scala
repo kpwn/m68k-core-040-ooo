@@ -513,7 +513,7 @@ object DcacheByteLane {
   // access is at most 4 bytes, so it spans at most two adjacent lines.
   // ───────────────────────────────────────────────────────────────────────────
 
-  private def nBytesOf(size: Size.C): UInt = {
+  def nBytesOf(size: Size.C): UInt = {
     val n = UInt(3 bits); n := 1
     switch(size) {
       is(Size.BYTE) { n := 1 }
@@ -527,6 +527,28 @@ object DcacheByteLane {
     * byte offset `off`. Byte k of the value (k=0 = MSB at `off`) is taken from
     * line A at `off+k` (if `off+k<16`) else line B at `off+k-16`. Right-justified
     * in 32 bits. Aligned (no cross) reduces to `extract(lineA, ...)`. */
+  /** CPU_LS_SPLIT_TAIL: the line bytes a crossing merge can read. A split access
+    * satisfies off + nBytes > 16 with nBytes <= 4, so it reads only line A bytes 13..15
+    * and line B bytes 0..2. Packed {line[127:104] (A tail), line[23:0] (B head)}. */
+  def splitKeep(line: Bits): Bits = line(127 downto 104) ## line(23 downto 0)
+  /** `extractCross` over the kept bytes: `tailA` = lineA[127:104], `headB` = lineB[23:0].
+    * Equal to `extractCross(lineA, lineB, off, size)` whenever off + nBytes(size) > 16. */
+  def extractCrossTail(tailA: Bits, headB: Bits, off: UInt, size: Size.C): Bits = {
+    val bytes = Vec(Bits(8 bits), 8)
+    for (i <- 0 until 3) { bytes(i) := tailA(i * 8 + 7 downto i * 8); bytes(3 + i) := headB(i * 8 + 7 downto i * 8) }
+    bytes(6) := B(0, 8 bits); bytes(7) := B(0, 8 bits)
+    def selByte(k: Int): Bits = bytes(((off +^ U(k, 5 bits)) - U(13, 5 bits)).resize(3 bits))
+    val b0 = selByte(0); val b1 = selByte(1); val b2 = selByte(2); val b3 = selByte(3)
+    val result = Bits(32 bits)
+    result := B(0, 32 bits)
+    switch(size) {
+      is(Size.BYTE) { result := B(0, 24 bits) ## b0 }
+      is(Size.WORD) { result := B(0, 16 bits) ## b0 ## b1 }
+      is(Size.LONG) { result := b0 ## b1 ## b2 ## b3 }
+    }
+    result
+  }
+
   def extractCross(lineA: Bits, lineB: Bits, off: UInt, size: Size.C): Bits = {
     val aBytes = lineA.subdivideIn(8 bits)   // aBytes(i) = lineA[i*8 +: 8]
     val bBytes = lineB.subdivideIn(8 bits)

@@ -994,4 +994,25 @@ object ShippingCoreConfig {
     * Advertised as OFF_FEATURES bit 26 (`dbg_lite`). Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val dbgLite: Boolean = envFlag("CPU_DBG_LITE", false)
+  /** CPU_SHIFT_FUNNEL (redundancy hunt 2026-10-15): the ALU slow path's line-E shifter
+    * builds every result and carry as ONE window of one class-shaped funnel word
+    * (`ShifterFunnel`) instead of ten per-op barrel shifters + ~17 flag-bit shifts.
+    * Same S1/S1a/S2/S3 stages, same latency; bit-identical (ShifterFunnelEquivSpec).
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val shiftFunnel: Boolean = envFlag("CPU_SHIFT_FUNNEL", false)
+  /** CPU_FP_SRC_NORM1 (redundancy hunt 2026-10-15): the int/single/double -> extended
+    * source conversions (DivEuPlugin's FS1 gateway and RobPlugin's unimplemented-frame
+    * immediate) share ONE clz64 + barrel normalizer (`FpSource.toExtendedShared`) instead of
+    * three. Bit-identical (FpSrcNormEquivSpec). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val fpSrcNorm1: Boolean = envFlag("CPU_FP_SRC_NORM1", false)
+  /** CPU_LS_SPLIT_TAIL (redundancy hunt 2026-10-15): a line-crossing load's merge reads
+    * only slot A's line bytes 13..15 and slot B's bytes 0..2, so the parked-response lines
+    * (`alignedRLine`, 128 b/slot) keep 48 bits and `splitMergeLine` keeps 24.
+    * Bit-identical merge (LsSplitTailEquivSpec). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val lsSplitTail: Boolean = envFlag("CPU_LS_SPLIT_TAIL", false)
+  /** CPU_BF_TRIM (redundancy hunt 2026-10-15): the CPLX bit-field lane's stage 1 drops
+    * its redundant shifters (dyShL, the arithmetic extract shifter, the BFINS shift+rotate
+    * pair -> one rotate) and stage 2 its duplicate zero compares (`Bitfield.stage1T`).
+    * Bit-identical (BitfieldTrimEquivSpec). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val bfTrim: Boolean = envFlag("CPU_BF_TRIM", false)
 }

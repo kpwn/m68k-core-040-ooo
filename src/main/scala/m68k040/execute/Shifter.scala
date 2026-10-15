@@ -510,3 +510,240 @@ object Shifter {
     acc
   }
 }
+
+/** CPU_SHIFT_FUNNEL stage-1a midpoint: the masked source, the class-shaped FUNNEL WORD
+  * `d` and the funnel right-shift amount `r` -- instead of the ten separate count-derived
+  * amounts the per-op shifters needed. */
+case class ShiftFunnelStage1a() extends Bundle {
+  val shiftOp = UInt(2 bits); val dirLeft = Bool(); val size = Size()
+  val isImm   = Bool();       val xIn = Bool();     val count = UInt(6 bits)
+  val src     = UInt(32 bits); val srcMsb = Bool()
+  val d       = Bits(66 bits)  // funnel word D[0..65] (see ShifterFunnel)
+  val r       = UInt(6 bits)   // right-shift amount, 0..33 on every live path
+  val countP1 = UInt(6 bits)   // ASL V: shTable(count+1)
+}
+
+/** CPU_SHIFT_FUNNEL stage-1 midpoint: the ONE funnel window plus the ASL V inputs. */
+case class ShiftFunnelStage1() extends Bundle {
+  val shiftOp = UInt(2 bits); val dirLeft = Bool(); val size = Size()
+  val isImm   = Bool();       val xIn = Bool();     val count = UInt(6 bits)
+  val src     = UInt(32 bits); val srcMsb = Bool()
+  val o       = Bits(34 bits)  // ({D, guard} >> r)[33:0]: [0]=bit below, [s:1]=result, [s+1]=bit above
+  val lshSvZero = Bool()       // (src & shTable(count+1)) == 0
+  val lshSvAll  = Bool()       // (src & shTable(count+1)) == shTable(count+1)
+}
+
+/** CPU_SHIFT_FUNNEL: the line-E shifter with ONE funnel instead of ten barrel shifters.
+  *
+  * The per-op `Shifter` builds ASR/LSR/LSL results, two-shift ROR/ROL/ROXR/ROXL rotates and
+  * ~17 separate "(FLAG>>8)&1" words, every one of them a variable shift of the SAME source.
+  * Every result here is a window of one class-shaped 66-bit word `D` (built from the source
+  * with constant indices only) shifted right by one amount `r`:
+  *   LSR      D[j] = src[j] (j<32), 0 above               r = count
+  *   ASR      D[j] = src[j] (j<s),  msb above             r = count
+  *   ASL/LSL  D[j] = src[j-32] (32<=j<64), 0 elsewhere    r = 32 - count
+  *   ROR/ROL  D[j] = src[j mod s]                         r = sMod / s - sMod
+  *   ROXR/L   D[j] = ring[j mod (s+1)], ring = {X, src}   r = k / (s+1) - k
+  * With W = {D, guard=0} and O = W >> r: result = O[s:1]; the last bit shifted out of a
+  * right shift is O[0]; of a left shift (and the new ROX X) O[s+1]; a ROR's C is the
+  * result MSB and a ROL's the result LSB. Stage 2 keeps the per-op count/size special
+  * cases verbatim. Equivalence vs `Shifter`: ShifterFunnelEquivSpec. */
+object ShifterFunnel {
+  def apply(cmd: ShiftCmd): ShiftRsp = stage2(stage1b(stage1a(cmd)))
+
+  def stage1a(cmd: ShiftCmd): ShiftFunnelStage1a = new Area {
+    val a = ShiftFunnelStage1a()
+    val isB = cmd.size === Size.BYTE
+    val isW = cmd.size === Size.WORD
+    val sizeBits = cmd.size.mux(Size.BYTE -> U(8, 7 bits), Size.WORD -> U(16, 7 bits), Size.LONG -> U(32, 7 bits))
+    val mask = cmd.size.mux(
+      Size.BYTE -> B(0x000000ffL, 32 bits),
+      Size.WORD -> B(0x0000ffffL, 32 bits),
+      Size.LONG -> B(0xffffffffL, 32 bits)).asUInt
+    val src  = cmd.data.asUInt & mask
+    val srcMsb = cmd.size.mux(Size.BYTE -> src(7), Size.WORD -> src(15), Size.LONG -> src(31))
+    val count = cmd.count
+    val sMod = cmd.size.mux(Size.BYTE -> count(2 downto 0).resize(6), Size.WORD -> count(3 downto 0).resize(6), Size.LONG -> count(4 downto 0).resize(6))
+    val wBits = (sizeBits + 1).resize(7)
+    val roxShift = (cmd.isImm ? count.resize(7) | rmod(count, wBits)).resize(6)
+
+    val tt = cmd.shiftOp
+    val left = cmd.dirLeft
+    val isShiftCls = !tt(1)                     // ASR/ASL/LSR/LSL
+    val isRox = tt === 2
+    val isRot = tt === 3
+    // Per-bit funnel word: constant source indices per (class, size).
+    val x = cmd.xIn
+    def rot(j: Int, s: Int): Bool = src(j % s)
+    def rox(j: Int, s: Int): Bool = { val i = j % (s + 1); if (i == s) x else src(i) }
+    val d = Bits(66 bits)
+    for (j <- 0 until 66) {
+      val lsr = if (j < 32) src(j) else False
+      val asr = Bool()
+      asr := (if (j < 32) src(j) else srcMsb)
+      if (j >= 8 && j < 32) when(isB || (isW && Bool(j >= 16))) { asr := srcMsb }
+      val lsl = if (j >= 32 && j < 64) src(j - 32) else False
+      val rotJ = cmd.size.mux(Size.BYTE -> rot(j, 8), Size.WORD -> rot(j, 16), Size.LONG -> rot(j, 32))
+      val roxJ = cmd.size.mux(Size.BYTE -> rox(j, 8), Size.WORD -> rox(j, 16), Size.LONG -> rox(j, 32))
+      d(j) := Mux(isShiftCls, Mux(left, lsl, Mux(tt(0), lsr, asr)), Mux(isRot, rotJ, roxJ))
+    }
+    val rotBack = (sizeBits - sMod.resize(7)).resize(6)
+    val roxBack = (wBits - roxShift.resize(7)).resize(6)
+    val r = UInt(6 bits)
+    when(isShiftCls) {
+      r := Mux(left, (U(32, 7 bits) - count.resize(7)).resize(6), count)
+    } elsewhen(isRot) {
+      r := Mux(left, rotBack, sMod)
+    } otherwise {
+      r := Mux(left, roxBack, roxShift)
+    }
+
+    a.shiftOp := cmd.shiftOp; a.dirLeft := cmd.dirLeft; a.size := cmd.size
+    a.isImm := cmd.isImm;     a.xIn := cmd.xIn;         a.count := count
+    a.src := src;             a.srcMsb := srcMsb
+    a.d := d;                 a.r := r
+    a.countP1 := (count + 1).resize(6)
+  }.a
+
+  def stage1b(a: ShiftFunnelStage1a): ShiftFunnelStage1 = new Area {
+    val s1 = ShiftFunnelStage1()
+    val sizeBits = a.size.mux(Size.BYTE -> U(8, 7 bits), Size.WORD -> U(16, 7 bits), Size.LONG -> U(32, 7 bits))
+    val mask = a.size.mux(
+      Size.BYTE -> B(0x000000ffL, 32 bits),
+      Size.WORD -> B(0x0000ffffL, 32 bits),
+      Size.LONG -> B(0xffffffffL, 32 bits)).asUInt
+    // The one funnel: W = {D, guard 0} (67 bits) >> r, keep 34 bits.
+    val w = (a.d ## False).asUInt
+    s1.o := (w >> a.r).resize(34).asBits
+    // ASL V inputs (shTable verbatim from Shifter.stage1b).
+    def shTable(k: UInt): UInt = {
+      val res = UInt(32 bits)
+      val lowZeros = (sizeBits - k.resize(7)).asSInt
+      when(k === 0) {
+        res := 0
+      } otherwise {
+        when(lowZeros <= 0) {
+          res := mask
+        } otherwise {
+          val lz = lowZeros.asUInt.resize(6)
+          val lowOnes = ((U(1, 33 bits) << lz) - 1).resize(32)
+          res := mask & ~lowOnes
+        }
+      }
+      res
+    }
+    val tbl = shTable(a.countP1)
+    val sv  = a.src & tbl
+    s1.lshSvZero := sv === 0
+    s1.lshSvAll  := sv === tbl
+    s1.shiftOp := a.shiftOp; s1.dirLeft := a.dirLeft; s1.size := a.size
+    s1.isImm := a.isImm;     s1.xIn := a.xIn;         s1.count := a.count
+    s1.src := a.src;         s1.srcMsb := a.srcMsb
+  }.s1
+
+  def stage2(s1: ShiftFunnelStage1): ShiftRsp = new Area {
+    val rsp = ShiftRsp()
+    val isB = s1.size === Size.BYTE
+    val isL = s1.size === Size.LONG
+    val sizeBits = s1.size.mux(Size.BYTE -> U(8, 7 bits), Size.WORD -> U(16, 7 bits), Size.LONG -> U(32, 7 bits))
+    val mask = s1.size.mux(
+      Size.BYTE -> B(0x000000ffL, 32 bits),
+      Size.WORD -> B(0x0000ffffL, 32 bits),
+      Size.LONG -> B(0xffffffffL, 32 bits)).asUInt
+    val src = s1.src
+    val srcMsb = s1.srcMsb
+    val count = s1.count
+    val countZ = count === 0
+    def nOf(v: UInt): Bool = s1.size.mux(Size.BYTE -> v(7), Size.WORD -> v(15), Size.LONG -> v(31))
+    def zOf(v: UInt): Bool = (v & mask) === 0
+
+    val win    = s1.o(32 downto 1).asUInt & mask     // the shifted/rotated result
+    val winN   = nOf(win)
+    val winZ   = win === 0
+    val cBelow = s1.o(0)                              // last bit out of a right shift
+    val cAbove = s1.size.mux(Size.BYTE -> s1.o(9), Size.WORD -> s1.o(17), Size.LONG -> s1.o(33))
+    val vImm = !(s1.lshSvZero || (s1.lshSvAll && (!isB || count < 8)))
+    val vReg = !(s1.lshSvZero || s1.lshSvAll)
+
+    rsp.result := src.asBits
+    rsp.n := srcMsb
+    rsp.z := zOf(src)
+    rsp.v := False
+    rsp.c := False
+    rsp.xOut := s1.xIn
+    def setRsp(result: UInt, n: Bool, z: Bool, v: Bool, c: Bool, x: Bool): Unit = {
+      rsp.result := (result & mask).asBits
+      rsp.n := n; rsp.z := z; rsp.v := v; rsp.c := c; rsp.xOut := x
+    }
+    def setWin(v: Bool, c: Bool, x: Bool, n: Bool = null): Unit = {
+      rsp.result := win.asBits
+      rsp.n := (if (n == null) winN else n); rsp.z := winZ; rsp.v := v; rsp.c := c; rsp.xOut := x
+    }
+    def setCount0(c: Bool, x: Bool): Unit = setRsp(src, srcMsb, zOf(src), False, c, x)
+
+    val sel = s1.shiftOp @@ s1.dirLeft
+    switch(sel) {
+      is(U"000") {  // ASR
+        when(s1.isImm) { setWin(False, cBelow, cBelow) } otherwise {
+          when(countZ) { setCount0(False, s1.xIn) } otherwise {
+            when(count < sizeBits) { setWin(False, cBelow, cBelow) } otherwise {
+              when(srcMsb) { setRsp(mask, True, False, False, True, True) }
+                .otherwise { setRsp(U(0, 32 bits), False, True, False, False, False) }
+            }
+          }
+        }
+      }
+      is(U"001") {  // ASL
+        when(s1.isImm) { setWin(vImm, cAbove, cAbove) } otherwise {
+          when(countZ) { setCount0(False, s1.xIn) } otherwise {
+            when(count < sizeBits) { setWin(vReg, cAbove, cAbove) } otherwise {
+              val c = (count === sizeBits) && src(0)
+              setRsp(U(0, 32 bits), False, True, src =/= 0, c, c)
+            }
+          }
+        }
+      }
+      is(U"010") {  // LSR
+        when(s1.isImm) { setWin(False, cBelow, cBelow, False) } otherwise {
+          when(countZ) { setCount0(False, s1.xIn) } otherwise {
+            when((isL && count < sizeBits) || (!isL && count <= sizeBits)) {
+              setWin(False, cBelow, cBelow, False)
+            } otherwise {
+              val c = Mux(isL, (count === sizeBits) && srcMsb, False)
+              setRsp(U(0, 32 bits), False, True, False, c, c)
+            }
+          }
+        }
+      }
+      is(U"011") {  // LSL
+        when(s1.isImm) { setWin(False, cAbove, cAbove) } otherwise {
+          when(countZ) { setCount0(False, s1.xIn) } otherwise {
+            when((isL && count < sizeBits) || (!isL && count <= sizeBits)) {
+              setWin(False, cAbove, cAbove)
+            } otherwise {
+              val c = Mux(isL, (count === sizeBits) && src(0), False)
+              setRsp(U(0, 32 bits), False, True, False, c, c)
+            }
+          }
+        }
+      }
+      is(U"100", U"101") {  // ROXR / ROXL
+        when(!s1.isImm && countZ) { setCount0(s1.xIn, s1.xIn) } otherwise { setWin(False, cAbove, cAbove) }
+      }
+      is(U"110") {  // ROR
+        when(!s1.isImm && countZ) { setCount0(False, s1.xIn) } otherwise { setWin(False, winN, s1.xIn) }
+      }
+      default {     // ROL
+        when(!s1.isImm && countZ) { setCount0(False, s1.xIn) } otherwise { setWin(False, win(0), s1.xIn) }
+      }
+    }
+  }.rsp
+
+  private def rmod(count: UInt, w: UInt): UInt = {
+    var acc = count.resize(7)
+    for (_ <- 0 until 7) {
+      acc = Mux(acc >= w, (acc - w).resize(7), acc)
+    }
+    acc
+  }
+}

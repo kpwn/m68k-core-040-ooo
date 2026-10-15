@@ -1626,7 +1626,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // the in-order release from writing the PRF a SECOND time.
     val alignedWb     = Vec.fill(alignedDepth)(RegInit(False))
     val alignedRData  = Vec.fill(alignedDepth)(Reg(Bits(32 bits)))
-    val alignedRLine  = Vec.fill(alignedDepth)(Reg(Bits(128 bits)))
+    // CPU_LS_SPLIT_TAIL: a parked line is read ONLY by the split merge, which reads only
+    // line bytes 13..15 (slot A) / 0..2 (slot B) -- keep those 48 bits (`splitKeep`).
+    val lsSplitTail   = m68k040.top.ShippingCoreConfig.lsSplitTail
+    def lineKeep(l: Bits): Bits = if (lsSplitTail) m68k040.cache.DcacheByteLane.splitKeep(l) else l
+    val alignedRLine  = Vec.fill(alignedDepth)(Reg(Bits((if (lsSplitTail) 48 else 128) bits)))
     val alignedRFault = Vec.fill(alignedDepth)(RegInit(False))
     alignedDone.foreach(_.simPublic()); alignedWb.foreach(_.simPublic())
     val alignedPushPtr  = Reg(UInt(alignedPtrW bits)) init 0
@@ -1839,7 +1843,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // The response fields the ring path consumes: live off the port for the head,
     // otherwise the parked copy.
     val alignedRspData  = Mux(alignedHeadLive, dcache.loadRsp.payload.data,  alignedRData(alignedRspPtr))
-    val alignedRspLine  = Mux(alignedHeadLive, dcache.loadRsp.payload.line,  alignedRLine(alignedRspPtr))
+    val alignedRspLine  = Mux(alignedHeadLive, lineKeep(dcache.loadRsp.payload.line),  alignedRLine(alignedRspPtr))
     val alignedRspFault = Mux(alignedHeadLive, dcache.loadRsp.payload.fault, alignedRFault(alignedRspPtr))
     alignedRspMatchVec.foreach(_.simPublic()); alignedHeadLive.simPublic()
     GenerationFlags.simulation {
@@ -2937,7 +2941,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       when(alignedRspMatchVec(i) && !((alignedRspPtr === U(i, alignedPtrW bits)) && alignedRspFire)) {
         alignedDone(i)   := True
         alignedRData(i)  := dcache.loadRsp.payload.data
-        alignedRLine(i)  := dcache.loadRsp.payload.line
+        alignedRLine(i)  := lineKeep(dcache.loadRsp.payload.line)
         alignedRFault(i) := dcache.loadRsp.payload.fault
       }
     }
@@ -3514,7 +3518,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // substitute one wrong answer for another.  What hardware guarantees is the
     // part that actually reduces harm -- that the residue after a squash is a
     // known constant, not a previous instruction's line.
-    val splitMergeLine  = Reg(Bits(128 bits)) init B(0, 128 bits)
+    val splitMergeLine  = (if (lsSplitTail) Reg(Bits(24 bits)) init B(0, 24 bits)
+                           else Reg(Bits(128 bits)) init B(0, 128 bits))
     val splitMergeValid = RegInit(False)
     val splitMergeRob   = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)) init 0
     // Test-visibility only (LsEuSplitRingSpec's squash-clear fence); no-op for
@@ -3523,7 +3528,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     splitMergeValid.simPublic()
     when(alignedRspFire && !alignedRspIsPoison) {
       when(alignedRspIsSplitA && !alignedRspFault) {
-        splitMergeLine  := alignedRspLine
+        splitMergeLine  := (if (lsSplitTail) alignedRspLine(47 downto 24) else alignedRspLine)
         splitMergeValid := True
         splitMergeRob   := alignedRspEntry.bk.robId
       } otherwise {
@@ -3554,7 +3559,15 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
               "assembled from two unrelated lines.",
               FAILURE)
           }
-          val merged = m68k040.cache.DcacheByteLane.extractCross(
+          val merged = if (lsSplitTail) {
+            GenerationFlags.simulation {
+              assert((alignedRspEntry.mergeOff +^ m68k040.cache.DcacheByteLane.nBytesOf(alignedRspEntry.size)) > U(16),
+                "CPU_LS_SPLIT_TAIL: a split merge whose access does not cross the line", FAILURE)
+            }
+            m68k040.cache.DcacheByteLane.extractCrossTail(
+              splitMergeLine, alignedRspLine(23 downto 0),
+              alignedRspEntry.mergeOff, alignedRspEntry.size)
+          } else m68k040.cache.DcacheByteLane.extractCross(
             splitMergeLine, alignedRspLine,
             alignedRspEntry.mergeOff, alignedRspEntry.size)
           captureCompletionDesc(alignedRspEntry.bk, merged, alignedRspEntry.size)
@@ -3601,7 +3614,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // response coincide -- that response is being poisoned anyway.  The 128-bit
     // clear costs no LUTs (it is the flops' synchronous-reset pin).
     when(sqFlushSig) {
-      splitMergeLine  := B(0, 128 bits)
+      splitMergeLine  := B(0, splitMergeLine.getWidth bits)
       splitMergeValid := False
     }
 
