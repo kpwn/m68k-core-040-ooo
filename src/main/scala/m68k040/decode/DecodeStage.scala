@@ -41,7 +41,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
                   feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
                   /** `ShippingCoreConfig.alignMaskNoRst` (CPU_ALIGN_MASK_NORST): apply the
                     * aligner's slot-1 zero-fill on the registered side of `raw`. */
-                  alignMaskNoRst: Boolean = m68k040.top.ShippingCoreConfig.alignMaskNoRst) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
+                  alignMaskNoRst: Boolean = m68k040.top.ShippingCoreConfig.alignMaskNoRst,
+                  /** `ShippingCoreConfig.immCone` (CPU_IMM_CONE): one-hot atom imm cone. */
+                  immCone: Boolean = m68k040.top.ShippingCoreConfig.immCone) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
                                        with FpImmTableService with FpTrapImmediateService
                                        with m68k040.services.DecodeRasSnapService {
 
@@ -348,8 +350,14 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // preserved.) A 3-µop SLOT1 (after a <=2-µop slot0) is likewise stashed + replayed.
     // ANGLE E: pass the REGISTERED (offloaded) per-slot OpSpec into the assembler so the
     // deep masked-pattern table is NOT re-evaluated on the post-register critical arc.
-    val a0 = MicroOpAssembler.assemble(fed.payload.packets(0), fed.payload.specs(0), fuseLongMoveLoads, feRetime)
-    val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1), fed.payload.specs(1), fuseLongMoveLoads, feRetime)
+    // CPU_IMM_CONE: the assembler's `imm` is an ImmAtoms code (decode/ImmCone.scala) and
+    // `a0Ia`/`a1Ia` hold the per-packet atoms that rebuild the 32-bit GROUP-bank values (the
+    // only consumer of the assembled `imm`, see wideImm). Flag OFF: the original assembler.
+    def asmPair(i: Int): (MicroOpAssembler.AssembledUops, ImmAtoms) =
+      if (immCone) MicroOpAssembler.assembleAtoms(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime)
+      else (MicroOpAssembler.assemble(fed.payload.packets(i), fed.payload.specs(i), fuseLongMoveLoads, feRetime), null)
+    val (a0, a0Ia)    = asmPair(0)
+    val (a1raw, a1Ia) = asmPair(1)
 
     // ── WIDE-IMMEDIATE side banks (Global.WIDE_IMM_TABLE_DEPTH) ─────────────────
     // Third member of the FP_IMM / BR_PRED side-table family, and the reason the decode
@@ -370,7 +378,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       val grpData = Bits(ImmEnc.GRP_ENTRY_W bits)
       for (pk <- 0 until 2; q <- 0 until ImmEnc.GRP_UOPS_PER_PACKET) {
         val sl = ImmEnc.grpSel(pk, q)
-        grpData(32 * sl + 31 downto 32 * sl) := (if (pk == 0) a0 else a1raw).uops(q).imm
+        val (a, ia) = if (pk == 0) (a0, a0Ia) else (a1raw, a1Ia)
+        grpData(32 * sl + 31 downto 32 * sl) := (if (immCone) ia.expand(a.uops(q).imm) else a.uops(q).imm)
       }
       // FMAX 200 MHz (t200-dec): the write is REGISTERED and lands one cycle late.
       // `grpData` is the end of the whole `assemble` imm cone out of `fed`'s payload, and
@@ -386,7 +395,22 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       // (immediate) way is compared against every live popped read below.
       val grpWrEn   = RegNext(fed.valid) init False
       val grpWrAddr = RegNext(grpTag)
-      val grpWrData = RegNext(grpData)
+      // CPU_IMM_CONE: register the three addends {A, P, K} per slot (+ each packet's pc) and do
+      // the single `A + (P ? pc : 0) + K` add AFTER this register, on the RAM DI side; the
+      // value written is the same `grpData` of cycle E, one cycle late, exactly as above.
+      // (`grpData` itself then only feeds the sim-only shadow bank.)
+      val grpWrData = if (!immCone) RegNext(grpData) else {
+        val d = Bits(ImmEnc.GRP_ENTRY_W bits)
+        for (pk <- 0 until 2) {
+          val (a, ia) = if (pk == 0) (a0, a0Ia) else (a1raw, a1Ia)
+          val pcR = RegNext(fed.payload.packets(pk).pc)
+          for (q <- 0 until ImmEnc.GRP_UOPS_PER_PACKET) {
+            val sl = ImmEnc.grpSel(pk, q)
+            d(32 * sl + 31 downto 32 * sl) := RegNext(ia.parts(a.uops(q).imm)).value(pcR)
+          }
+        }
+        d
+      }
       grpMem.write(address = grpWrAddr, data = grpWrData, enable = grpWrEn)
       when(fed.fire) { grpTag := (grpTag + 1).resized }
 

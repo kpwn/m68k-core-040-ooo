@@ -47,12 +47,12 @@ object MicroOpAssembler {
   val T2 = 18
   val T3 = 19
 
-  case class AssembledUops(withCount3: Boolean = false) extends Bundle {
+  case class AssembledUops(withCount3: Boolean = false, immW: Int = 32) extends Bundle {
     // Up to 3 µops per instruction (RTR = pop.w CCR + pop.l PC + ibranch). uops(0)
     // always valid; uops(1) iff count>=2; uops(2) iff count==3. The 3-µop case
     // (RTR) is decoded ONE-instruction-per-cycle (DecodeStage gates slot1 off) so the
     // 4-wide MicroOpQueue push never overflows (3 <= 4).
-    val uops  = Vec(DecodedUop(), 3)
+    val uops  = Vec(DecodedUop(immW), 3)
     val count = UInt(2 bits)         // 1, 2, or 3 µops valid
     // ── FP wide-immediate SIDE CHANNEL (docs/PLAN_routing_congestion_architectural.md
     // item 3). `fpImmAlloc` marks "uops(0) is an `F<op>.<fmt> #imm,FPn` uop whose 80-bit
@@ -936,10 +936,44 @@ object MicroOpAssembler {
                fuseLongMoveLoads: Boolean = false, retime: Boolean = false): AssembledUops =
     assembleImpl(pkt, Some(offIn), fuseLongMoveLoads, retime)
 
+  /** CPU_IMM_CONE form of `assemble`: every `uops(i).imm` is a one-hot ImmAtoms code
+    * (width ImmAtoms.WIDTH) and the second result is the per-packet atom registry; rebuild
+    * the 32-bit value with its `expand` (or `parts`). See decode/ImmCone.scala. */
+  def assembleAtoms(pkt: DecodePacket, offIn: Offload,
+                    fuseLongMoveLoads: Boolean, retime: Boolean): (AssembledUops, ImmAtoms) = {
+    val ia = new ImmAtoms(true)
+    (assembleImpl(pkt, Some(offIn), fuseLongMoveLoads, retime, ia), ia)
+  }
+
+  /** The GROUP-bank write data (`wideImm.grpData` in DecodeStage) for a fed pair. Used by
+    * the OOC probe; DecodeStage builds the same thing from its own a0/a1raw. */
+  def grpImmData(pk: Vec[DecodePacket], of: Vec[Offload], fuseLongMoveLoads: Boolean,
+                 retime: Boolean, immCone: Boolean): Bits = {
+    val d = Bits(ImmEnc.GRP_ENTRY_W bits)
+    for (p <- 0 until 2) {
+      val vals: Seq[Bits] =
+        if (immCone) {
+          val (a, ia) = assembleAtoms(pk(p), of(p), fuseLongMoveLoads, retime)
+          (0 until ImmEnc.GRP_UOPS_PER_PACKET).map(q => ia.expand(a.uops(q).imm))
+        } else {
+          val a = assemble(pk(p), of(p), fuseLongMoveLoads, retime)
+          (0 until ImmEnc.GRP_UOPS_PER_PACKET).map(q => a.uops(q).imm)
+        }
+      for (q <- 0 until ImmEnc.GRP_UOPS_PER_PACKET) {
+        val sl = ImmEnc.grpSel(p, q)
+        d(32 * sl + 31 downto 32 * sl) := vals(q)
+      }
+    }
+    d
+  }
+
   private def assembleImpl(pkt: DecodePacket, offIn: Option[Offload],
                            fuseLongMoveLoads: Boolean = false,
-                           retime: Boolean = false): AssembledUops = {
-    val out = AssembledUops(retime)
+                           retime: Boolean = false,
+                           ia: ImmAtoms = new ImmAtoms(false)): AssembledUops = {
+    def I(key: String)(v: => Bits): Bits = ia(key)(v)
+    ia.pc = pkt.pc
+    val out = AssembledUops(retime, ia.width)
     out.fpImmAlloc := False            // overridden ONLY by the `F<op>.<fmt> #imm,FPn` arm below
     out.fpWideImm  := B(0, 80 bits)
     val op  = pkt.words(0)
@@ -1180,7 +1214,7 @@ object MicroOpAssembler {
     val nextPc = (pkt.pc + (pkt.lenWords << 1)).resize(32)
 
     // ── opUop = the operation (EASRC operand routed to T0 when cracked) ────────
-    val opUop = DecodedUop()
+    val opUop = DecodedUop(ia.width)
     opUop.debugBreakValid := False; opUop.debugBreakSlot := 0
     opUop.fpInert()
     opUop.valid         := pkt.valid
@@ -1335,12 +1369,12 @@ object MicroOpAssembler {
         opUop.srcAValid := True
       }
       is(OperandKind.EASRC) {
-        when(srcEa.klass === EaClass.IMM) { opUop.useImm := True; opUop.imm := srcEa.imm }
+        when(srcEa.klass === EaClass.IMM) { opUop.useImm := True; opUop.imm := I("srcEaImm")(srcEa.imm) }
           .elsewhen(srcIsMem) { opUop.srcAReg := U(T0, 5 bits); opUop.srcAValid := True }
           .otherwise { opUop.srcAReg := srcEa.reg; opUop.srcAValid := True }
       }
       is(OperandKind.EADST) { opUop.srcAReg := dstEa.reg; opUop.srcAValid := True }
-      is(OperandKind.IMMQ)  { opUop.useImm := True; opUop.imm := op(7 downto 0).asSInt.resize(32).asBits }
+      is(OperandKind.IMMQ)  { opUop.useImm := True; opUop.imm := I("q8")(op(7 downto 0).asSInt.resize(32).asBits) }
       default {}
     }
 
@@ -1352,19 +1386,19 @@ object MicroOpAssembler {
         opUop.srcBValid := True
       }
       is(OperandKind.EASRC) {
-        when(srcEa.klass === EaClass.IMM) { opUop.useImm := True; opUop.imm := srcEa.imm }
+        when(srcEa.klass === EaClass.IMM) { opUop.useImm := True; opUop.imm := I("srcEaImm")(srcEa.imm) }
           .elsewhen(srcIsMem) { opUop.srcBReg := U(T0, 5 bits); opUop.srcBValid := True }
           .otherwise { opUop.srcBReg := srcEa.reg; opUop.srcBValid := True }
       }
       is(OperandKind.EADST) { opUop.srcBReg := dstEa.reg; opUop.srcBValid := True }
-      is(OperandKind.IMMQ)  { opUop.useImm := True; opUop.imm := op(7 downto 0).asSInt.resize(32).asBits }
-      is(OperandKind.IMMEXT) { opUop.useImm := True; opUop.imm := immExt }   // line-0 trailing imm word(s)
+      is(OperandKind.IMMQ)  { opUop.useImm := True; opUop.imm := I("q8")(op(7 downto 0).asSInt.resize(32).asBits) }
+      is(OperandKind.IMMEXT) { opUop.useImm := True; opUop.imm := ia.alt(immExt)(Mux(spec.size === Size.LONG, ia.a("w12")(pkt.words(1) ## pkt.words(2)), ia.a("w1s")(pkt.words(1).asSInt.resize(32).asBits))) }   // line-0 trailing imm word(s)
       is(OperandKind.IMMQ3) {
         // ADDQ/SUBQ quick immediate: ddd = op[11:9], 1-8 with ddd==0 -> 8. Always
         // POSITIVE (1-8), zero-extended (the An full-32 path adds/subtracts it whole).
         val ddd = op(11 downto 9).asUInt
         opUop.useImm := True
-        opUop.imm    := Mux(ddd === 0, U(8, 4 bits), ddd.resize(4)).resize(32).asBits
+        opUop.imm    := I("q3")(Mux(ddd === 0, U(8, 4 bits), ddd.resize(4)).resize(32).asBits)
       }
       default {}
     }
@@ -1427,7 +1461,7 @@ object MicroOpAssembler {
         // immediate count: ccc 1..8, with ccc==0 -> 8.
         val cnt = Mux(ccc === 0, U(8, 6 bits), ccc.resize(6))
         opUop.useImm := True
-        opUop.imm    := cnt.resize(32).asBits
+        opUop.imm    := I("q3")(cnt.resize(32).asBits)
         opUop.srcBValid := False
       } otherwise {
         // register count: srcB = Dc (op[11:9]); the EU masks to 6 bits.
@@ -1443,7 +1477,7 @@ object MicroOpAssembler {
     // bit; there is no register/immediate count operand at this encoding.
     when(spec.op === DecOp.SHIFT && (spec.dst.kind === OperandKind.EASRC)) {
       opUop.useImm    := True
-      opUop.imm       := U(1, 32 bits).asBits
+      opUop.imm       := ia.alt(U(1, 32 bits).asBits)(ia.k("c1")(U(1, 32 bits).asBits))
       opUop.srcBValid := False
     }
 
@@ -1456,7 +1490,7 @@ object MicroOpAssembler {
     val packUnpkReg = (spec.op === DecOp.PACK) || (spec.op === DecOp.UNPK)
     when(packUnpkReg) {
       opUop.useImm := True
-      opUop.imm    := pkt.words(1).resize(16).asSInt.resize(32).asBits  // adj16, sign-extended
+      opUop.imm    := I("w1s")(pkt.words(1).resize(16).asSInt.resize(32).asBits)  // adj16, sign-extended
     }
 
     // ── Bit-field register form operand routing (DecOp.BITFIELD) ────────────────
@@ -1498,7 +1532,7 @@ object MicroOpAssembler {
       // µop into T0, read here via srcC; flag bfDynamic so the EU takes srcC[9:0] (NOT
       // imm). srcA=Dy / srcB=Dn2 (BFINS) unchanged. (BFINS-dynamic = Dy+Dn2+T0 = 3 srcs.)
       opUop.useImm := True
-      opUop.imm    := (B(0, 22 bits) ## wd5 ## off5).resize(32)
+      opUop.imm    := I("bfStatic")((B(0, 22 bits) ## wd5 ## off5).resize(32))
       when(bfDyn) {
         opUop.bfDynamic := True
         opUop.srcCReg   := U(T0, 5 bits); opUop.srcCValid := True
@@ -1585,20 +1619,20 @@ object MicroOpAssembler {
         // (`r.readsFpcc := dec.readsFpcc`, `r.pFpccSrc := fpccRat...`), and BranchEu
         // selects the FP predicate table on it.
         opUop.readsFpcc := True
-        when(op(6)) { opUop.imm := pkt.words(1) ## pkt.words(2) }   // FBcc.L
-          .otherwise { opUop.imm := pkt.words(1).asSInt.resize(32).asBits }  // FBcc.W
+        when(op(6)) { opUop.imm := I("w12")(pkt.words(1) ## pkt.words(2)) }   // FBcc.L
+          .otherwise { opUop.imm := I("w1s")(pkt.words(1).asSInt.resize(32).asBits) }  // FBcc.W
       } .otherwise {
         val disp8 = op(7 downto 0)
-        when(disp8 === 0x00) { opUop.imm := pkt.words(1).asSInt.resize(32).asBits }
-          .elsewhen(disp8 === M"11111111") { opUop.imm := pkt.words(1) ## pkt.words(2) }
-          .otherwise { opUop.imm := disp8.asSInt.resize(32).asBits }
+        when(disp8 === 0x00) { opUop.imm := I("w1s")(pkt.words(1).asSInt.resize(32).asBits) }
+          .elsewhen(disp8 === M"11111111") { opUop.imm := I("w12")(pkt.words(1) ## pkt.words(2)) }
+          .otherwise { opUop.imm := I("q8")(disp8.asSInt.resize(32).asBits) }
       }
     }
 
     // ── ldUop = the LOAD (used only when crackLoad) ────────────────────────────
     // Address = base An (psrcA) + disp(imm); for (d16,PC) the PC is folded into the
     // absolute disp (base=0). dst = T0.
-    val ldUop = DecodedUop()
+    val ldUop = DecodedUop(ia.width)
     ldUop.debugBreakValid := False; ldUop.debugBreakSlot := 0
     ldUop.fpInert()
     ldUop.valid         := pkt.valid
@@ -1673,7 +1707,10 @@ object MicroOpAssembler {
     // the imm word(s)).
     val pcRelAddr = (pkt.pc + U(2, 32 bits) + (pcRelImmShiftWords << 1).resize(32 bits) +
                       rmwEaDisp.asUInt).asBits
-    ldUop.imm           := Mux(srcEaPcRelEff, pcRelAddr, rmwEaDisp)
+    ldUop.imm           := Mux(srcEaPcRelEff,
+      ia.alt(pcRelAddr)(ia.a("rmwEaDisp")(rmwEaDisp) | ia.p |
+        ia.k("kPcRelLd")((U(2, 32 bits) + (pcRelImmShiftWords << 1).resize(32 bits)).asBits)),
+      I("rmwEaDisp")(rmwEaDisp))
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
     ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.isReturn := False; ldUop.isCall := False; ldUop.ccrRestore := False; ldUop.toCcr := False; ldUop.cond := 0
@@ -1719,7 +1756,7 @@ object MicroOpAssembler {
     // a renamed NZVC dest; the LS EU computes N/Z of the store data at the access size
     // and writes the NZVC PRF (+ bypass) at completion. (MOVEA — to an address reg —
     // never reaches here: an address-reg dst is not memSimple.)
-    val stUop = DecodedUop()
+    val stUop = DecodedUop(ia.width)
     stUop.debugBreakValid := False; stUop.debugBreakSlot := 0
     stUop.fpInert()
     stUop.valid         := pkt.valid
@@ -1750,7 +1787,9 @@ object MicroOpAssembler {
     stUop.dstReg        := stDstEa.base; stUop.dstValid  := dstAuto
     stUop.useImm        := True
     val stPcRelAddr = (pkt.pc + U(2, 32 bits) + stDstEa.disp.asUInt).asBits
-    stUop.imm           := Mux(stDstEa.pcRel, stPcRelAddr, stDstEa.disp)
+    stUop.imm           := Mux(stDstEa.pcRel,
+      ia.alt(stPcRelAddr)(ia.a("stDstEaDisp")(stDstEa.disp) | ia.p | ia.k("c2")(B(2, 32 bits))),
+      I("stDstEaDisp")(stDstEa.disp))
     stUop.readsNzvc     := False; stUop.readsX := False
     stUop.writesNzvc    := True;  stUop.writesX := False   // MOVE to memory sets NZVC
     stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.isReturn := False; stUop.isCall := False; stUop.ccrRestore := False; stUop.toCcr := False; stUop.cond := 0
@@ -1786,7 +1825,7 @@ object MicroOpAssembler {
     // The EA is op[5:0] = `srcEa` (the SAME descriptor the load used — MEMSIMPLE has no
     // side effect, so base+disp recompute identically). data = T1 (the op result). NO
     // int dst, NO flags (the op µop owns NZVCX). firstOfInstr=False (a trailing µop).
-    val rmwStUop = DecodedUop()
+    val rmwStUop = DecodedUop(ia.width)
     rmwStUop.debugBreakValid := False; rmwStUop.debugBreakSlot := 0
     rmwStUop.fpInert()
     rmwStUop.valid         := pkt.valid
@@ -1822,7 +1861,9 @@ object MicroOpAssembler {
     rmwStUop.useImm        := True
     // Same EA as the load (MEMSIMPLE recompute): rmwEaDisp (immEa for a line-0 immediate).
     val rmwStPcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
-    rmwStUop.imm           := Mux(srcEa.pcRel, rmwStPcRelAddr, rmwEaDisp)
+    rmwStUop.imm           := Mux(srcEa.pcRel,
+      ia.alt(rmwStPcRelAddr)(ia.a("srcEaDisp")(srcEa.disp) | ia.p | ia.k("c2")(B(2, 32 bits))),
+      I("rmwEaDisp")(rmwEaDisp))
     rmwStUop.readsNzvc     := False; rmwStUop.readsX := False
     rmwStUop.writesNzvc    := False; rmwStUop.writesX := False   // the op µop owns the flags
     rmwStUop.isBranch      := False; rmwStUop.ibranch := False; rmwStUop.stkPush := False; rmwStUop.anInc := 0; rmwStUop.isReturn := False; rmwStUop.isCall := False; rmwStUop.ccrRestore := False; rmwStUop.toCcr := False; rmwStUop.cond := 0
@@ -2472,7 +2513,7 @@ object MicroOpAssembler {
         opUop.writesFp   := True
         opUop.srcAValid  := False; opUop.srcBValid := False
         opUop.useImm     := True
-        opUop.imm        := fpOpmode.resize(32)
+        opUop.imm        := I("fpOpmode")(fpOpmode.resize(32))
         opUop.size       := Size.LONG
       } .elsewhen(fpFormIsReg) {
         // F<op> FPm,FPn: the source is FP register FPm (ext[12:10]).
@@ -2577,7 +2618,7 @@ object MicroOpAssembler {
       opUop.fpSrcKind  := FpSrcKind.FPREG   // inert: this op has no FpuCore source gateway
       opUop.fpSrcFmt   := fpSrcSpec         // ext[12:10] = the DESTINATION format
       // The chunk index rides imm[1:0]; every register-direct format is a single chunk.
-      opUop.useImm := True; opUop.imm := U(0, 32 bits).asBits
+      opUop.useImm := True; opUop.imm := ia.zero
       // `.W`/`.B` read the old Dn back as the partial-write merge source.
       opUop.srcAReg   := fpEaReg.resize(5)
       opUop.srcAValid := fpStoreRegMerge
@@ -2668,7 +2709,7 @@ object MicroOpAssembler {
       opUop.sysKind    := SysKind.FMOVE_FPCTRL
       opUop.sysReadDir := fpCtrlIsFrom      // True = FPcr -> Rn
       opUop.firstOfInstr := True            // a single uop: it IS the macro boundary
-      opUop.imm    := fpSrcSpec.resize(32)  // one-hot mask in imm[2:0] (NOT useImm)
+      opUop.imm    := I("fpSrcSpec")(fpSrcSpec.resize(32))  // one-hot mask in imm[2:0] (NOT useImm)
       opUop.useImm := False
       opUop.srcAValid := False; opUop.srcBValid := False
       // <ea> mode 000 = Dn (arch id 0..7), mode 001 = An (arch id 8..15).
@@ -2827,7 +2868,7 @@ object MicroOpAssembler {
         // a MOVE whose result = srcB = Rn), while the ROB reads imm[11:0] for the Rc
         // directly. Keeping useImm=False is REQUIRED so the IQ treats srcB as a REGISTER
         // source (srcBIsReg gates on !useImm) -> the Rn dependency is woken correctly.
-        opUop.imm := rc.resize(32)              // Rc id in imm[11:0] (NOT useImm)
+        opUop.imm := I("movecRc")(rc.resize(32))              // Rc id in imm[11:0] (NOT useImm)
         opUop.useImm := False
         opUop.srcAValid := False; opUop.srcBValid := False
         when(spec.sysReadDir) {                 // 0x4E7A Rc -> Rn: dst = Rn
@@ -2872,7 +2913,7 @@ object MicroOpAssembler {
         opUop.op := DecOp.MOVE
         opUop.srcAValid := False; opUop.srcBValid := False; opUop.dstValid := False
         opUop.useImm := True
-        opUop.imm := pkt.words(1).asUInt.resize(32).asBits   // imm16 -> new SR (zero-ext)
+        opUop.imm := I("w1z")(pkt.words(1).asUInt.resize(32).asBits)   // imm16 -> new SR (zero-ext)
       }
       // CPUSH/CINV: route An like PTEST does (srcB -> EU result -> sysValStore, so
       // S_APPLY has the address) + pack {scope,cacheSel} into imm[3:0] via the SAME
@@ -2890,7 +2931,7 @@ object MicroOpAssembler {
         opUop.srcAValid := False
         opUop.dstValid := False
         opUop.useImm := False   // srcB is a REAL register read (An), like MOVEC/PTEST
-        opUop.imm := (op(4 downto 3) ## op(7 downto 6)).resize(32)
+        opUop.imm := I("maint")((op(4 downto 3) ## op(7 downto 6)).resize(32))
       }
       // PFLUSHA: no operands (opword-only), the flushAll pulse fires from S_APPLY
       // regardless of any register content.
@@ -2948,8 +2989,8 @@ object MicroOpAssembler {
         // Report mode 010 ((An)) to the FSM on the computed-address path: by then T0 HOLDS
         // the final address, so the frame walk is a plain base-register walk with no
         // auto-update. That is a shape the FSM already implements, so it needs no change.
-        opUop.imm       := (Mux(fsvNeedsEa, B"3'b010", op(5 downto 3)) ##
-                            fsvIsRest.asBits).resize(32)
+        opUop.imm       := I("fsave")((Mux(fsvNeedsEa, B"3'b010", op(5 downto 3)) ##
+                            fsvIsRest.asBits).resize(32))
         opUop.dstReg    := fsvAn
         opUop.dstValid  := fsvAuto        // only -(An)/(An)+ write An back
         opUop.isMovea   := True    // An destination: full-32 write, no partial merge
@@ -2991,7 +3032,8 @@ object MicroOpAssembler {
     // predicate table there, as for FBcc/FScc).  Only cc[3:0] is carried -- 0x10..0x1F are
     // the truth-identical signaling spellings.
     when(isFDbccOp) {
-      dbccUop(fsccCond, fsccReg5.resize(5), (pkt.words(2).asSInt.resize(32) + 2).asBits, fromFpcc = true)
+      dbccUop(fsccCond, fsccReg5.resize(5), ia.alt((pkt.words(2).asSInt.resize(32) + 2).asBits)(
+        ia.a("w2s")(pkt.words(2).asSInt.resize(32).asBits) | ia.k("c2")(B(2, 32 bits))), fromFpcc = true)
     }
     when(isFTrapccOp) {
       condTrap(fsccCond, fromFpcc = true)
@@ -3059,7 +3101,7 @@ object MicroOpAssembler {
     // = Mux(cond, Dn, {Dn[31:16], Dn[15:0]-1})); redirect = `!cond && (decW != -1)` to
     // pc+2+disp (the branch EU's relTarget). cond = cccc (DBRA/DBF = cccc=F=1). NO flags.
     when(isDbccOp) {
-      dbccUop(cccc5, rrr5, pkt.words(1).asSInt.resize(32).asBits)
+      dbccUop(cccc5, rrr5, I("w1s")(pkt.words(1).asSInt.resize(32).asBits))
     }
 
     // ── INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault) ─────────
@@ -3107,7 +3149,7 @@ object MicroOpAssembler {
     // the EA's OWN ext word starts one word later than the "plain EA-first"
     // convention — identical shape to CMP2/CHK2/the bit-field memory crack below.
     def divMulLoadUop(ea: EaSpec): DecodedUop = {
-      val u = DecodedUop()
+      val u = DecodedUop(ia.width)
       u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
@@ -3122,7 +3164,9 @@ object MicroOpAssembler {
       u.srcCReg     := ea.indexReg; u.srcCValid := ea.indexValid
       u.dstReg      := U(T0, 5 bits); u.dstValid := True
       u.useImm      := True
-      u.imm         := Mux(ea.pcRel, (pkt.pc + U(4, 32 bits) + ea.disp.asUInt).asBits, ea.disp)
+      u.imm         := Mux(ea.pcRel,
+        ia.alt((pkt.pc + U(4, 32 bits) + ea.disp.asUInt).asBits)(ia.a("ext1Disp")(ea.disp) | ia.p | ia.k("c4")(B(4, 32 bits))),
+        I("ext1Disp")(ea.disp))
       u.readsNzvc   := False; u.readsX := False
       u.writesNzvc  := False; u.writesX := False
       u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
@@ -3175,7 +3219,7 @@ object MicroOpAssembler {
     val divlHasRem = divl64 || (divlDr =/= divlDq)
 
     // DIV (quotient) µop.
-    val divlUop = DecodedUop()
+    val divlUop = DecodedUop(ia.width)
     divlUop.debugBreakValid := False; divlUop.debugBreakSlot := 0
     divlUop.fpInert()
     divlUop.valid         := pkt.valid
@@ -3189,7 +3233,7 @@ object MicroOpAssembler {
     // divisor: reg -> srcB; imm -> useImm; mem -> T0 (cracked load).
     when(divlDivisorIsImm) {
       divlUop.srcBReg := 0; divlUop.srcBValid := False
-      divlUop.useImm  := True; divlUop.imm := divlSrcEa.imm
+      divlUop.useImm  := True; divlUop.imm := I("ext1ImmL")(divlSrcEa.imm)
     } elsewhen(divlDivisorIsMem) {
       divlUop.srcBReg := U(T0, 5 bits); divlUop.srcBValid := True
       divlUop.useImm  := False; divlUop.imm := 0
@@ -3236,7 +3280,7 @@ object MicroOpAssembler {
     // (not just Dq) is preserved. The remainder itself (the non-overflow case) still
     // comes from the DivEu's internal latch, not this register read -- srcA exists
     // SOLELY to carry the old value through on the overflow path.
-    val divremUop = DecodedUop()
+    val divremUop = DecodedUop(ia.width)
     divremUop.debugBreakValid := False; divremUop.debugBreakSlot := 0
     divremUop.fpInert()
     divremUop.valid         := pkt.valid
@@ -3358,7 +3402,7 @@ object MicroOpAssembler {
     val mullMulIsMem = mullSrcEa.klass === EaClass.MEMSIMPLE
 
     // MUL (low-product) µop. Writes Dl. Sets N/Z (+ V for the .L32 form).
-    val mullUop = DecodedUop()
+    val mullUop = DecodedUop(ia.width)
     mullUop.debugBreakValid := False; mullUop.debugBreakSlot := 0
     mullUop.fpInert()
     mullUop.valid         := pkt.valid
@@ -3371,7 +3415,7 @@ object MicroOpAssembler {
     mullUop.srcAReg       := mullDl; mullUop.srcAValid := True              // multiplicand (Dl)
     when(mullMulIsImm) {
       mullUop.srcBReg := 0; mullUop.srcBValid := False
-      mullUop.useImm  := True; mullUop.imm := mullSrcEa.imm
+      mullUop.useImm  := True; mullUop.imm := I("ext1ImmL")(mullSrcEa.imm)
     } elsewhen(mullMulIsMem) {
       mullUop.srcBReg := U(T0, 5 bits); mullUop.srcBValid := True
       mullUop.useImm  := False; mullUop.imm := 0
@@ -3426,7 +3470,7 @@ object MicroOpAssembler {
     // as-is (it is harmless and this is not the place to re-open the reg/imm
     // regression), but it is NOT what makes MULHI correct.
     // Writes Dh; sets no flags (the MUL set N/Z; V=0).
-    val mulhiUop = DecodedUop()
+    val mulhiUop = DecodedUop(ia.width)
     mulhiUop.debugBreakValid := False; mulhiUop.debugBreakSlot := 0
     mulhiUop.fpInert()
     mulhiUop.valid         := pkt.valid
@@ -3528,7 +3572,7 @@ object MicroOpAssembler {
     val bfmImm = (B(0, 13 bits) ## bfmOffset5.asBits.resize(5) ## bfmNeedHi ## bfmBitOff.asBits.resize(3) ##
                   bfmWidthRaw.asBits.resize(5) ## B(0, 5 bits)).resize(32)
     def bfmLoadUop(disp: Bits, dst: Int, size: Size.C, first: Bool): DecodedUop = {
-      val u = DecodedUop()
+      val u = DecodedUop(ia.width)
       u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
@@ -3565,13 +3609,20 @@ object MicroOpAssembler {
       u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
     }
-    val bfmLoadLo = bfmLoadUop(bfmDispLo, T0, Size.LONG, first = True)   // misaligned LONG `lo`
-    val bfmLoadHi = bfmLoadUop(bfmDispHi, T1, Size.BYTE, first = False)  // spill byte `hi`
+    // CPU_IMM_CONE: lo = disp + byteOff (+ pc + 4 when pcRel), hi = lo + 4.
+    def bfmCode(pcK: Int, k: Int): Bits = {
+      val d = ia.a("ext1Disp")(bfmEaDec.disp)
+      Mux(bfmEaDec.pcRel,
+        d | ia.p | ia.k(s"kBfm$pcK")((U(pcK, 32 bits) + bfmByteOff).asBits),
+        d | ia.k(s"kBfm$k")((U(k, 32 bits) + bfmByteOff).asBits))
+    }
+    val bfmLoadLo = bfmLoadUop(ia.alt(bfmDispLo)(bfmCode(4, 0)), T0, Size.LONG, first = True)   // misaligned LONG `lo`
+    val bfmLoadHi = bfmLoadUop(ia.alt(bfmDispHi)(bfmCode(8, 4)), T1, Size.BYTE, first = False)  // spill byte `hi`
     // The BITFIELD bfMem compute µop (the macro architectural commit): srcA=T0, srcB=T1
     // (valid iff needHi), dst=Dn2 for EXTU/EXTS/FFO, none for BFTST.
     val bfmIsExtFfo = (bfmBfOp === 1) || (bfmBfOp === 3) || (bfmBfOp === 5)
     val bfmCompute = {
-      val u = DecodedUop()
+      val u = DecodedUop(ia.width)
       u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
@@ -3586,7 +3637,7 @@ object MicroOpAssembler {
       u.srcCReg     := 0;             u.srcCValid := False
       when(bfmIsExtFfo) { u.dstReg := bfmDn2; u.dstValid := True }
         .otherwise      { u.dstReg := 0;      u.dstValid := False }   // BFTST: no write
-      u.useImm      := True; u.imm := bfmImm
+      u.useImm      := True; u.imm := I("bfmImm")(bfmImm)
       u.readsNzvc   := False; u.readsX := False
       u.writesNzvc  := True;  u.writesX := False                       // NZ only (V=C=0, X untouched)
       u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
@@ -3666,7 +3717,7 @@ object MicroOpAssembler {
                                      (c2SrcEa.disp.asSInt + c2SizeBytes.asSInt).asBits)
     // Common load builder (every field once): addr = base + disp + index, -> dst.
     def c2LoadUop(disp: Bits, dst: Int, first: Bool): DecodedUop = {
-      val u = DecodedUop()
+      val u = DecodedUop(ia.width)
       u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
@@ -3703,13 +3754,16 @@ object MicroOpAssembler {
       u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
     }
-    val c2Load0 = c2LoadUop(c2Disp1, T0, first = True)       // lower @ [EA]
-    val c2Load1 = c2LoadUop(c2Disp2, T1, first = False)      // upper @ [EA+size]
+    def c2D = ia.a("ext1Disp")(c2SrcEa.disp)
+    val c2Load0 = c2LoadUop(ia.alt(c2Disp1)(Mux(c2SrcEa.pcRel, c2D | ia.p | ia.k("c4")(B(4, 32 bits)), c2D)), T0, first = True)       // lower @ [EA]
+    val c2Load1 = c2LoadUop(ia.alt(c2Disp2)(Mux(c2SrcEa.pcRel,
+                    c2D | ia.p | ia.k("kC2pc")((U(4, 32 bits) + c2SizeBytes).asBits),
+                    c2D | ia.k("kC2")(c2SizeBytes.asBits))), T1, first = False)      // upper @ [EA+size]
     // Compare µop (CPLX/DivEu): srcA=T0(lower), srcB=T1(upper), srcC=Rn (psrcC). The EU
     // computes Z/C per Musashi + the {oldN,Z,oldV,C} CCR RMW; CHK2 raises EuFault{vec6}
     // on out-of-bounds C. reads+writes NZVC (preserve N/V); no int dst.
     val c2Cmp = {
-      val u = DecodedUop()
+      val u = DecodedUop(ia.width)
       u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
@@ -3795,7 +3849,7 @@ object MicroOpAssembler {
         isJsrOp && !jsrBad && srcEa.indexValid && (srcEa.indexReg === U(15, 5 bits))
     val jsrNeedsSnap = isJsrOp && !jsrBad && srcEa.baseValid && !brIdxCrack &&
                        (srcEa.base === U(15, 5 bits))   // 15 = A7
-    val ibrUop = DecodedUop()
+    val ibrUop = DecodedUop(ia.width)
     ibrUop.debugBreakValid := False; ibrUop.debugBreakSlot := 0
     ibrUop.fpInert()
     ibrUop.valid         := pkt.valid
@@ -3816,7 +3870,7 @@ object MicroOpAssembler {
     ibrUop.srcCValid     := (if (m68k040.top.ShippingCoreConfig.prfTrimBrIdx) False else srcEa.indexValid && !brIdxCrack)
     ibrUop.dstReg        := 0;          ibrUop.dstValid  := False
     ibrUop.useImm        := True
-    ibrUop.imm           := Mux(brIdxCrack, B(0, 32 bits), Mux(srcEa.pcRel, ctrlPcRelAddr, srcEa.disp))
+    ibrUop.imm           := Mux(brIdxCrack, ia.zero, Mux(srcEa.pcRel, ia.alt(ctrlPcRelAddr)(ia.a("srcEaDisp")(srcEa.disp) | ia.p | ia.k("c2")(B(2, 32 bits))), I("srcEaDisp")(srcEa.disp)))
     ibrUop.readsNzvc     := False; ibrUop.readsX := False
     ibrUop.writesNzvc    := False; ibrUop.writesX := False
     ibrUop.isBranch      := True;  ibrUop.ibranch := True
@@ -3858,7 +3912,7 @@ object MicroOpAssembler {
               srcAReg: UInt = U(0, 5 bits), srcAValid: Bool = False,
               srcBReg: UInt = U(0, 5 bits), srcBValid: Bool = False,
               dstReg: UInt = U(0, 5 bits),  dstValid: Bool = False,
-              useImm: Bool = False, imm: Bits = B(0, 32 bits),
+              useImm: Bool = False, imm: Bits = ia.zero,
               isBranch: Bool = False, ibranch: Bool = False, stkPush: Bool = False,
               anInc: UInt = U(0, 3 bits), cond: Bits = B(0, 4 bits),
               first: Bool = True,
@@ -3868,7 +3922,7 @@ object MicroOpAssembler {
               eaAuto: EaAuto.C = EaAuto.NONE, eaDelta: UInt = U(0, 3 bits),
               keepCommit: Bool = False, movesAliasStore: Bool = False,
               isReturn: Bool = False, isCall: Bool = False): DecodedUop = {
-      val u = DecodedUop()
+      val u = DecodedUop(ia.width)
       u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid := pkt.valid; u.pc := pkt.pc; u.lenWords := pkt.lenWords
@@ -3915,12 +3969,13 @@ object MicroOpAssembler {
       mkUop(cluster = Cluster.LS, memOp = MemOp.STORE, stkPush = True,
             srcAReg = U(an, 5 bits), srcAValid = True,    // base An (A7)
             dstReg  = U(an, 5 bits), dstValid  = True,    // new A7 = A7-4
-            useImm  = True, imm = retPc, first = first)   // store data = retPC
+            useImm  = True, imm = ia.alt(retPc)(ia.p | ia.k("kLen")((pkt.lenWords << 1).resize(32).asBits)),
+            first = first)   // store data = retPC (always nextPc = pc + 2*len)
     // POP-load µop: load.l (An + disp) -> a temp dst.
     def popUop(an: Int, disp: Int, dst: Int, first: Bool): DecodedUop =
       mkUop(cluster = Cluster.LS, memOp = MemOp.LOAD,
             srcAReg = U(an, 5 bits), srcAValid = True,
-            useImm  = True, imm = S(disp, 32 bits).asBits,
+            useImm  = True, imm = (if (disp == 0) ia.zero else ia.alt(S(disp, 32 bits).asBits)(ia.k(s"c$disp")(S(disp, 32 bits).asBits))),
             dstReg  = U(dst, 5 bits), dstValid = True, first = first)
     // RETURN ibranch: ibranch -> tgt (psrcA + 0), folding An += inc (psrcB=An, dst=An,
     // anInc=inc). Used by RTS/RTR. isReturn=True: BTB/FTB training exclusion (task
@@ -3929,7 +3984,7 @@ object MicroOpAssembler {
     def retBranchUop(tgt: Int, an: Int, inc: Int): DecodedUop =
       mkUop(isBranch = True, ibranch = True,
             srcAReg = U(tgt, 5 bits), srcAValid = True,   // target = tgt + 0
-            useImm  = True, imm = B(0, 32 bits),
+            useImm  = True, imm = ia.zero,
             srcBReg = U(an, 5 bits),  srcBValid = True,    // postinc base = An
             dstReg  = U(an, 5 bits),  dstValid = True,     // new A7 = A7 + inc
             isReturn = True,
@@ -3950,7 +4005,9 @@ object MicroOpAssembler {
     // earlier `bsrPush` -- and the branch EU needs it to let a flush re-apply the
     // fetch-time RAS push (RasPlugin `branchRepair`). JSR's half is on `ibrUop`.
     val bsrBranch = mkUop(isBranch = True, cond = B(0, 4 bits),    // unconditional BRA
-                          useImm = False, imm = bsrDisp, first = False, isCall = True)
+                          useImm = False, imm = ia.alt(bsrDisp)(Mux(op(7 downto 0) === 0x00, ia.a("w1s")(pkt.words(1).asSInt.resize(32).asBits),
+                            Mux(op(7 downto 0) === M"11111111", ia.a("w12")(pkt.words(1) ## pkt.words(2)),
+                                ia.a("q8")(op(7 downto 0).asSInt.resize(32).asBits)))), first = False, isCall = True)
 
     // ── RTS (0x4E75) — crack into [load.l (A7) -> T0] + [ibranch -> T0 ; A7 += 4]. ─
     // The pop load reads (A7) into T0 (a temp); the trailing ibranch redirects to T0
@@ -3968,9 +4025,10 @@ object MicroOpAssembler {
     // JMP's target. (No An postinc — JSR does not pop.)
     // With the JSR (A7) snapshot prepended, the SNAPSHOT is the instruction's first uop.
     val jsrPush = pushUop(A7, nextPc.asBits, first = !jsrNeedsSnap && !brIdxCrack)
-    val jsrSnap = movemSnapUop(
+    val jsrSnap0 = movemSnapUop(
       dst = U(T0, 5 bits), src = U(A7, 5 bits), valid = pkt.valid,
       pc = pkt.pc, lenWords = pkt.lenWords)
+    val jsrSnap = if (ia.enabled) DecodedUop.withImm(jsrSnap0, ia.zero) else jsrSnap0
 
     // ── RTR (0x4E77) — pop CCR (word) then PC (long); restore CCR; A7 += 6. ─────────
     // Crack: [load.w (A7) -> CCR restore (NZVC:=d[3:0], X:=d[4])] + [load.l (A7+2) -> T0]
@@ -3981,7 +4039,7 @@ object MicroOpAssembler {
     val isRtrOp   = spec.form === OpForm.RTR
     val rtrCcr    = mkUop(cluster = Cluster.LS, memOp = MemOp.LOAD, size = Size.WORD,
                           srcAReg = U(A7, 5 bits), srcAValid = True,
-                          useImm = True, imm = B(0, 32 bits),
+                          useImm = True, imm = ia.zero,
                           ccrRestore = True, writesNzvc = True, writesX = True, first = True)
     val rtrPc     = popUop(A7, disp = 2, dst = T0, first = False)   // PC at (A7+2)
     val rtrBranch = retBranchUop(tgt = T0, an = A7, inc = 6)
@@ -4028,10 +4086,10 @@ object MicroOpAssembler {
     val rtdDisp   = pkt.words(1).asSInt.resize(32)
     val rtdDealloc= (S(4, 32 bits) + rtdDisp).asBits          // 4 + disp16
     val rtdLoad   = popUop(A7, disp = 0, dst = T0, first = True)
-    val rtdA7     = addUop(U(A7, 5 bits), rtdDealloc, U(A7, 5 bits), first = False, drop = True)
+    val rtdA7     = addUop(U(A7, 5 bits), ia.alt(rtdDealloc)(ia.a("w1s")(pkt.words(1).asSInt.resize(32).asBits) | ia.k("c4")(B(4, 32 bits))), U(A7, 5 bits), first = False, drop = True)
     val rtdBranch = mkUop(isBranch = True, ibranch = True,
                           srcAReg = U(T0, 5 bits), srcAValid = True,   // target = T0 + 0
-                          useImm  = True, imm = B(0, 32 bits), first = False,
+                          useImm  = True, imm = ia.zero, first = False,
                           isReturn = True)
 
     // LINK An,#disp16 — [stkPush store dst=An, push old An] + [A7 := A7+disp (drop)]
@@ -4061,17 +4119,17 @@ object MicroOpAssembler {
                          dstReg  = U(A7, 5 bits), dstValid  = True,    // A7 := A7-4
                          first = True,
                          movesAliasStore = linkIsA7)  // An==A7: push the computed EA, not srcB
-    val linkA7  = addUop(U(A7, 5 bits), linkDisp.asBits, U(A7, 5 bits), first = False, drop = True)
-    val linkAnU = addUop(U(A7, 5 bits), Mux(linkIsA7, B(0, 32 bits), negDisp), linkAn, first = False, drop = False)
+    val linkA7  = addUop(U(A7, 5 bits), ia.alt(linkDisp.asBits)(Mux(isLinkLOp, ia.a("w12")(pkt.words(1) ## pkt.words(2)), ia.a("w1s")(pkt.words(1).asSInt.resize(32).asBits))), U(A7, 5 bits), first = False, drop = True)
+    val linkAnU = addUop(U(A7, 5 bits), Mux(linkIsA7, ia.zero, I("negDisp")(negDisp)), linkAn, first = False, drop = False)
 
     // UNLK An — [load.l (An) -> T0] + [A7 := An+4 (drop)] + [An := T0 (kept MOVE)].
     // load.l (An + 0) -> T0 (the saved frame value). An is a hardware UInt (not a Scala
     // Int), so build the load directly via mkUop rather than the Int-keyed popUop.
     val unlkLoad = mkUop(cluster = Cluster.LS, memOp = MemOp.LOAD,
                          srcAReg = linkAn, srcAValid = True,
-                         useImm = True, imm = B(0, 32 bits),
+                         useImm = True, imm = ia.zero,
                          dstReg = U(T0, 5 bits), dstValid = True, first = True)
-    val unlkA7   = addUop(linkAn, B(4, 32 bits), U(A7, 5 bits), first = False, drop = True)
+    val unlkA7   = addUop(linkAn, ia.alt(B(4, 32 bits))(ia.k("c4")(B(4, 32 bits))), U(A7, 5 bits), first = False, drop = True)
     // MOVE T0 -> An: the ALU MOVE takes its moved value from src2 (= srcB), NOT srcA
     // (srcA is the .B/.W partial-merge OLD-value source). LONG move -> no merge, srcB only.
     val unlkAn   = mkUop(srcBReg = U(T0, 5 bits), srcBValid = True,        // MOVE T0 -> An
@@ -4111,7 +4169,7 @@ object MicroOpAssembler {
     val srcAnReg   = srcEa.base
     val srcDelta32 = srcEaDelta.resize(32).asSInt
     val srcAnImm   = Mux(srcEa.autoMode === EaAuto.PREDEC, (-srcDelta32).asBits, srcDelta32.asBits)
-    val anUpdUop   = addUop(srcAnReg, srcAnImm, srcAnReg, first = False, drop = True)
+    val anUpdUop   = addUop(srcAnReg, I("srcAnImm")(srcAnImm), srcAnReg, first = False, drop = True)
 
     // ── Sequence selection (each slot driven exactly once) ─────────────────────
     // pkt.fault  -> [op] (fetch fault delivery)
@@ -4131,7 +4189,7 @@ object MicroOpAssembler {
     // (every field once) so no mkUop-overlap. `leaDst`/`leaFirst` parameterize LEA vs PEA.
     val ctrlEaPcRel = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
     def leaGenUop(leaDst: UInt, leaFirst: Bool): DecodedUop = {
-      val u = DecodedUop()
+      val u = DecodedUop(ia.width)
       u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
@@ -4146,7 +4204,7 @@ object MicroOpAssembler {
       u.srcCReg     := srcEa.indexReg; u.srcCValid := srcEa.indexValid // index Xn (AGU)
       u.dstReg      := leaDst;     u.dstValid  := True
       u.useImm      := True
-      u.imm         := Mux(srcEa.pcRel, ctrlEaPcRel, srcEa.disp)        // disp / folded abs / folded pc
+      u.imm         := Mux(srcEa.pcRel, ia.alt(ctrlEaPcRel)(ia.a("srcEaDisp")(srcEa.disp) | ia.p | ia.k("c2")(B(2, 32 bits))), I("srcEaDisp")(srcEa.disp))        // disp / folded abs / folded pc
       u.readsNzvc   := False; u.readsX := False
       u.writesNzvc  := False; u.writesX := False
       u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
@@ -4208,7 +4266,7 @@ object MicroOpAssembler {
       srcAReg = bfOffDn, srcAValid = bfDo,
       srcBReg = bfWdDn,  srcBValid = bfDw,
       dstReg  = U(T0, 5 bits), dstValid = True,
-      useImm = True, imm = bfResImm, first = True)
+      useImm = True, imm = I("bfResImm")(bfResImm), first = True)
 
     // Default the 3rd µop slot (only RTR uses it) so every path drives uops(2) once.
     // `FMOVE.L #imm,FPcr` staging uop: MOVE.L #imm -> T0. Plain integer immediate move;
@@ -4217,7 +4275,7 @@ object MicroOpAssembler {
     val fpCtrlImmUop = mkUop(
       op = DecOp.MOVE, cluster = Cluster.INT, size = Size.LONG,
       dstReg = U(T0, 5 bits), dstValid = True,
-      useImm = True, imm = (pkt.words(2) ## pkt.words(3)).asBits.resize(32),
+      useImm = True, imm = I("w23")((pkt.words(2) ## pkt.words(3)).asBits.resize(32)),
       first = True)          // THIS is the macro boundary; opUop clears its own flag
 
     // Fixed three-uop cold transfer: capture Dn at retirement, compute EA into
@@ -4230,7 +4288,8 @@ object MicroOpAssembler {
     val coldAddrUop = mkUop(cluster=Cluster.LS, srcAReg=coldEa.base,
       srcAValid=coldEa.baseValid, dstReg=U(T1,5 bits), dstValid=True,
       useImm=True, imm=Mux(coldEa.pcRel,
-        (pkt.pc + U(4,32 bits) + coldEa.disp.asUInt).asBits, coldEa.disp),
+        ia.alt((pkt.pc + U(4,32 bits) + coldEa.disp.asUInt).asBits)(ia.a("ext1Disp")(coldEa.disp) | ia.p | ia.k("c4")(B(4, 32 bits))),
+        I("ext1Disp")(coldEa.disp)),
       first=False, divIsRem=True)
     coldAddrUop.leaAddr.allowOverride; coldAddrUop.leaAddr := True
     coldAddrUop.srcCReg.allowOverride; coldAddrUop.srcCReg := coldEa.indexReg
@@ -4238,7 +4297,7 @@ object MicroOpAssembler {
     coldAddrUop.indexLong.allowOverride; coldAddrUop.indexLong := coldEa.indexLong
     coldAddrUop.indexScale.allowOverride; coldAddrUop.indexScale := coldEa.indexScale
     val coldFinalUop = mkUop(srcBReg=U(T1,5 bits), srcBValid=True,
-      imm=(pkt.words(1)(13).asBits ## op(5 downto 0)).resize(32), first=False)
+      imm=I("coldFinal")((pkt.words(1)(13).asBits ## op(5 downto 0)).resize(32)), first=False)
     coldFinalUop.sysOp.allowOverride; coldFinalUop.sysOp := True
     coldFinalUop.sysKind.allowOverride; coldFinalUop.sysKind := SysKind.FMOVEM_DATA
 

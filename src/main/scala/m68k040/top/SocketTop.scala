@@ -707,6 +707,7 @@ object GenSocketTopVerilog {
             s"lsSpecWakeAluProbe=${ShippingCoreConfig.lsSpecWakeAluProbe} " +
             s"feRetime=${ShippingCoreConfig.feRetime} " +
             s"alignMaskNoRst=${ShippingCoreConfig.alignMaskNoRst} " +
+            s"immCone=${ShippingCoreConfig.immCone} " +
             s"feRedirectCmd=${ShippingCoreConfig.feRedirectCmd} " +
             s"beRetime=${ShippingCoreConfig.beRetime} " +
             s"tc3Retime=${ShippingCoreConfig.tc3Retime} " +
