@@ -4033,6 +4033,10 @@ object MicroOpAssembler {
                           srcAReg = U(T0, 5 bits), srcAValid = True,   // target = T0 + 0
                           useImm  = True, imm = B(0, 32 bits), first = False,
                           isReturn = True)
+    // CPU_RTS_SPLIT_A7's stack-pointer µop (see the RTS arm of the crack tree). Built only
+    // with the flag on, so the flag-off elaboration is unchanged.
+    val rtsA7     = if (m68k040.top.ShippingCoreConfig.rtsSplitA7)
+      addUop(U(A7, 5 bits), B(4, 32 bits), U(A7, 5 bits), first = False, drop = True) else null
 
     // LINK An,#disp16 — [stkPush store dst=An, push old An] + [A7 := A7+disp (drop)]
     //                   + [An := A7-disp (kept)].
@@ -4411,10 +4415,20 @@ object MicroOpAssembler {
       out.uops(0) := bsrPush
       out.uops(1) := bsrBranch
     } elsewhen(isRtsOp) {
-      // RTS -> [load.l (A7) -> T0] + [ibranch -> T0 ; A7 += 4].
-      cnt   := 2
-      out.uops(0) := rtsLoad
-      out.uops(1) := rtsBranch
+      if (m68k040.top.ShippingCoreConfig.rtsSplitA7) {
+        // CPU_RTS_SPLIT_A7: RTS -> [load.l (A7) -> T0] + [A7 := A7 + 4 (drop)] +
+        // [ibranch -> T0] -- RTD's crack with a zero displacement, so A7 does not wait
+        // for the return-address load.
+        cnt   := 3
+        out.uops(0) := rtsLoad
+        out.uops(1) := rtsA7
+        out.uops(2) := rtdBranch
+      } else {
+        // RTS -> [load.l (A7) -> T0] + [ibranch -> T0 ; A7 += 4].
+        cnt   := 2
+        out.uops(0) := rtsLoad
+        out.uops(1) := rtsBranch
+      }
     } elsewhen(isRtdOp) {
       // RTD -> [load.l (A7) -> T0] + [A7 := A7 + (4+disp16) (drop)] + [ibranch -> T0].
       cnt   := 3

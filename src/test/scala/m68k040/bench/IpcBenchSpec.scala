@@ -113,7 +113,13 @@ class IpcBenchSpec extends CoreBenchHarness {
       (if (sys.env.get("IPC_JTAB_KERNEL").contains("1")) Seq(
         kBrJumpTable(), kBrJumpTable(call = true, label = "br-jtab-jsr")) else Nil) ++
       // IPC_DIV_KERNEL=1 appends the divide-heavy loop (opt-in; default aggregate unchanged).
-      (if (sys.env.get("IPC_DIV_KERNEL").contains("1")) Seq(kDivMix(200)) else Nil)
+      (if (sys.env.get("IPC_DIV_KERNEL").contains("1")) Seq(kDivMix(200)) else Nil) ++
+      // IPC_CALL_CB=1 appends call-return under COPYBACK translation (the board's stack is
+      // copyback; the default kernel's BSR push is a precise write-through store).
+      (if (sys.env.get("IPC_CALL_CB").contains("1"))
+        Seq(kCallReturn.copy(name = "call-return-cb", copybackDtt = true),
+          kBrReturn(depth = 12, iters = 64, label = "br-ras-fit-cb").copy(copybackDtt = true),
+          kBrReturn(depth = 24, iters = 64, label = "br-ras-cb").copy(copybackDtt = true)) else Nil)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))

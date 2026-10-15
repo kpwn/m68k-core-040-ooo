@@ -719,6 +719,14 @@ object ShippingCoreConfig {
     * unchanged. Default OFF: with it off the ROM content and every width are as before.
     * Read by `Microcode`, `DecodeContracts`, `DecodeStage`, `OperationDecoder`. */
   val upc10: Boolean = envFlag("CPU_UPC10", true)
+  /** CPU_RTS_SPLIT_A7: crack RTS as [load.l (A7) -> T0] + [A7 := A7 + 4 (drop)] +
+    * [ibranch -> T0] (the RTD shape with a zero displacement) instead of folding A7 += 4
+    * into the ibranch. The folded form makes the new A7 wait for the return-address LOAD,
+    * so a call/return loop's stack pointer recurrence runs push -> pop load -> ibranch ->
+    * next push (12 cycles per call on the copyback call-return kernel). Split, A7 += 4
+    * is a 1-cycle ALU op off the push's early A7. Costs one ROB/IQ entry per RTS.
+    * Read by `MicroOpAssembler`. Default OFF. */
+  val rtsSplitA7: Boolean = envFlag("CPU_RTS_SPLIT_A7", false)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
