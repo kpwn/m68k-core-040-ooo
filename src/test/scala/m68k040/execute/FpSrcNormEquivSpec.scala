@@ -15,12 +15,13 @@ class FpSrcNormEquivSpec extends AnyFunSuite {
     val io = new Bundle {
       val isInt, isSgl = in Bool()
       val v = in Bits(64 bits)
-      val oldO, newO = out Bits(80 bits)
+      val oldO, newO, newB = out Bits(80 bits)
     }
     // distinct inputs per format (DivEu feeds three different muxes)
     val iv = io.v(31 downto 0); val sv = io.v(63 downto 32) ^ io.v(31 downto 0); val dv = io.v
     io.oldO := Mux(io.isInt, FpSource.intToExtended(iv), Mux(io.isSgl, FpSource.singleToExtended(sv), FpSource.doubleToExtended(dv)))
     io.newO := FpSource.toExtendedShared(io.isInt, io.isSgl, iv, sv, dv)
+    io.newB := FpSource.toExtendedShared(io.isInt, io.isSgl, iv, sv, dv, sharedClz = false)
   }
   test("toExtendedShared == per-format converters", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
@@ -42,6 +43,7 @@ class FpSrcNormEquivSpec extends AnyFunSuite {
         sleep(1)
         assert(dut.io.oldO.toBigInt == dut.io.newO.toBigInt,
           f"v=0x$v%x isInt=$ii isSgl=$ss old=0x${dut.io.oldO.toBigInt}%x new=0x${dut.io.newO.toBigInt}%x")
+        assert(dut.io.oldO.toBigInt == dut.io.newB.toBigInt, f"(sharedClz=false) v=0x$v%x isInt=$ii isSgl=$ss")
         n += 1
       }
       println(s"FpSrcNormEquivSpec: $n vectors identical")

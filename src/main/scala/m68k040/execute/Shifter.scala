@@ -520,7 +520,7 @@ case class ShiftFunnelStage1a() extends Bundle {
   val src     = UInt(32 bits); val srcMsb = Bool()
   val d       = Bits(66 bits)  // funnel word D[0..65] (see ShifterFunnel)
   val r       = UInt(6 bits)   // right-shift amount, 0..33 on every live path
-  val countP1 = UInt(6 bits)   // ASL V: shTable(count+1)
+  val lshTbl  = UInt(32 bits)  // ASL V: shTable(count+1) (count-only, built in S1)
 }
 
 /** CPU_SHIFT_FUNNEL stage-1 midpoint: the ONE funnel window plus the ASL V inputs. */
@@ -602,20 +602,8 @@ object ShifterFunnel {
     a.isImm := cmd.isImm;     a.xIn := cmd.xIn;         a.count := count
     a.src := src;             a.srcMsb := srcMsb
     a.d := d;                 a.r := r
-    a.countP1 := (count + 1).resize(6)
-  }.a
-
-  def stage1b(a: ShiftFunnelStage1a): ShiftFunnelStage1 = new Area {
-    val s1 = ShiftFunnelStage1()
-    val sizeBits = a.size.mux(Size.BYTE -> U(8, 7 bits), Size.WORD -> U(16, 7 bits), Size.LONG -> U(32, 7 bits))
-    val mask = a.size.mux(
-      Size.BYTE -> B(0x000000ffL, 32 bits),
-      Size.WORD -> B(0x0000ffffL, 32 bits),
-      Size.LONG -> B(0xffffffffL, 32 bits)).asUInt
-    // The one funnel: W = {D, guard 0} (67 bits) >> r, keep 34 bits.
-    val w = (a.d ## False).asUInt
-    s1.o := (w >> a.r).resize(34).asBits
-    // ASL V inputs (shTable verbatim from Shifter.stage1b).
+    // ASL V table: a function of count and size only, so it is built here in parallel
+    // with the (deeper) ROX `rmod` amount, keeping S1a's cone to the funnel + compares.
     def shTable(k: UInt): UInt = {
       val res = UInt(32 bits)
       val lowZeros = (sizeBits - k.resize(7)).asSInt
@@ -632,7 +620,20 @@ object ShifterFunnel {
       }
       res
     }
-    val tbl = shTable(a.countP1)
+    a.lshTbl := shTable((count + 1).resize(6))
+  }.a
+
+  def stage1b(a: ShiftFunnelStage1a): ShiftFunnelStage1 = new Area {
+    val s1 = ShiftFunnelStage1()
+    val sizeBits = a.size.mux(Size.BYTE -> U(8, 7 bits), Size.WORD -> U(16, 7 bits), Size.LONG -> U(32, 7 bits))
+    val mask = a.size.mux(
+      Size.BYTE -> B(0x000000ffL, 32 bits),
+      Size.WORD -> B(0x0000ffffL, 32 bits),
+      Size.LONG -> B(0xffffffffL, 32 bits)).asUInt
+    // The one funnel: W = {D, guard 0} (67 bits) >> r, keep 34 bits.
+    val w = (a.d ## False).asUInt
+    s1.o := (w >> a.r).resize(34).asBits
+    val tbl = a.lshTbl
     val sv  = a.src & tbl
     s1.lshSvZero := sv === 0
     s1.lshSvAll  := sv === tbl

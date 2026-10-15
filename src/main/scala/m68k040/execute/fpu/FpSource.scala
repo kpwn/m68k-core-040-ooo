@@ -296,7 +296,8 @@ object FpSource {
     * only the 64-bit input placement and the exponent base are per format. Bit-identical
     * to `Mux(isInt, intToExtended(intV), Mux(isSgl, singleToExtended(sglV),
     * doubleToExtended(dblV)))` (FpSrcNormEquivSpec). */
-  def toExtendedShared(isInt: Bool, isSgl: Bool, intV: Bits, sglV: Bits, dblV: Bits): Bits = {
+  def toExtendedShared(isInt: Bool, isSgl: Bool, intV: Bits, sglV: Bits, dblV: Bits,
+                       sharedClz: Boolean = true): Bits = {
     require(intV.getWidth == 32 && sglV.getWidth == 32 && dblV.getWidth == 64)
     // int
     val ia   = intV.asSInt
@@ -310,7 +311,10 @@ object FpSource {
     val dMax = dExp === 0x7FF; val dSub = (dExp === 0) && (dSig =/= 0); val dZro = (dExp === 0) && (dSig === 0)
     // the shared normalizer
     val m = Mux(isInt, iMag ## B(0, 32 bits), Mux(isSgl, sSig ## B(0, 41 bits), dSig ## B(0, 12 bits)))
-    val c = Fp80.clz(m)                                       // 0..64
+    // sharedClz=false: three narrow clz's in parallel with the input mux (a 7-bit count
+    // mux instead of a 64-bit clz behind it) -- only the barrel shifter is shared.
+    val c = if (sharedClz) Fp80.clz(m) else
+      Mux(isInt, Fp80.clz(iMag).resize(7), Mux(isSgl, Fp80.clz(sSig).resize(7), Fp80.clz(dSig).resize(7)))
     val sigN = (m.asUInt |<< c.resize(6)).asBits              // c==64 only for m==0 (zero arms)
     val base = Mux(isInt, U(0x401E, 15 bits), Mux(isSgl, U(0x3F80, 15 bits), U(0x3C00, 15 bits)))
     val expN = base - c.resize(15)
