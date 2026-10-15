@@ -1020,4 +1020,9 @@ object ShippingCoreConfig {
     * instead of 640 flops + an 8:1 80-bit read mux. Same cycles. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val fmStageRam: Boolean = envFlag("CPU_FM_STAGE_RAM", false)
+  /** CPU_EXC_FSM_ONEHOT (fanout census R1, 2026-10-16): the ExceptionUnit state machine
+    * is one-hot encoded, so each state predicate is one flop instead of a 6-bit decode
+    * repeated in every consumer. Pure re-encoding: same states, same transitions.
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val excFsmOneHot: Boolean = envFlag("CPU_EXC_FSM_ONEHOT", false)
 }

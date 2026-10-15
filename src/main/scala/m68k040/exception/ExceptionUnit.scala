@@ -1557,6 +1557,10 @@ class ExceptionUnit(
   val vecTableRedirectVec = Reg(UInt(8 bits)) init 0; vecTableRedirectVec.simPublic()
 
   val fsm = new StateMachine {
+    // CPU_EXC_FSM_ONEHOT: one flop per state, so every `isActive(X)` / `=== X` decode in
+    // this unit and in the plugins that consume its outputs reads ONE bit instead of
+    // re-decoding the 6-bit binary state (census R1: ~3,600 LUT loads on stateReg[0..5]).
+    if (m68k040.top.ShippingCoreConfig.excFsmOneHot) setEncoding(binaryOneHot)
     val IDLE      = new State with EntryPoint
     // ENTRY path
     val E_DRAIN   = new State    // wait for the SQ to drain before grabbing the port
