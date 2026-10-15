@@ -189,7 +189,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
                    * environment, rather than the "wired in one top only" failure family. */
                  val inhibitedFullBarrier: Boolean = m68k040.top.ShippingCoreConfig.inhibitedFullBarrier,
                  val sqCoalesceLines: Boolean = m68k040.top.ShippingCoreConfig.sqCoalesceLines,
-                 val sqCoalesceHold: Int = m68k040.top.ShippingCoreConfig.sqCoalesceHold)
+                 val sqCoalesceHold: Int = m68k040.top.ShippingCoreConfig.sqCoalesceHold,
+                 /** See `ShippingCoreConfig.lsParkNoLine`. */
+                 val parkNoLine: Boolean = m68k040.top.ShippingCoreConfig.lsParkNoLine)
     extends FiberPlugin with LsEuService {
   require(isPow2(sqDepth) && sqDepth >= 4 && sqDepth <= 16,
     s"store-queue depth must be a power of two in 4..16, got $sqDepth")
@@ -1626,7 +1628,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // the in-order release from writing the PRF a SECOND time.
     val alignedWb     = Vec.fill(alignedDepth)(RegInit(False))
     val alignedRData  = Vec.fill(alignedDepth)(Reg(Bits(32 bits)))
-    val alignedRLine  = Vec.fill(alignedDepth)(Reg(Bits(128 bits)))
+    // `parkNoLine`: no per-entry line (see `ShippingCoreConfig.lsParkNoLine`).
+    val alignedRLine  = if (parkNoLine) null else Vec.fill(alignedDepth)(Reg(Bits(128 bits)))
     val alignedRFault = Vec.fill(alignedDepth)(RegInit(False))
     alignedDone.foreach(_.simPublic()); alignedWb.foreach(_.simPublic())
     val alignedPushPtr  = Reg(UInt(alignedPtrW bits)) init 0
@@ -1839,7 +1842,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // The response fields the ring path consumes: live off the port for the head,
     // otherwise the parked copy.
     val alignedRspData  = Mux(alignedHeadLive, dcache.loadRsp.payload.data,  alignedRData(alignedRspPtr))
-    val alignedRspLine  = Mux(alignedHeadLive, dcache.loadRsp.payload.line,  alignedRLine(alignedRspPtr))
+    // `parkNoLine`: the ring's only line consumers (split A capture, split B merge) run
+    // when the response ARRIVES, so they only ever see the live line.
+    val alignedRspLine  = if (parkNoLine) dcache.loadRsp.payload.line
+                          else Mux(alignedHeadLive, dcache.loadRsp.payload.line,  alignedRLine(alignedRspPtr))
     val alignedRspFault = Mux(alignedHeadLive, dcache.loadRsp.payload.fault, alignedRFault(alignedRspPtr))
     alignedRspMatchVec.foreach(_.simPublic()); alignedHeadLive.simPublic()
     GenerationFlags.simulation {
@@ -2933,11 +2939,28 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // very cycle its own entry retires -- that combination is impossible (a matched
     // entry has `!alignedDone`, and the head pops live in the same cycle it matches),
     // but the ordering makes the park the winner rather than relying on that argument.
+    // `parkNoLine`: a parked split slot B -- always the ring HEAD (B is not sent until A
+    // has popped: `alignedSendHeld`) -- stores its MERGED result in `alignedRData`
+    // (`splitMergeNow`, the same merge the pop arm performs live). Every other entry stores
+    // the live data word, exactly as before.
+    val alignedParkVec = Vec(Bool(), alignedDepth)
+    for (i <- 0 until alignedDepth)
+      alignedParkVec(i) := alignedRspMatchVec(i) && !((alignedRspPtr === U(i, alignedPtrW bits)) && alignedRspFire)
+    val alignedParkAny = alignedParkVec.asBits.orR
+    val alignedParkIsB = if (parkNoLine)
+      alignedHeadLive && alignedRspEntry.twoAccess && alignedRspEntry.splitSecond else False
+    val alignedParkIsA = if (parkNoLine)
+      (0 until alignedDepth).map(i => alignedParkVec(i) && alignedMem(i).twoAccess &&
+        !alignedMem(i).splitSecond && !alignedPoisoned(i)).reduce(_ || _) &&
+      !dcache.loadRsp.payload.fault && !sqFlushSig
+    else False
+    val splitMergeNow = Bits(32 bits)   // driven next to `splitMergeLine` below
     for (i <- 0 until alignedDepth) {
-      when(alignedRspMatchVec(i) && !((alignedRspPtr === U(i, alignedPtrW bits)) && alignedRspFire)) {
+      when(alignedParkVec(i)) {
         alignedDone(i)   := True
-        alignedRData(i)  := dcache.loadRsp.payload.data
-        alignedRLine(i)  := dcache.loadRsp.payload.line
+        if (parkNoLine) alignedRData(i) := Mux(alignedParkIsB, splitMergeNow, dcache.loadRsp.payload.data)
+        else alignedRData(i)  := dcache.loadRsp.payload.data
+        if (!parkNoLine) alignedRLine(i)  := dcache.loadRsp.payload.line
         alignedRFault(i) := dcache.loadRsp.payload.fault
       }
     }
@@ -3521,11 +3544,44 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // synthesis, same idiom as DcachePlugin's `earlyProbeStale.simPublic()`.
     splitMergeLine.simPublic()
     splitMergeValid.simPublic()
+    // ONE merge, shared by the pop arm and (`parkNoLine`) the park of a slot B.
+    splitMergeNow := m68k040.cache.DcacheByteLane.extractCross(
+      splitMergeLine, alignedRspLine,
+      alignedRspEntry.mergeOff, alignedRspEntry.size)
+    if (parkNoLine) {
+      // A parked slot A captures its line NOW (it is the only time the line exists).
+      // Nothing else can write `splitMergeLine` this cycle: a pop capture needs the
+      // response to belong to the head popping live, which a park excludes, and its
+      // pair's slot B is not sent until this A pops. The squash clear below still wins.
+      when(alignedParkIsA) {
+        splitMergeLine  := dcache.loadRsp.payload.line
+        splitMergeValid := True
+        splitMergeRob   := MuxOH(alignedParkVec, alignedMem.map(_.bk.robId))
+      }
+      GenerationFlags.simulation {
+        when(alignedParkAny && alignedParkIsB && !alignedRspIsPoison && !dcache.loadRsp.payload.fault) {
+          assert(splitMergeValid,
+            "LsEuPlugin(parkNoLine): parked split slot B merged against an EMPTY splitMergeLine", FAILURE)
+          assert(splitMergeRob === alignedRspEntry.bk.robId,
+            "LsEuPlugin(parkNoLine): parked split slot B merged against ANOTHER PAIR's line", FAILURE)
+        }
+      }
+      when(alignedParkAny && alignedParkIsB) { splitMergeValid := False }
+    }
     when(alignedRspFire && !alignedRspIsPoison) {
       when(alignedRspIsSplitA && !alignedRspFault) {
-        splitMergeLine  := alignedRspLine
-        splitMergeValid := True
-        splitMergeRob   := alignedRspEntry.bk.robId
+        if (parkNoLine) {
+          // A parked slot A already captured at park time.
+          when(alignedHeadLive) {
+            splitMergeLine  := alignedRspLine
+            splitMergeValid := True
+            splitMergeRob   := alignedRspEntry.bk.robId
+          }
+        } else {
+          splitMergeLine  := alignedRspLine
+          splitMergeValid := True
+          splitMergeRob   := alignedRspEntry.bk.robId
+        }
       } otherwise {
         val suppressForLaterPrivCheck = alignedRspEntry.bk.needsSupervisor &&
                                         !alignedRspEntry.bk.xlateSup
@@ -3541,7 +3597,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
           // it must still be there.  Both are invariants of the ring's ordering,
           // so they are CHECKED every time the merge runs rather than left as the
           // paragraph above.
-          GenerationFlags.simulation {
+          GenerationFlags.simulation { when(if (parkNoLine) alignedHeadLive else True) {
             assert(splitMergeValid,
               "LsEuPlugin: split slot B merged against an EMPTY splitMergeLine -- " +
               "slot A never captured, or a squash cleared it and slot B was not " +
@@ -3553,12 +3609,15 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
               "send/response ordering has desynced. The merged longword is " +
               "assembled from two unrelated lines.",
               FAILURE)
-          }
-          val merged = m68k040.cache.DcacheByteLane.extractCross(
-            splitMergeLine, alignedRspLine,
-            alignedRspEntry.mergeOff, alignedRspEntry.size)
+          }}
+          // `parkNoLine`: a parked slot B was merged when it parked.
+          val merged = if (parkNoLine) Mux(alignedHeadLive, splitMergeNow, alignedRData(alignedRspPtr))
+                       else splitMergeNow
           captureCompletionDesc(alignedRspEntry.bk, merged, alignedRspEntry.size)
-          splitMergeValid := False   // consumed
+          // consumed (`parkNoLine`: a parked B consumed it at park time, and the NEXT
+          // pair's slot A may have parked into it since)
+          if (parkNoLine) { when(alignedHeadLive) { splitMergeValid := False } }
+          else splitMergeValid := False
         } elsewhen(!alignedWb(alignedRspPtr)) {
           // The ordinary single-access completion -- UNLESS this entry already wrote
           // back out of ring order, in which case its PRF write and wakeup have
