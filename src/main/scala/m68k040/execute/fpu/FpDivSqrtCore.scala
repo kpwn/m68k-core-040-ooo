@@ -99,7 +99,7 @@ object FpDivSqrtCore {
   * that "a non-backpressured completion Flow is not permission to drop either result": if the
   * EU's arbiter grants the fixed lane this cycle, the iterative result is still there next
   * cycle. */
-class FpDivSqrtCore(sharedNorm: Boolean = false) extends Component {
+class FpDivSqrtCore(sharedNorm: Boolean = false, sharedSub: Boolean = false) extends Component {
   val io = new Bundle {
     val start  = in Bool ()
     val isSqrt = in Bool ()
@@ -259,6 +259,20 @@ class FpDivSqrtCore(sharedNorm: Boolean = false) extends Component {
 
     // -- S_ITER: 65 radix-2 restoring steps ------------------------------------
     is(U(S_ITER, 3 bits)) {
+      if (sharedSub) {
+        // CPU_FPU_ITER_SUB_SHARE: one 69-bit subtractor serves both recurrences; its
+        // borrow-out is the `>=` compare.
+        val r2s = ((rem(65 downto 0) ## rad(129 downto 128)).asUInt).resize(68)
+        val ts  = ((quot(64 downto 0) ## B"01").asUInt).resize(68)
+        val r2d = (rem(66 downto 0) ## False).asUInt.resize(68)
+        val r2  = Mux(sqrtR, r2s, r2d)
+        val x   = Mux(sqrtR, ts, dEff.resize(68))
+        val dif = r2.resize(69) - x.resize(69)
+        val ge  = !dif(68)
+        rem  := Mux(ge, dif(67 downto 0), r2)
+        quot := (quot(63 downto 0) ## ge).asUInt
+        when(sqrtR) { rad := (rad(127 downto 0) ## B"00").asUInt }
+      } else {
       when(sqrtR) {
         val r2 = ((rem(65 downto 0) ## rad(129 downto 128)).asUInt).resize(68)
         val t  = ((quot(64 downto 0) ## B"01").asUInt).resize(68)      // (q << 2) | 1
@@ -271,6 +285,7 @@ class FpDivSqrtCore(sharedNorm: Boolean = false) extends Component {
         val ge = r2 >= dEff.resize(68)
         rem  := Mux(ge, r2 - dEff.resize(68), r2)
         quot := (quot(63 downto 0) ## ge).asUInt
+      }
       }
       cnt := cnt + 1
       when(cnt === U(FpDivSqrtCore.Iterations - 1, 7 bits)) { state := U(S_ROUND, 3 bits) }

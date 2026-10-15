@@ -1000,4 +1000,8 @@ object ShippingCoreConfig {
     * registers, two 64-bit LZCs and two 64-bit normalising shifters. Read as `FpuCore`'s
     * constructor default. Echoed in `SHIPPING_CONFIG`. */
   val fpuNormShare: Boolean    = envFlag("CPU_FPU_NORM_SHARE", false)
+  /** `CPU_FPU_ITER_SUB_SHARE`: the FDIV and FSQRT restoring steps share one subtractor whose
+    * borrow-out is the `>=` compare (zero-cycle; default OFF = identical netlist). Read as
+    * `FpuCore`'s constructor default. Echoed in `SHIPPING_CONFIG`. */
+  val fpuIterSubShare: Boolean = envFlag("CPU_FPU_ITER_SUB_SHARE", false)
 }

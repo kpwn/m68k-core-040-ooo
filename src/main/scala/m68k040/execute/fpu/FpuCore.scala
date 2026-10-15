@@ -101,7 +101,8 @@ object FpuCore {
   * NO BACKPRESSURE ON THE FIXED SIDE. `doneFixed` is an unconditional 1-cycle pulse
   * FixedLatency after an accepted `start`, identical to MulCore. The EU MUST reserve result
   * capacity before asserting `start` (2026-08-09 spec §3). */
-class FpuCore(normShare: Boolean = m68k040.top.ShippingCoreConfig.fpuNormShare) extends Component {
+class FpuCore(normShare: Boolean = m68k040.top.ShippingCoreConfig.fpuNormShare,
+              iterSubShare: Boolean = m68k040.top.ShippingCoreConfig.fpuIterSubShare) extends Component {
   val io = new Bundle {
     // -- request --
     val start   = in Bool ()
@@ -144,7 +145,7 @@ class FpuCore(normShare: Boolean = m68k040.top.ShippingCoreConfig.fpuNormShare) 
   val addPipe   = new FpAddPipe
   val mulPipe   = new FpMulPipe(exportNorm = normShare)
   val cheapPipe = new FpCheapPipe
-  val iterCore  = new FpDivSqrtCore(sharedNorm = normShare)
+  val iterCore  = new FpDivSqrtCore(sharedNorm = normShare, sharedSub = iterSubShare)
   val roundPack = new FpRoundPack
 
   addPipe.io.start := io.start && isAdd
