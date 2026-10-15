@@ -994,4 +994,12 @@ object ShippingCoreConfig {
     * Advertised as OFF_FEATURES bit 26 (`dbg_lite`). Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val dbgLite: Boolean = envFlag("CPU_DBG_LITE", false)
+  /** Area (sqarea 2026-10-15): the D-cache round-robin victim pointers (`victim`, one
+    * wayBits counter per line set) live in an async-read LUTRAM instead of a
+    * `Vec(RegInit)` flop array with a 256:1 read mux per reader. Reset equivalence is
+    * kept by writing 0 at `resetSweepSet` during the existing runtime reset sweep (no
+    * request is accepted until it ends), and the Mem is initialised to 0 for power-on.
+    * Every read returns the same value as the flop array on every cycle after the sweep.
+    * Unsectored only. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val dcacheVictimLutram: Boolean = envFlag("CPU_DCACHE_VICTIM_LUTRAM", false)
 }

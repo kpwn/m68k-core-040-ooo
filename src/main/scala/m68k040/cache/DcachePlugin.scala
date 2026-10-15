@@ -380,7 +380,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    /** See `ShippingCoreConfig.beRetime`. */
                    val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime,
                    /** See `ShippingCoreConfig.tc3Retime`. */
-                   val tc3Retime: Boolean = m68k040.top.ShippingCoreConfig.tc3Retime)
+                   val tc3Retime: Boolean = m68k040.top.ShippingCoreConfig.tc3Retime,
+                   /** See `ShippingCoreConfig.dcacheVictimLutram`. */
+                   val victimLutram: Boolean = m68k040.top.ShippingCoreConfig.dcacheVictimLutram)
     extends FiberPlugin with DcacheService {
   require(!(fullLineNoFill && sectored),
     "fullLineNoFill is unsectored-only: a sectored LINE miss would still owe other sectors")
@@ -617,7 +619,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
       tagMem(w).simPublic()
     }
     // Slice `D3-BURST`: replacement is per LINE, so this is LINE-indexed too.
-    val victim  = Vec.fill(lineSets)(RegInit(U(0, wayBits bits)))
+    // CPU_DCACHE_VICTIM_LUTRAM: one async-read LUTRAM instead of the flop array. Every
+    // reader below goes through `victim(set)`, so the two forms differ only in storage.
+    // The single write port (round-robin bump, or 0 during the reset sweep) is driven
+    // once, after the FSM, from `victimBumpEn`.
+    private val victimOnLutram = victimLutram && !sectored
+    val victimRegs: Vec[UInt] = if (victimOnLutram) null else Vec.fill(lineSets)(RegInit(U(0, wayBits bits)))
+    val victimMem: Mem[UInt] = if (!victimOnLutram) null else {
+      val m = Mem(UInt(wayBits bits), lineSets) init Seq.fill(lineSets)(U(0, wayBits bits))
+      m.addAttribute("ram_style", "distributed"); m
+    }
+    val victimBumpEn: Bool = if (victimOnLutram) Bool() else null
+    if (victimOnLutram) victimBumpEn := False
+    def victim(set: UInt): UInt = if (victimOnLutram) victimMem.readAsync(set) else victimRegs(set)
+    /** Advance the round robin of `set` (the unsectored `victim(set) := victim(set) + 1`). */
+    def victimBump(set: UInt): Unit =
+      if (victimOnLutram) victimBumpEn := True else victimRegs(set) := victimRegs(set) + 1
     // Runtime reset invalidation. RegInit(True) re-arms this on every reset (not
     // merely at FPGA configuration); one set is invalidated per cycle after reset
     // releases. Request acceptance and maintenance quiescence are gated below until
@@ -3695,11 +3712,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
             // nothing, so it must not advance the round robin (doing so would make a
             // CINVL'd sector's refill steal an unrelated way on the NEXT line miss).
             if (!sectored) {
-              victim(missSet) := victim(missSet) + 1
+              victimBump(missSet)
             } else when(refillFullLine && (refillBeat === U(0, secBits bits))) {
               // ONCE per burst, not once per beat: four increments at wayBits=2 would
               // wrap to zero and freeze the round robin entirely.
-              victim(lineOf(missSet)) := victim(lineOf(missSet)) + 1
+              victimRegs(lineOf(missSet)) := victimRegs(lineOf(missSet)) + 1
             }
             missArrayWrite  := True
           }
@@ -3881,7 +3898,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
                 validsWrData(w) := True
                 validsVoteW1(w) := True    // Task #255 tripwire: this IS the W1 allocate
               }
-              victim(missSet) := victim(missSet) + 1
+              victimBump(missSet)
               noFillReg   := False
               noFillAlloc := True
             }
@@ -3937,6 +3954,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
           replayRelaunch()
         }
         }
+      }
+    }
+
+    // CPU_DCACHE_VICTIM_LUTRAM: the one write port. Both bump sites address `missSet`
+    // (unsectored), so a same-cycle double bump writes the same value the flop form did.
+    // The reset sweep owns the port while it runs -- nothing can allocate then -- and
+    // zeroes each set exactly like the flop array's RegInit(0).
+    // nonBlocking: the legacy REFILL allocate is unreachable (asserted at its site), and
+    // the round robin is written by the MSHR allocator instead -- see `victimNbWrite`.
+    if (victimOnLutram && !nonBlocking) {
+      victimMem.write(
+        address = Mux(resetSweepBusy, resetSweepSet, missSet),
+        data    = Mux(resetSweepBusy, U(0, wayBits bits), victimMem.readAsync(missSet) + 1),
+        enable  = resetSweepBusy || victimBumpEn)
+      GenerationFlags.simulation {
+        assert(!(resetSweepBusy && victimBumpEn), "D-cache victim bump during the reset sweep")
       }
     }
 
@@ -6357,8 +6390,26 @@ class DcachePlugin(val socketMerged: Boolean = false,
           mdirty(k) := True
         }
       }
-      when(sAlloc) { victim(sSet) := pendingVictimWay + 1 }
-      when(lAlloc) { victim(stgSet) := stgVWay + 1 }
+      if (!victimOnLutram) {
+        when(sAlloc) { victimRegs(sSet) := pendingVictimWay + 1 }
+        when(lAlloc) { victimRegs(stgSet) := stgVWay + 1 }
+      } else {
+        // CPU_DCACHE_VICTIM_LUTRAM, nonBlocking: TWO write ports (lowered to the XOR
+        // two-write LUTRAM). Port A = reset sweep (zero) or the store allocation; port B =
+        // the load allocation. They never collide: `lAlloc` excludes `resetSweepBusy` and,
+        // through `lSetBusy`, `sAlloc && sSet === stgSet`.
+        victimMem.write(
+          address = Mux(resetSweepBusy, resetSweepSet, sSet),
+          data    = Mux(resetSweepBusy, U(0, wayBits bits), pendingVictimWay + 1),
+          enable  = resetSweepBusy || sAlloc)
+        victimMem.write(address = stgSet, data = stgVWay + 1, enable = lAlloc)
+        GenerationFlags.simulation {
+          assert(!(resetSweepBusy && sAlloc), "D-cache victim store allocation during the reset sweep")
+          assert(!(lAlloc && (resetSweepBusy || (sAlloc && sSet === stgSet))),
+            "D-cache victim LUTRAM write ports collide")
+          assert(!victimBumpEn, "D-cache legacy victim bump in nonBlocking mode")
+        }
+      }
       when(sDo) {
         pendingStoreMiss := False
         storeAllocAckReg := True

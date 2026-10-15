@@ -768,6 +768,7 @@ object GenSocketTopVerilog {
             s"dcacheNbPreselectAr=${ShippingCoreConfig.dcacheNbPreselectAr} " +
             s"dcacheNbDynamicRelease=${ShippingCoreConfig.dcacheNbDynamicRelease} " +
             s"dcacheNbProbeMissStage=${ShippingCoreConfig.dcacheNbProbeMissStage} " +
+            s"dcacheVictimLutram=${ShippingCoreConfig.dcacheVictimLutram} " +
             s"prfReadTrim=${ShippingCoreConfig.prfReadTrim} " +
             s"prfTrimDivH=${ShippingCoreConfig.prfTrimDivH} " +
             s"prfTrimBrIdx=${ShippingCoreConfig.prfTrimBrIdx} " +
