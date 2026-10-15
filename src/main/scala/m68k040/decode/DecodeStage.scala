@@ -2477,13 +2477,26 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val ucComplexResumeTarget =
       Mux(movemPcIdxResumeFire, movemPcIdxRealNextPc, ucMoveRealNextPc)
     val ucComplexResumeValidReg = Reg(Bool()) init False
-    val ucComplexResumeTargetReg = Reg(UInt(32 bits)) init 0
+    val ucComplexResumeTargetReg = if (!ucEaDispFold) Reg(UInt(32 bits)) init 0 else UInt(32 bits)
     // FMAX 200 MHz (t200-dec): the target is captured UNCONDITIONALLY (no CE). Its only
     // reader is `ucComplexResume.payload`, consumed solely under `ucComplexResume.valid`
     // (= ValidReg, which is set exactly on the cycle after a kept detect -- the very cycle
     // whose capture this is); the detect-gated CE carried ucBegin/movemBegin and the
     // whole slot0 classifier cone onto 32 flop CEs.
-    ucComplexResumeTargetReg := ucComplexResumeTarget
+    // CPU_UC_EADISP_FOLD: register {base pc, K <= 22} and add after the register (the target
+    // only feeds the wiring plugin's ComplexResumeActionPipe register). Exact; init 0+0.
+    if (!ucEaDispFold) ucComplexResumeTargetReg := ucComplexResumeTarget
+    else {
+      val baseR = RegNext(Mux(movemPcIdxResumeFire, ePc, ucEntryPkt.pc)) init 0
+      val kR    = RegNext(Mux(movemPcIdxResumeFire, U(6, 5 bits), (ucMoveRealLenWords << 1).resize(5))) init 0
+      ucComplexResumeTargetReg := baseR + kR.resize(32)
+      GenerationFlags.simulation {
+        assert(ucMoveRealLenWords <= U(15, 5 bits), "DecodeStage: MOVE real length > 15 words", FAILURE)
+        assert((Mux(movemPcIdxResumeFire, ePc, ucEntryPkt.pc) +
+                Mux(movemPcIdxResumeFire, U(6, 5 bits), (ucMoveRealLenWords << 1).resize(5)).resize(32)) === ucComplexResumeTarget,
+          "DecodeStage: CPU_UC_EADISP_FOLD complex-resume {base,K} != target", FAILURE)
+      }
+    }
     when(pipeFlush) {
       ucComplexResumeValidReg := False
     } otherwise {

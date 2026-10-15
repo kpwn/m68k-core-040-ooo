@@ -601,9 +601,10 @@ object ShippingCoreConfig {
     * lenWords (`CPU_UC_CTX_NARROW`, default OFF). Bit-identical `ucCtx`,
     * cycle-identical. Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
   val ucCtxNarrow: Boolean = envFlag("CPU_UC_CTX_NARROW", false)
-  /** Microcode context `eaDispLo` latched as {disp, +pc?, +K<=6} with the single add AFTER
-    * the context register (`CPU_UC_EADISP_FOLD`, default OFF), replacing three entry-side
-    * pc/byteOff adders in front of a 5-way priority chain. Bit-identical `ucCtx`,
+  /** Microcode-entry pc folds after the register (`CPU_UC_EADISP_FOLD`, default OFF):
+    * context `eaDispLo` latched as {disp, +pc?, +K<=6} (replacing three entry-side
+    * pc/byteOff adders in front of a 5-way priority chain), and the complex-packet resume
+    * target latched as {base pc, +K<=22}; each gets one add after its register. Bit-identical `ucCtx`,
     * cycle-identical. Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
   val ucEaDispFold: Boolean = envFlag("CPU_UC_EADISP_FOLD", false)
   /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
