@@ -1013,4 +1013,9 @@ object ShippingCoreConfig {
     * each; `fmt` selects the row, and every output is gated by the same row. Zero-cycle;
     * default OFF = identical netlist. Echoed in `SHIPPING_CONFIG`. */
   val fpuNarrowShare: Boolean  = envFlag("CPU_FPU_NARROW_SHARE", false)
+  /** `CPU_SQ_VADDR_LUTRAM`: StoreQueue's fault-report-only fields (vaddrA, supervisor:
+    * written only at alloc/tail, read only at head) live in a LUTRAM, not per-entry flops.
+    * Zero-cycle; default OFF = identical netlist. Read as StoreQueue's constructor default.
+    * Echoed in `SHIPPING_CONFIG`. */
+  val sqVaddrLutram: Boolean   = envFlag("CPU_SQ_VADDR_LUTRAM", false)
 }
