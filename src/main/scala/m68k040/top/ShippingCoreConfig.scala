@@ -570,6 +570,12 @@ object ShippingCoreConfig {
     * side, so the `raw` slot-1 word flops carry no synchronous clear. Cycle-identical.
     * Producer of nothing in `Global`. Echoed in `SHIPPING_CONFIG`. */
   val alignMaskNoRst: Boolean = envFlag("CPU_ALIGN_MASK_NORST", true)
+  /** Decode immediate cone as one-hot ATOM codes (`CPU_IMM_CONE`, default OFF). The
+    * assembler's `imm` assignments steer a one-hot code over a per-packet atom list
+    * (decode/ImmCone.scala) and the GROUP-bank write data is one AND-OR per crack position.
+    * Bit-identical immediates, cycle-identical. Producer of nothing in `Global`. Echoed in
+    * `SHIPPING_CONFIG`. */
+  val immCone: Boolean = envFlag("CPU_IMM_CONE", true)
   /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
     * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
     * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,
