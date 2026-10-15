@@ -576,6 +576,21 @@ object ShippingCoreConfig {
     * outermost `cmdWindowPc` select) instead of a born-stale command from the old fetchPc:
     * one cycle off every early-redirect restart. Echoed in `SHIPPING_CONFIG`. */
   val feRedirectCmd: Boolean = envFlag("CPU_FE_REDIRECT_CMD", true)
+  /** I-cache refill predecode with the length arithmetic carried as a CODE
+    * (`CPU_PREDECODE_CODED`, default OFF): `PredecodeCoded.classify` replaces
+    * `PredecodeWord.classify` in the refill classifier bank (`IcachePlugin.classifyBeat`);
+    * each lookahead word's indexed-EA extension length is computed once per word and shared.
+    * Bit-identical record (PredecodeCodedEquivSpec). Echoed in `SHIPPING_CONFIG`. */
+  val predecodeCoded: Boolean = envFlag("CPU_PREDECODE_CODED", false)
+  /** Op-only predecode fields computed at IBuf PUSH instead of at I-cache refill
+    * (`CPU_PREDECODE_PUSH_OPFIELDS`, default OFF). `ChunkPredecode.size` and `.ctrlXfer`
+    * depend on the opword alone (no lookahead), so FetchAlignPlugin derives them from the
+    * 4 response words it pushes (4 decoders) instead of the refill bank deriving them for
+    * all 16 words of every beat (16 decoders). The I-cache stores only {lenWords,
+    * ambiguousLine} (5 of 8 bits/word): narrower unified array, `ufaWrData`, `bypPred`,
+    * `rspPredReg`. The pushed IBuf record is identical by construction (same function of
+    * the same word). Echoed in `SHIPPING_CONFIG`. */
+  val predecodePushOpFields: Boolean = envFlag("CPU_PREDECODE_PUSH_OPFIELDS", false)
   /** Physical NZVC (condition-code) register pool size. Rename stalls on an empty NZVC
     * freelist (16 phys - 1 arch = 15 in flight) while the 32-entry ROB is half empty,
     * because nearly every ALU op writes NZVC. 16 is the shipping default; 32 is the

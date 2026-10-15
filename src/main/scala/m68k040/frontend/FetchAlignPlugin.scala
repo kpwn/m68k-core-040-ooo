@@ -898,6 +898,14 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     val rawRspWords = ic.rsp.payload.data.subdivideIn(16 bits)
     val rspWords = Vec((0 until 4).map(i => IcacheInstructionOrder.opword(rawRspWords(i))))
     val rspPreds = ic.rsp.payload.pred
+    // CPU_PREDECODE_PUSH_OPFIELDS: the op-only predecode fields, derived here from the 4
+    // response words (straight off the I-cache's response register) instead of being
+    // carried from refill. Same functions `PredecodeWord.classify` uses.
+    val pushOpFields = m68k040.top.ShippingCoreConfig.predecodePushOpFields
+    val rspOpSize = if (pushOpFields)
+      Vec(rspWords.map(op => m68k040.decode.OperationDecoder.decode(op).size)) else null
+    val rspOpCtrl = if (pushOpFields)
+      Vec(rspWords.map(op => m68k040.frontend.PredecodeCoded.ctrlXfer(op))) else null
 
     // The response belongs to the HEAD ring entry (in-order pipeline). Its OWN
     // stale/drop govern discard + leading-word drop.
@@ -941,12 +949,14 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
             ibuf.io.push.payload.preds(j).ambiguousLine   := rspPreds(srcIdx).ambiguousLine
             // FMax Lever B: indexed by the SAME `srcIdx` as `words(j)` above, which is what
             // keeps `preds(j).size` paired with `words(j)` across the leading-word drop.
-            ibuf.io.push.payload.preds(j).size            := rspPreds(srcIdx).size
+            ibuf.io.push.payload.preds(j).size            :=
+              (if (pushOpFields) rspOpSize(srcIdx) else rspPreds(srcIdx).size)
             // Control-transfer gate: same `srcIdx` pairing as `words(j)`/`size` above, so
             // the bit the fetch-side prediction gate reads always belongs to the opword it
             // is gating. Dropping this line would silently pin `ctrlXfer` at its False
             // default and disable prediction outright (caught exactly that way).
-            ibuf.io.push.payload.preds(j).ctrlXfer        := rspPreds(srcIdx).ctrlXfer
+            ibuf.io.push.payload.preds(j).ctrlXfer        :=
+              (if (pushOpFields) rspOpCtrl(srcIdx) else rspPreds(srcIdx).ctrlXfer)
           }
         }
         ibuf.io.push.payload.n := nWords

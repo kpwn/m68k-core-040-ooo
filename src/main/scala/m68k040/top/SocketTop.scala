@@ -708,6 +708,8 @@ object GenSocketTopVerilog {
             s"feRetime=${ShippingCoreConfig.feRetime} " +
             s"alignMaskNoRst=${ShippingCoreConfig.alignMaskNoRst} " +
             s"feRedirectCmd=${ShippingCoreConfig.feRedirectCmd} " +
+            s"predecodeCoded=${ShippingCoreConfig.predecodeCoded} " +
+            s"predecodePushOpFields=${ShippingCoreConfig.predecodePushOpFields} " +
             s"beRetime=${ShippingCoreConfig.beRetime} " +
             s"tc3Retime=${ShippingCoreConfig.tc3Retime} " +
             s"physNzvc=${ShippingCoreConfig.physNzvc} " +
