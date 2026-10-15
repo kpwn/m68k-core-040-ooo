@@ -20,7 +20,9 @@ import spinal.lib.misc.plugin.FiberPlugin
   */
 class IcachePlugin(val predecodeWords: Int = 16,
                    /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME). */
-                   feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime)
+                   feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
+                   /** `ShippingCoreConfig.icachePfFilledLutram` (CPU_ICACHE_PFFILLED_LUTRAM). */
+                   pfFilledLutram: Boolean = m68k040.top.ShippingCoreConfig.icachePfFilledLutram)
     extends FiberPlugin with FetchService {
   require(predecodeWords == 8 || predecodeWords == 16)
 
@@ -306,7 +308,22 @@ class IcachePlugin(val predecodeWords: Int = 16,
     // pfFilledQ` -- which reaches a flop ENABLE and nothing else, so it cannot extend
     // `s1HitVec`'s own arc. The one thing it costs `s1HitVec` is fan-out, which is what
     // Task 11 already accepted when it moved this clear from S0 to S1.
-    val pfFilled = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
+    val pfFilled: Vec[Vec[Bool]] =
+      if (pfFilledLutram) null else Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
+    // CPU_ICACHE_PFFILLED_LUTRAM: one async-read LUTRAM per way. It has no all-clear:
+    // the bit is only ever consumed under `s1HitVec(w)`, which requires `validsQ(w)`
+    // captured with it, and every `valids := True` (the install) writes the bit too --
+    // so wherever the line is valid the LUTRAM equals the flop array, and where it is
+    // not, nothing reads it. The two writers (install, S1 clear) are driven through the
+    // wires below and written once, after the install FSM.
+    val pfFilledMem: Seq[Mem[Bool]] =
+      if (!pfFilledLutram) null else Seq.fill(ways)(Mem(Bool(), sets))
+    val pfInstEn:  Vec[Bool] = if (pfFilledLutram) Vec.fill(ways)(False) else null
+    val pfInstBit: Bool      = if (pfFilledLutram) Bool() else null
+    val pfClrEn:   Vec[Bool] = if (pfFilledLutram) Vec.fill(ways)(False) else null
+    if (pfFilledLutram) pfInstBit := False
+    def pfFilledRd(w: Int, set: UInt): Bool =
+      if (pfFilledLutram) pfFilledMem(w).readAsync(set) else pfFilled(w)(set)
 
     // DEBUG (icache-corruption-fix task, temporary — mirrors DcachePlugin's
     // ldS1Valid/stS2Valid.simPublic() DEBUG hooks): exposes the raw shared arrays
@@ -327,7 +344,7 @@ class IcachePlugin(val predecodeWords: Int = 16,
       // The prefetch-provenance marks die with the lines they describe: an invalidated
       // line was never "used", and leaving the mark set would let a LATER demand fill
       // into the same way/set be miscounted as a prefetch hit.
-      for (w <- 0 until ways; s <- 0 until sets) pfFilled(w)(s) := False
+      if (!pfFilledLutram) for (w <- 0 until ways; s <- 0 until sets) pfFilled(w)(s) := False
     }
 
     // ---- live parallel-VIPT lookup context (binding amendment 2026-08-10) ----
@@ -1115,7 +1132,7 @@ class IcachePlugin(val predecodeWords: Int = 16,
       val hu = Bool(); hu := False
       when(s0Valid && !s0Replay && !s0Fault) {
         for (w <- 0 until ways) when(s1HitVec(w) && pfFilledQ(w)) {
-          pfFilled(w)(s0Set) := False
+          if (pfFilledLutram) pfClrEn(w) := True else pfFilled(w)(s0Set) := False
           hu                 := True
         }
       }
@@ -1896,7 +1913,7 @@ class IcachePlugin(val predecodeWords: Int = 16,
           // bits are provenance TELEMETRY while those are state the verdict depends on.
           // The read address is `lookupSet`, the same virtual index the tag/valid
           // capture already uses, so this adds no new address decode to the accept cone.
-          for (w <- 0 until ways) pfFilledQ(w) := pfFilled(w)(lookupSet)
+          for (w <- 0 until ways) pfFilledQ(w) := pfFilledRd(w, lookupSet)
           // M4 (Task 12): the frontier seed / window-kill that stood HERE is deleted.
           // It was the LAST live-translation consumer outside the S0 capture: it read
           // `lookupFault`, `lookupCacheable` AND `lookupPaddr`, and it drove the clock
@@ -2962,7 +2979,8 @@ class IcachePlugin(val predecodeWords: Int = 16,
               // approximate, and what makes a DEMAND miss count in neither of the two
               // prefetch counters. Window allocation does not depend on this bit.
               // 2026-09-27: un-gated, see `pfFilled`'s declaration.
-              pfFilled(w)(installSet) := predIsPf && !anyInvalidate
+              if (pfFilledLutram) { pfInstEn(w) := True; pfInstBit := predIsPf && !anyInvalidate }
+              else pfFilled(w)(installSet) := predIsPf && !anyInvalidate
             }
           }
         }
@@ -2977,6 +2995,14 @@ class IcachePlugin(val predecodeWords: Int = 16,
       // cycle when this beat missed early predecode due to installer contention.
       // The counter still wraps on the FSM's exit, without an install-start clear.
       when(predBeatDone) { commitBeat := commitBeat + 1 }
+    }
+
+    // CPU_ICACHE_PFFILLED_LUTRAM: the two writers. The install wins a same-(way,set)
+    // collision exactly as its later assignment did over the S1 clear in the flop form
+    // (and the XOR two-write lowering requires distinct addresses anyway).
+    if (pfFilledLutram) for (w <- 0 until ways) {
+      pfFilledMem(w).write(installSet, pfInstBit, pfInstEn(w))
+      pfFilledMem(w).write(s0Set, False, pfClrEn(w) && !(pfInstEn(w) && installSet === s0Set))
     }
 
     // ══ FMax (200 MHz, 2026-10-06): REGISTERED UFA WRITE + BYPASS CAPTURE ════════════

@@ -92,7 +92,9 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
                        /** See `ShippingCoreConfig.lsSpecWakeAlu` (B2). Effective only when
                          * the host has an LS EU publishing `wakeupSpecAlu`. */
                        val specAluWake: Boolean = m68k040.top.ShippingCoreConfig.lsSpecWakeAlu,
-                       val alu1Lean: Boolean = m68k040.top.ShippingCoreConfig.alu1Lean) extends FiberPlugin
+                       val alu1Lean: Boolean = m68k040.top.ShippingCoreConfig.alu1Lean,
+                       /** See `ShippingCoreConfig.iqPositionLutram`. */
+                       val positionLutram: Boolean = m68k040.top.ShippingCoreConfig.iqPositionLutram) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
   require(!earlyAutoStoreAddress || earlyStoreAddress)
   require(!fourCycleL1 || specLoadWakeup,
@@ -395,7 +397,17 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // Only insertion writes positions; compaction changes the shared epoch.
     class Scoreboard(depth: Int) extends Area {
       val busy       = Reg(Bits(depth bits)) init 0
-      val physToPosition = Reg(Vec(UInt(slotIdxW bits), depth))
+      // CPU_IQ_POS_LUTRAM: the position rows live in an async-read LUTRAM (two write
+      // ports = the two push ways, written once below by `commitPositionWrites`). A row is
+      // only read under `busy(p)`, and `busy(p)` is only ever set together with an insert
+      // of row p, so a never-written row is never observed.
+      val physToPosition: Vec[UInt] = if (positionLutram) null else Reg(Vec(UInt(slotIdxW bits), depth))
+      val positionMem: Mem[UInt] = if (!positionLutram) null else Mem(UInt(slotIdxW bits), depth)
+      private val pW = log2Up(depth)
+      val insEn:   Vec[Bool] = if (positionLutram) Vec.fill(wayCount)(False) else null
+      val insAddr: Vec[UInt] = if (positionLutram) Vec.fill(wayCount)(U(0, pW bits)) else null
+      def position(physreg: UInt): UInt =
+        if (positionLutram) positionMem.readAsync(physreg.resize(pW)) else physToPosition(physreg)
       val legacyPhysToSlot = GenerationFlags.simulation {
         Reg(Vec(UInt(slotIdxW bits), depth))
       }
@@ -405,16 +417,32 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
             legacyPhysToSlot(p) := (legacyPhysToSlot(p) - wayCount).resize(slotIdxW)
           }
           when(busy(p)) {
-            assert(slotAtEpoch(physToPosition(p), positionEpoch) === legacyPhysToSlot(p),
+            assert(slotAtEpoch(position(U(p, pW bits)), positionEpoch) === legacyPhysToSlot(p),
               "IQ stationary position differs from legacy compacted slot")
           }
         }
       }
       def insert(physreg: UInt, way: Int): Unit = {
         // (14 + way) + 2*(E+1) == 2*E + way modulo 16.
-        physToPosition(physreg) := (positionEpoch.asBits ## B(way, 1 bits)).asUInt
+        if (positionLutram) { insEn(way) := True; insAddr(way) := physreg.resize(pW) }
+        else physToPosition(physreg) := (positionEpoch.asBits ## B(way, 1 bits)).asUInt
         GenerationFlags.simulation {
           legacyPhysToSlot(physreg) := slotCount - wayCount + way
+        }
+      }
+      /** CPU_IQ_POS_LUTRAM: the row writes, after every `insert` site. Way 1 wins a
+        * same-row collision exactly as its later assignment did in the flop form (rename
+        * never hands two in-flight producers one physreg, so it does not occur). */
+      def commitPositionWrites(): Unit = if (positionLutram) {
+        for (way <- 0 until wayCount) {
+          val overridden = (way + 1 until wayCount).map(o => insEn(o) && insAddr(o) === insAddr(way))
+            .foldLeft(False: Bool)(_ || _)
+          positionMem.write(insAddr(way), (positionEpoch.asBits ## B(way, 1 bits)).asUInt,
+            insEn(way) && !overridden)
+        }
+        GenerationFlags.simulation {
+          assert(!(insEn(0) && insEn(1) && insAddr(0) === insAddr(1)),
+            "IQ scoreboard: both push ways inserted the same physreg")
         }
       }
     }
@@ -456,8 +484,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       s"PHYS_X_REGS_DEFAULT=${m68k040.Global.PHYS_X_REGS_DEFAULT}, " +
       s"RegfileSpec.X.depth=${m68k040.execute.regfile.RegfileSpec.X.depth}")
     val sbX    = new Scoreboard(physXN) // X flag physregs (width PHYS_X_ID_W)
-    sbX.busy.simPublic(); sbX.physToPosition.simPublic()
-    sbInt.busy.simPublic(); sbInt.physToPosition.simPublic(); positionEpoch.simPublic()
+    sbX.busy.simPublic(); if (!positionLutram) sbX.physToPosition.simPublic()
+    sbInt.busy.simPublic(); if (!positionLutram) sbInt.physToPosition.simPublic(); positionEpoch.simPublic()
     // FP-DATA / FPCC static scoreboards. Both rename classes have 16 physical entries
     // (spec Decisions 4+6), so both are 4-bit-tag/16-deep, exactly like sbNzvc/sbX.
     // NOTE (see this task's scope note): today EVERY FP producer is CPLX and therefore
@@ -1512,8 +1540,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // Build the trigger Bits for a pushed slot of the given priority width.
     def trigInit(uop: IqHot, width: Int): Bits = {
       val t = B(0, width bits)
-      def dep(busy: Bits, positions: Vec[UInt], physreg: UInt, reads: Bool): Unit = {
-        val producerSlot = slotAtEpoch(positions(physreg), nextPositionEpoch)
+      def dep(busy: Bits, sb: Scoreboard, physreg: UInt, reads: Bool): Unit = {
+        val producerSlot = slotAtEpoch(sb.position(physreg), nextPositionEpoch)
         when(reads && busy(physreg)) {
           // bit index < this slot's priority (older), so in range.
           t(producerSlot) := True
@@ -1522,14 +1550,14 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       // `sb*BusyEff`, NOT the raw `sb*.busy`: the retimed (C+1) scoreboard clear MUST be
       // bypassed in here or a uop pushed exactly one cycle after its producer's issue
       // latches a trigger that can never clear -> deadlock. See the bypass declaration.
-      dep(sbIntBusyEff,  sbInt.physToPosition,  uop.psrcA, uop.psrcAValid)
-      dep(sbIntBusyEff,  sbInt.physToPosition,  uop.psrcB, srcBIsReg(uop))
-      dep(sbIntBusyEff,  sbInt.physToPosition,  uop.psrcC, uop.psrcCValid)
-      dep(sbNzvcBusyEff, sbNzvc.physToPosition, uop.pNzvcSrc, uop.readsNzvc)
-      dep(sbXBusyEff,    sbX.physToPosition,    uop.pXSrc, uop.readsX)
-      dep(sbFpBusyEff,   sbFp.physToPosition,   uop.pFpSrcA,  uop.psrcAFpValid)
-      dep(sbFpBusyEff,   sbFp.physToPosition,   uop.pFpSrcB,  uop.psrcBFpValid)
-      dep(sbFpccBusyEff, sbFpcc.physToPosition, uop.pFpccSrc, uop.readsFpcc)
+      dep(sbIntBusyEff,  sbInt,  uop.psrcA, uop.psrcAValid)
+      dep(sbIntBusyEff,  sbInt,  uop.psrcB, srcBIsReg(uop))
+      dep(sbIntBusyEff,  sbInt,  uop.psrcC, uop.psrcCValid)
+      dep(sbNzvcBusyEff, sbNzvc, uop.pNzvcSrc, uop.readsNzvc)
+      dep(sbXBusyEff,    sbX,    uop.pXSrc, uop.readsX)
+      dep(sbFpBusyEff,   sbFp,   uop.pFpSrcA,  uop.psrcAFpValid)
+      dep(sbFpBusyEff,   sbFp,   uop.pFpSrcB,  uop.psrcBFpValid)
+      dep(sbFpccBusyEff, sbFpcc, uop.pFpccSrc, uop.readsFpcc)
       t
     }
 
@@ -2059,6 +2087,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         }
       }
     }
+    Seq(sbInt, sbNzvc, sbX, sbFp, sbFpcc).foreach(_.commitPositionWrites())
     // On issue, clear busy for the issued producer's dst(s) so later pushes do not
     // depend on an already-result-available producer. A SLOW (shift) producer is in the
     // aluSlow* bitmaps, NOT sb*, so its sb*-clear here is a harmless no-op; aluSlow* is

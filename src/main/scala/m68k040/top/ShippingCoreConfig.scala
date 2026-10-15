@@ -1018,4 +1018,24 @@ object ShippingCoreConfig {
     * Zero-cycle; default OFF = identical netlist. Read as StoreQueue's constructor default.
     * Echoed in `SHIPPING_CONFIG`. */
   val sqVaddrLutram: Boolean   = envFlag("CPU_SQ_VADDR_LUTRAM", true)
+  /** Area (sqarea 2026-10-15): the D-cache round-robin victim pointers (`victim`, one
+    * wayBits counter per line set) live in an async-read LUTRAM instead of a
+    * `Vec(RegInit)` flop array with a 256:1 read mux per reader. Reset equivalence is
+    * kept by writing 0 at `resetSweepSet` during the existing runtime reset sweep (no
+    * request is accepted until it ends), and the Mem is initialised to 0 for power-on.
+    * Every read returns the same value as the flop array on every cycle after the sweep.
+    * Unsectored only. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val dcacheVictimLutram: Boolean = envFlag("CPU_DCACHE_VICTIM_LUTRAM", true)
+  /** Area (sqarea 2026-10-15): the I-cache prefetch-provenance telemetry `pfFilled`
+    * (ways x sets flops with an all-clear) becomes one async-read LUTRAM per way. The
+    * all-clear on invalidate is dropped: the bit is consumed only under `s1HitVec(w)`,
+    * which needs a valid line, and every `valids := True` install also writes the bit,
+    * so a stale bit under an invalid line is never observed. Default OFF; echoed. */
+  val icachePfFilledLutram: Boolean = envFlag("CPU_ICACHE_PFFILLED_LUTRAM", true)
+  /** Area (sqarea 2026-10-15): the IssueQueue static scoreboards' producer-position rows
+    * (`physToPosition`, depth x 4 bits for sbInt/sbNzvc/sbX/sbFp/sbFpcc) live in async-read
+    * LUTRAMs written by the two push ways, instead of flop arrays with a depth:1 read mux
+    * per push source. A row is read only under its `busy` bit, which is set only together
+    * with an insert of that row, so every observed value is identical. Default OFF; echoed. */
+  val iqPositionLutram: Boolean = envFlag("CPU_IQ_POS_LUTRAM", false)
 }
