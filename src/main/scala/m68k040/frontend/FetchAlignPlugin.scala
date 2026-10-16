@@ -901,7 +901,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // CPU_PREDECODE_PUSH_OPFIELDS: the op-only predecode fields, derived here from the 4
     // response words (straight off the I-cache's response register) instead of being
     // carried from refill. Same functions `PredecodeWord.classify` uses.
-    val pushOpFields = m68k040.top.ShippingCoreConfig.predecodePushOpFields
+    val pushOpFields = m68k040.top.ShippingCoreConfig.predecodePushOpFields ||
+                       m68k040.top.ShippingCoreConfig.predecodeLazy4
     val rspOpSize = if (pushOpFields)
       Vec(rspWords.map(op => m68k040.decode.OperationDecoder.decode(op).size)) else null
     val rspOpCtrl = if (pushOpFields)
@@ -1184,6 +1185,18 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                            (availEffPrev =/= availEff)
     when(p0LiveInvalidate) {
       p0LiveReg.ambiguousLine := True
+    }
+    // Refill-predecode oracle (simulation only, under the predecode-restructuring flags):
+    // a resolved live classification of the head and a non-ambiguous stored predecode of
+    // the same head word must agree. Catches a stale/foreign predecode record.
+    if (m68k040.top.ShippingCoreConfig.predecodeLazy4 || m68k040.top.ShippingCoreConfig.predecodeCoded ||
+        m68k040.top.ShippingCoreConfig.predecodePushOpFields) GenerationFlags.simulation {
+      val hp0 = (if (feRetime) ibuf.io.headPredRaw else ibuf.io.headPred)(0)
+      when(availEff =/= 0 && !p0LiveReg.ambiguousLine && !hp0.ambiguousLine &&
+           hp0.lenWords =/= 0 && p0LiveReg.lenWords =/= 0) {
+        assert(hp0.lenWords === p0LiveReg.lenWords,
+          "stored predecode lenWords disagrees with the live classification of the head", FAILURE)
+      }
     }
 
     // ---- Aligner: combinational decode of buffer head ----

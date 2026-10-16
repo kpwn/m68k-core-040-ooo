@@ -15,7 +15,7 @@ foreach pat {IcachePlugin FetchAlignPlugin ufaWrData rspPredReg rspDataReg bypPr
   set m [llength [get_cells -hier -filter "REF_NAME =~ RAM* && NAME =~ *$pat*"]]
   puts "RESULT cells $pat LUT $l FF $f RAM $m"
 }
-foreach {tag pat} {ufaWrData *ufaWrData* rspPredReg *rspPredReg* bypPred *bypPred_reg* ibufEntries *ibuf*entries* lineMem *lineMem*} {
+foreach {tag pat} {predMem *predMem* jobRegs *logic_job* ufaWrData *ufaWrData* rspPredReg *rspPredReg* bypPred *bypPred_reg* ibufEntries *ibuf*entries* lineMem *lineMem*} {
   set cs [get_cells -hier -filter "NAME =~ $pat"]
   if {[llength $cs] == 0} { puts "RESULT path $tag none"; continue }
   set ps [get_timing_paths -max_paths 1 -nworst 1 -setup -to $cs]

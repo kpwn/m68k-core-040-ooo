@@ -2,7 +2,7 @@ package m68k040.top
 
 import m68k040.M68kSpinalConfig
 import m68k040.cache.{ChunkPredecode, IcacheInstructionOrder}
-import m68k040.frontend.PredecodeWord
+import m68k040.frontend.{PredecodeCoded, PredecodeWord}
 import spinal.core._
 
 /** OOC probe of the I-cache refill predecode cone (`IcachePlugin.ufaWrData`): fillLo/fillHi
@@ -63,5 +63,41 @@ object GenPredecodeSynthVerilog {
     M68kSpinalConfig(targetDirectory = "generated").generateVerilog(
       new PredecodeProbe(mode).setDefinitionName(name))
     println(s"Generated generated/$name.v")
+  }
+}
+
+/** OOC probe of the LAZY4 job's classifier group: 4 units over a registered 7-word window
+  * (+ window-end validity), CODED form under the coverage cuts `drop`; registered
+  * {lenWords, ambiguousLine} x 4 out. `drop` empty = the LAZY4 shipping classifier. */
+class PredecodeUnits4Probe(drop: Set[String], coded: Boolean = true) extends Component {
+  val io = new Bundle {
+    val w = in Vec(Bits(16 bits), 7)
+    val lastGroup = in Bool()
+    val q = out Bits(20 bits)
+  }
+  val w = RegNext(io.w); val lastG = RegNext(io.lastGroup)
+  val valid = (0 until 7).map(k => if (k < 4) True else !lastG)
+  val recs = if (coded) {
+    val views = (0 until 7).map(j => PredecodeCoded.ix(w(j), valid(j)))
+    (0 until 4).map { i =>
+      val v = (1 to 3).map(p => PredecodeCoded.cutView(w(i + p), valid(i + p), p, drop))
+      PredecodeCoded.classifyD(w(i), w(i + 1), w(i + 2), w(i + 3), v(0)._1, v(1)._1, v(2)._1,
+        if (drop.isEmpty) views(i + 1) else v(0)._2, if (drop.isEmpty) views(i + 2) else v(1)._2,
+        if (drop.isEmpty) views(i + 3) else v(2)._2, v.map(_._3), drop)
+    }
+  } else (0 until 4).map(i => PredecodeWord.classify(w(i), w(i + 1), w(i + 2), w(i + 3),
+    extWValid = valid(i + 1), extW2Valid = valid(i + 2), extW3Valid = valid(i + 3)))
+  io.q := RegNext(Cat(recs.map(r => r.ambiguousLine ## r.lenWords.asBits)))
+}
+
+object GenPredecodeUnits4Verilog {
+  def main(args: Array[String]): Unit = {
+    // args: name=cuts (cuts '+'-joined, "none" = no cut, "orig" = PredecodeWord)
+    for (a <- args) {
+      val Array(name, c) = a.split('=')
+      val drop = if (c == "none" || c == "orig") Set.empty[String] else c.split('+').toSet
+      M68kSpinalConfig(targetDirectory = "generated").generateVerilog(
+        new PredecodeUnits4Probe(drop, coded = c != "orig").setDefinitionName("PdU4_" + name))
+    }
   }
 }

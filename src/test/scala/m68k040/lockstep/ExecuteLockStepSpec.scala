@@ -14452,4 +14452,50 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   test("odd-target: JSR/JMP/BSR/RTS to an odd address -> vector 3, 68040 side effects (user mode, USP)", VerilatorTest) {
     oddTargetRun("odd-target-user", user = true)
   }
+
+  // ── Refill-predecode hazards (CPU_PREDECODE_LAZY4 / CODED / PUSH_OPFIELDS) ──────────
+  // Cold lines entered at group 0 that immediately branch FORWARD into a far group of the
+  // SAME line (which a lazy predecode job may not have written yet), then run multi-word
+  // instructions whose lengths depend on 1..3 lookahead words (brief and full-format
+  // indexed EAs, .L immediates) across group and line boundaries, then branch to the next
+  // line at a varying offset. `stride` 4096 puts every line in ONE set (way replacement
+  // while lines are being installed back to back); 192 spreads them. Two passes: the
+  // second runs the same code warm (or re-missed, for the same-set variant).
+  private def predecodeHazardSrc(lines: Int, stride: Int, passes: Int): (String, Int) = {
+    val sb = new StringBuilder
+    sb.append(s"moveq #$passes,%d7 ; moveq #3,%d1 ; moveq #0,%d4 ; lea 0x100,%a0 ; bra.l .Lh0 ; ")
+    var perPass = 0
+    for (i <- 0 until lines) {
+      val base = 0x1000 + i * stride
+      val far  = 34 + 4 * (i % 7)                       // 34..58: groups 4..7
+      sb.append(f".org 0x$base%x ; .Lh$i: bra.s .Lf$i ; ")
+      sb.append(f".org 0x${base + far}%x ; .Lf$i: lea (8,%%pc,%%d1.w),%%a1 ; move.l #0x${0x11110000 + i}%x,%%d3 ; ")
+      sb.append(f"lea (0x12345678,%%a0,%%d1.l*4),%%a3 ; addi.w #$i,%%d4 ; lea (-6,%%a0,%%d1.l),%%a2 ; ")
+      perPass += 6
+      if (i + 1 < lines) { sb.append(s"bra.l .Lh${i + 1} ; "); perPass += 1 }
+      else { sb.append("subq.l #1,%d7 ; bne.l .Lh0 ; .Lhend: bra.s .Lhend ; "); perPass += 2 }
+    }
+    (sb.toString, 5 + passes * perPass)
+  }
+  /** Runs a hazard program; under CPU_PREDECODE_LAZY4 also requires that fetch really did
+    * read groups the job had not written yet (the case under test). */
+  private def pdHazardRun(name: String, src: String, n: Int): Unit = {
+    var pend = 0L
+    runLockStep(name, src, nInstr = n, maxCycles = 60000, perCycle = { d =>
+      val ic = d.icache.logic
+      if (ic.lazy4 && ic.lazyPendS1.toBoolean && ic.s0Valid.toBoolean) pend += 1
+    })
+    println(s"[$name] lazy pending-group responses = $pend")
+    // (CPU_PREDECODE_LAZY_PAIR finishes a line in 4 cycles; these programs cannot catch it.)
+    if (m68k040.top.ShippingCoreConfig.predecodeLazy4 && !m68k040.top.ShippingCoreConfig.predecodeLazyPair)
+      assert(pend > 0, s"[$name] no fetch ever read a not-yet-written predecode group")
+  }
+  test("lock-step: refill predecode hazards -- far-group entry into fresh lines, spread sets", VerilatorTest) {
+    val (src, n) = predecodeHazardSrc(lines = 24, stride = 192, passes = 2)
+    pdHazardRun("pd-hazard-spread", src, n)
+  }
+  test("lock-step: refill predecode hazards -- far-group entry, one set (way replacement)", VerilatorTest) {
+    val (src, n) = predecodeHazardSrc(lines = 10, stride = 4096, passes = 3)
+    pdHazardRun("pd-hazard-oneset", src, n)
+  }
 }
