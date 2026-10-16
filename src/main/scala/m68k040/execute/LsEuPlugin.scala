@@ -4879,8 +4879,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     val p3ReservationFire = Bool(); p3ReservationFire := False
     /** `storeCompDetach`: a captured fast store allocated in P3 and handed its completion
       * to the detached owner because an older completion owned comp* this cycle. */
-    val p3CompDetachFire = Bool(); p3CompDetachFire := False
-    if (compDetachOn) p3CompDetachFire.simPublic()
+    val p3CompDetachFire: Bool = if (!compDetachOn) null else {
+      val b = Bool(); b := False; b.simPublic(); b
+    }
     val p3ReservedPublish = Bool()
     if(!reserveLateStore) p3ReservedPublish := False
     val p3LateDataCapture = Bool()
@@ -5028,23 +5029,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
             p3CanLeave       := True
           }
         } elsewhen(!sq.io.full && !(pendRingFull && !fastStore)) {
-          // `storeCompDetach` eligibility: exactly the late-data reservation's set of
-          // detachable stores (see the detached owner's admission assertion), minus split
-          // accesses; the owner must have room.
-          val compDetachOk = if(!compDetachOn) False else
-            !p3Front.stkPush && !p3Front.ccrRestore && !p3Front.writesX && !p3Front.leaAddr &&
-            !p3Front.twoAccess &&
-            ((!p3Front.pdstValid && !p3Front.autoStoreAn) ||
-             (Bool(earlyAutoStoreAddress) && p3Front.pdstValid && p3Front.autoStoreAn)) &&
-            detachedStore.get.reserveReady
-          when(fastStore && olderThanP3Comp && !compDetachOk) {
-            frontCompHeld := True
-          } elsewhen(fastStore && olderThanP3Comp) {
-            sq.io.alloc.valid           := True
-            sq.io.alloc.payload.precise := False
-            p3CompDetachFire := True
-            p3CanLeave := True
-          } otherwise {
+          // The ordinary captured-data store arm (allocate + complete, or defer if precise).
+          def storeAllocAndComplete(): Unit = {
             sq.io.alloc.valid           := True
             sq.io.alloc.payload.precise := !fastStore
             when(fastStore) {
@@ -5054,6 +5040,29 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
               deferCompletion(p3Front)
             }
             p3CanLeave := True
+          }
+          if (!compDetachOn) {
+            when(fastStore && olderThanP3Comp) {
+              frontCompHeld := True
+            } otherwise { storeAllocAndComplete() }
+          } else {
+            // `storeCompDetach` eligibility: exactly the late-data reservation's set of
+            // detachable stores (see the detached owner's admission assertion), minus split
+            // accesses; the owner must have room.
+            val compDetachOk =
+              !p3Front.stkPush && !p3Front.ccrRestore && !p3Front.writesX && !p3Front.leaAddr &&
+              !p3Front.twoAccess &&
+              ((!p3Front.pdstValid && !p3Front.autoStoreAn) ||
+               (Bool(earlyAutoStoreAddress) && p3Front.pdstValid && p3Front.autoStoreAn)) &&
+              detachedStore.get.reserveReady
+            when(fastStore && olderThanP3Comp && !compDetachOk) {
+              frontCompHeld := True
+            } elsewhen(fastStore && olderThanP3Comp) {
+              sq.io.alloc.valid           := True
+              sq.io.alloc.payload.precise := False
+              p3CompDetachFire := True
+              p3CanLeave := True
+            } otherwise { storeAllocAndComplete() }
           }
         }
       } elsewhen(p3IsLoad) {

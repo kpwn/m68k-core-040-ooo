@@ -6358,20 +6358,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     } }
     val evict = for (line <- lines; n <- 1 to 4)
       yield s"move.l #0,0x${(line + n * DcWayStride).toHexString}"
-    var skipped = 0; var detached = 0
+    // Both taps are null unless their mechanism is elaborated (flag on; the detach also
+    // needs the shipping LSU's detached-store owner, i.e. LOCKSTEP_SHIPPING=1).
+    var skipped = 0; var detached = 0; var pnBuilt = false; var detBuilt = false
     runLockStep("ls-probe-nowait", (setup ++ body ++ evict).mkString(" ; "),
       checkMem = lines.map(_.toLong), checkSpan = 4, maxCycles = 100000,
       perCycle = dut => {
         val t = dut.lsEu.logic.probeSkipped
-        if (t != null && t.toBoolean) skipped += 1
-        if (m68k040.top.ShippingCoreConfig.lsStoreCompDetach &&
-            dut.lsEu.logic.p3CompDetachFire.toBoolean) detached += 1
+        if (t != null) { pnBuilt = true; if (t.toBoolean) skipped += 1 }
+        val d = dut.lsEu.logic.p3CompDetachFire
+        if (d != null) { detBuilt = true; if (d.toBoolean) detached += 1 }
       })
     println(s"LS_PROBE_NOWAIT_ORACLE skipped=$skipped detached=$detached")
-    if (m68k040.top.ShippingCoreConfig.lsProbeNoWait)
-      assert(skipped > 0, "CPU_LS_PROBE_NOWAIT on, but no load ever launched without a probe")
-    if (m68k040.top.ShippingCoreConfig.lsStoreCompDetach)
-      assert(detached > 0, "CPU_LS_STORE_COMP_DETACH on, but no store completion was ever detached")
+    if (pnBuilt) assert(skipped > 0, "CPU_LS_PROBE_NOWAIT on, but no load ever launched without a probe")
+    if (detBuilt) assert(detached > 0, "CPU_LS_STORE_COMP_DETACH on, but no store completion was ever detached")
   }
 
   test("lock-step: early store address preserves late data, byte lanes and CCR", VerilatorTest) {
