@@ -728,6 +728,11 @@ object GenSocketTopVerilog {
             s"alu1Lean=${ShippingCoreConfig.alu1Lean} " +
             s"excFastFrames=${ShippingCoreConfig.excFastFrames} " +
             s"excFramesCopyback=${ShippingCoreConfig.excFramesCopyback} " +
+            s"lsParkNoLine=${ShippingCoreConfig.lsParkNoLine} " +
+            s"tlbDrainNarrow=${ShippingCoreConfig.tlbDrainNarrow} " +
+            s"dcProbeMhLag=${ShippingCoreConfig.dcProbeMhLag} " +
+            s"dcFreeCapture=${ShippingCoreConfig.dcFreeCapture} " +
+            s"dbgApplyNoSnap=${ShippingCoreConfig.dbgApplyNoSnap} " +
             s"pairCorrectBranch=${ShippingCoreConfig.pairCorrectBranch} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
