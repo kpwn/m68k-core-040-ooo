@@ -795,10 +795,12 @@ object ShippingCoreConfig {
     * update, and a later FSAVE yields the 52-byte frame (E1 set, CMDREG1B, STAG/DTAG,
     * ETEMP/FPTEMP) the ROM FPSP's x_unsupp ($4088DAB0) reads. FP memory (An)+ is re-ordered
     * so the An update retires before the FP op (the 040 completes the EA before trapping).
-    * Default OFF: with it off no trap logic is elaborated and the FP lane is unchanged.
+    * Default ON: the Q700 ROM FPSP needs this trap to normalize the unnormal source
+    * used by SANE (and Speedometer's Whetstone calculation). CPU_FP_UNSUPP_TRAP=0
+    * retains the previous hardware behavior for isolation.
     * Read by `DivEuPlugin`, `RobPlugin`, `ExceptionUnit`, `FpuControlPlugin`,
     * `MicroOpAssembler`, `Microcode`. */
-  val fpUnsuppTrap: Boolean = envFlag("CPU_FP_UNSUPP_TRAP", false)
+  val fpUnsuppTrap: Boolean = envFlag("CPU_FP_UNSUPP_TRAP", true)
 
   /** CPU_FP_MEM_SRCB_WAIT: a microcoded FP memory-source issue row (UFpIssue: FMOVE/F<op>
     * .D/.X <mem>,FPn) carries its packed command word in `imm` (useImm=True), and the IQ's

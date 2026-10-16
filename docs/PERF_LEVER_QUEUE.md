@@ -139,6 +139,13 @@ Three things this pins down:
 nothing, not a fast result, and it is consistent with the known FP defects. Unmeasured —
 flagged here so no one reads the Average as an all-round figure.
 
+The board captures above predate the vector-55 unsupported-data-type implementation.
+The SANE path used by Speedometer loads an unnormal extended operand and needs the
+Q700 ROM FPSP trap handler to normalize it. That path passes in the focused Verilator
+test with `CPU_FP_UNSUPP_TRAP=1`; the shipping configuration now enables it by default. The
+board's 0.000 observation remains historical until a bitstream with that default is
+built and Speedometer is rerun on hardware.
+
 ## Area: track as we go, cut at the end
 
 **Plan (owner, 2026-09-27): track area in the 100 MHz lane as each lever lands, then
