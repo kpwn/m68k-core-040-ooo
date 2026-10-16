@@ -1,7 +1,7 @@
 package m68k040.cache
 
 import m68k040.services.{FetchService, TranslationService, PrivilegeService}
-import m68k040.frontend.PredecodeWord
+import m68k040.frontend.{PredecodeCoded, PredecodeWord}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -241,7 +241,20 @@ class IcachePlugin(val predecodeWords: Int = 16,
     // hardcoded 128 (= 4 bits/word * 32) back when ChunkPredecode was 4 bits; DERIVED now
     // (deep-audit F1/F2/F3, 2026-07-11: ChunkPredecode widened 4->5 bits, so this grows to
     // 160) so a future width change can't silently desync this packing from the real size.
-    val PRED_BITS_PER_WORD = ChunkPredecode().getBitsWidth
+    // CPU_PREDECODE_PUSH_OPFIELDS: only {lenWords, ambiguousLine} are stored; the op-only
+    // fields (size, ctrlXfer) are derived at IBuf push by FetchAlignPlugin.
+    val pushOpFields = m68k040.top.ShippingCoreConfig.predecodePushOpFields
+    val PRED_BITS_PER_WORD = if (pushOpFields) 5 else ChunkPredecode().getBitsWidth
+    def packPred(p: ChunkPredecode): Bits =
+      if (pushOpFields) p.ambiguousLine ## p.lenWords.asBits else p.asBits
+    def unpackPred(b: Bits): ChunkPredecode = if (pushOpFields) {
+      val r = ChunkPredecode()
+      r.lenWords      := b(3 downto 0).asUInt
+      r.ambiguousLine := b(4)
+      r.size          := m68k040.isa.Size.BYTE   // unread: FetchAlignPlugin derives it at push
+      r.ctrlXfer      := False                   // unread: FetchAlignPlugin derives it at push
+      r
+    } else b.as(ChunkPredecode())
     // M2a (Task 7): no longer used by any RTL expression -- the last whole-line packed
     // predecode value (`missPred`) is gone. Retained as the derived documentation of the
     // line-granular width the comments above and below still reason in.
@@ -1225,6 +1238,23 @@ class IcachePlugin(val predecodeWords: Int = 16,
         if (i < chunkWords) w(i) else Mux(nextValid, nx(i - chunkWords), B(0, 16 bits))
       def wordValid(i: Int): Bool =
         if (i < chunkWords) True else nextValid
+      if (m68k040.top.ShippingCoreConfig.predecodeCoded) {
+        // CPU_PREDECODE_CODED: one indexed-EA extension length per absolute word, shared by
+        // the (up to) three classifiers that see it as lookahead.
+        val ixs = (0 until chunkWords + 3).map(j => PredecodeCoded.ix(word(j), wordValid(j)))
+        Vec((0 until chunkWords).map { i =>
+          packPred(PredecodeCoded.classify(w(i), word(i + 1), word(i + 2), word(i + 3),
+            wordValid(i + 1), wordValid(i + 2), wordValid(i + 3), ixs(i + 1), ixs(i + 2), ixs(i + 3)))
+        }).asBits
+      } else if (pushOpFields)
+      Vec((0 until chunkWords).map { i =>
+        packPred(PredecodeWord.classify(
+          w(i), word(i + 1), word(i + 2), word(i + 3),
+          extWValid  = wordValid(i + 1),
+          extW2Valid = wordValid(i + 2),
+          extW3Valid = wordValid(i + 3)))
+      }).asBits
+      else
       Vec((0 until chunkWords).map { i =>
         PredecodeWord.classify(
           w(i), word(i + 1), word(i + 2), word(i + 3),
@@ -1247,7 +1277,7 @@ class IcachePlugin(val predecodeWords: Int = 16,
     def windowPredBeat(entry: Bits, pc: UInt): Vec[ChunkPredecode] = {
       val win  = entry.subdivideIn(4 * PRED_BITS_PER_WORD bits)(pc(4 downto 3))
       val nibs = win.subdivideIn(PRED_BITS_PER_WORD bits)
-      Vec(nibs.map(b => b.as(ChunkPredecode())))
+      Vec(nibs.map(b => unpackPred(b)))
     }
 
     // M2a (Task 7): the LEGACY whole-line form (`windowPredLine`, a pc(5:3) select over
@@ -1268,7 +1298,9 @@ class IcachePlugin(val predecodeWords: Int = 16,
     // select the same window. Passing `s0Pc` here rather than `s0Lane` keeps
     // `windowPredBeat`'s one signature shared with the bypass path -- do not "unify"
     // them by changing the helper.
-    val wayPred   = (0 until ways).map(w => windowPredBeat(ufaPred(w), s0Pc).asBits)
+    val wayPred   = (0 until ways).map(w =>
+      if (pushOpFields) ufaPred(w).subdivideIn(4 * PRED_BITS_PER_WORD bits)(s0Pc(4 downto 3))
+      else windowPredBeat(ufaPred(w), s0Pc).asBits)
 
     // ══ SG-2 (plan resolution; spec §5.3 sketches only the hit path) ═══════════════
     // REPLAY and FAULT deliver from a KNOWN way, not from a computed `s1HitVec`. One
@@ -1336,7 +1368,7 @@ class IcachePlugin(val predecodeWords: Int = 16,
     val s1PredBits = Mux(s0FromMiss, bypPred, ohOr(s1WayOh, wayPred))
     val s1PredW    = Vec(Mux(s0Fault, B(0, s1PredBits.getWidth bits), s1PredBits)
                            .subdivideIn(PRED_BITS_PER_WORD bits)
-                           .map(b => b.as(ChunkPredecode())))
+                           .map(b => unpackPred(b)))
 
     // ══ M3b: THE RESPONSE GATE. `s0Valid` alone is NOT the response condition. ═════
     // `s0Valid` now means "a command was accepted last cycle" and is therefore TRUE on

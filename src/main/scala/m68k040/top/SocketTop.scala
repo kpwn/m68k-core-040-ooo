@@ -714,6 +714,8 @@ object GenSocketTopVerilog {
             s"ucCtxNarrow=${ShippingCoreConfig.ucCtxNarrow} " +
             s"ucEaDispFold=${ShippingCoreConfig.ucEaDispFold} " +
             s"feRedirectCmd=${ShippingCoreConfig.feRedirectCmd} " +
+            s"predecodeCoded=${ShippingCoreConfig.predecodeCoded} " +
+            s"predecodePushOpFields=${ShippingCoreConfig.predecodePushOpFields} " +
             s"beRetime=${ShippingCoreConfig.beRetime} " +
             s"tc3Retime=${ShippingCoreConfig.tc3Retime} " +
             s"physNzvc=${ShippingCoreConfig.physNzvc} " +
