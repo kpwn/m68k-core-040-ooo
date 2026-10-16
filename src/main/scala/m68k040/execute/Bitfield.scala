@@ -54,6 +54,22 @@ case class BitfieldMid() extends Bundle {
   val width6   = UInt(6 bits)    // 1..32; needed to clamp the stage2 clz count
 }
 
+/** CPU_BF_TRIM midpoint (see `Bitfield.stage1T`). */
+case class BitfieldMidT() extends Bundle {
+  val dy       = Bits(32 bits)
+  val bfOp     = Bits(3 bits)
+  val ffoBase  = UInt(32 bits)
+  val mask     = Bits(32 bits)
+  val rotL     = Bits(32 bits)
+  val insPos   = Bits(32 bits)
+  val extU     = Bits(32 bits)
+  val extS     = Bits(32 bits)
+  val fieldLJ  = Bits(32 bits)
+  val width6   = UInt(6 bits)
+  val nIns     = Bool()
+  val zIns     = Bool()
+}
+
 /** Combinational bit-field datapath, transcribed from Musashi's `_32_d` BFxxx forms.
   *
   * m68k bit numbering: offset 0 = bit 31 (the MSB); the field is `width` bits from
@@ -222,4 +238,55 @@ object Bitfield {
     }
     cnt
   }
+
+  // ── CPU_BF_TRIM: the same datapath with the redundant shifters removed ──────────
+  //  * `dyShL(31)` == `rotL(31)` (both are dy(31-offset)), so `dyShL` is not built.
+  //  * `extS` = `extU` | sign-fill of the top `shAmt` bits (no second arithmetic shifter).
+  //  * `insPos` = ror32(dn2, (offset+width) mod 32) & mask (one rotate, not shift+rotate);
+  //    `insVal` is needed only for N (= dn2(width-1)) and Z (= low `width` bits of dn2 == 0).
+  //  * Z of every op but BFINS is "field == 0" == `extU == 0` (one compare, not four).
+  // Bit-identical to stage2(stage1(cmd)) (BitfieldTrimEquivSpec).
+  def stage1T(cmd: BitfieldCmd): BitfieldMidT = new Area {
+    val mid = BitfieldMidT()
+    val offset = cmd.offset
+    val width6 = (((cmd.rawWidth - 1) & U(31, 5 bits)).resize(6) + 1)   // 1..32
+    val shAmt  = (U(32, 6 bits) - width6).resize(5)                     // 0..31
+    val maskBase = (B(0xffffffffL, 32 bits).asUInt << shAmt)(31 downto 0).asBits
+    val mask     = ror32(maskBase, offset)
+    val rotL     = rol32(cmd.dy, offset)
+    val lowOnes  = (B(0xffffffffL, 32 bits).asUInt >> shAmt).asBits      // low `width` bits
+    val insAmt   = (offset + width6.resize(5)).resize(5)                  // (offset+width) mod 32
+    val insPos   = ror32(cmd.dn2, insAmt) & mask
+    val extU     = (rotL.asUInt >> shAmt).asBits
+    val extS     = extU | (~lowOnes & B(32 bits, default -> rotL(31)))
+    mid.dy      := cmd.dy
+    mid.bfOp    := cmd.bfOp
+    mid.ffoBase := cmd.ffoBase
+    mid.mask    := mask
+    mid.rotL    := rotL
+    mid.insPos  := insPos
+    mid.extU    := extU
+    mid.extS    := extS
+    mid.fieldLJ := (rotL.asUInt & maskBase.asUInt).asBits
+    mid.width6  := width6
+    mid.nIns    := (cmd.dn2 & lowOnes & ~(lowOnes |>> 1)) =/= 0           // dn2(width-1)
+    mid.zIns    := (cmd.dn2 & lowOnes) === 0
+  }.mid
+
+  def stage2T(mid: BitfieldMidT): BitfieldRsp = new Area {
+    val rsp = BitfieldRsp()
+    val clzRaw  = clz32(mid.fieldLJ)
+    val clzClamped = Mux(clzRaw > mid.width6, mid.width6, clzRaw)
+    val ffoRes  = (mid.ffoBase + clzClamped.resize(32)).asBits
+    val chgRes = (mid.dy.asUInt ^ mid.mask.asUInt).asBits
+    val clrRes = (mid.dy.asUInt & ~mid.mask.asUInt).asBits
+    val setRes = (mid.dy.asUInt | mid.mask.asUInt).asBits
+    val insRes = ((mid.dy.asUInt & ~mid.mask.asUInt) | mid.insPos.asUInt).asBits
+    val isIns = mid.bfOp === B"3'd7"
+    rsp.n := Mux(isIns, mid.nIns, mid.rotL(31))
+    rsp.z := Mux(isIns, mid.zIns, mid.extU === 0)
+    rsp.result := mid.bfOp.mux(
+      B"3'd0" -> mid.dy, B"3'd1" -> mid.extU, B"3'd2" -> chgRes, B"3'd3" -> mid.extS,
+      B"3'd4" -> clrRes, B"3'd5" -> ffoRes,   B"3'd6" -> setRes, default -> insRes)
+  }.rsp
 }

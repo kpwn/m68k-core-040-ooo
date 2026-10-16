@@ -1096,4 +1096,35 @@ object ShippingCoreConfig {
     * response not re-qualified by the arbiter `busy` flop, and fanout caps on the
     * D-cache array read set. Default OFF; echoed in `SHIPPING_CONFIG`. */
   val tail20: Boolean = envFlag("CPU_TAIL20", true)
+  /** CPU_SHIFT_FUNNEL (redundancy hunt 2026-10-15): the ALU slow path's line-E shifter
+    * builds every result and carry as ONE window of one class-shaped funnel word
+    * (`ShifterFunnel`) instead of ten per-op barrel shifters + ~17 flag-bit shifts.
+    * Same S1/S1a/S2/S3 stages, same latency; bit-identical (ShifterFunnelEquivSpec).
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val shiftFunnel: Boolean = envFlag("CPU_SHIFT_FUNNEL", true)
+  /** CPU_FP_SRC_NORM1 (redundancy hunt 2026-10-15): RobPlugin's cold unimplemented-frame
+    * immediate conversion (int/single/double -> extended) shares ONE clz64 + barrel
+    * normalizer (`FpSource.toExtendedShared`) instead of three. (Not applied to DivEu's FS1
+    * gateway: +3 logic levels there.) Bit-identical (FpSrcNormEquivSpec). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val fpSrcNorm1: Boolean = envFlag("CPU_FP_SRC_NORM1", true)
+  /** CPU_LS_SPLIT_TAIL (redundancy hunt 2026-10-15): a line-crossing load's merge reads
+    * only slot A's line bytes 13..15 and slot B's bytes 0..2, so the parked-response lines
+    * (`alignedRLine`, 128 b/slot) keep 48 bits and `splitMergeLine` keeps 24.
+    * Bit-identical merge (LsSplitTailEquivSpec). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val lsSplitTail: Boolean = envFlag("CPU_LS_SPLIT_TAIL", true)
+  /** CPU_BF_TRIM (redundancy hunt 2026-10-15): the CPLX bit-field lane's stage 1 drops
+    * its redundant shifters (dyShL, the arithmetic extract shifter, the BFINS shift+rotate
+    * pair -> one rotate) and stage 2 its duplicate zero compares (`Bitfield.stage1T`).
+    * Bit-identical (BitfieldTrimEquivSpec). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val bfTrim: Boolean = envFlag("CPU_BF_TRIM", true)
+  /** CPU_FM_STAGE_RAM (payload hunt 2026-10-15): the ExceptionUnit's cold FMOVEM staging
+    * buffer (`fmLoaded`, 8 x 80 b) becomes an 8-deep LUTRAM (one write, one async read)
+    * instead of 640 flops + an 8:1 80-bit read mux. Same cycles. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val fmStageRam: Boolean = envFlag("CPU_FM_STAGE_RAM", true)
+  /** CPU_EXC_FSM_ONEHOT (fanout census R1, 2026-10-16): the ExceptionUnit state machine
+    * is one-hot encoded, so each state predicate is one flop instead of a 6-bit decode
+    * repeated in every consumer. Pure re-encoding: same states, same transitions.
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val excFsmOneHot: Boolean = envFlag("CPU_EXC_FSM_ONEHOT", false)
 }

@@ -3126,11 +3126,21 @@ class RobPlugin(val detailedPerf: Boolean = false,
       val trapImmDataQ = RegNext(imm.trapImmData)
       val fpuImmQ      = RegNext(p0.fpuImm) init False
       val source = Bits(80 bits)
+      if (!m68k040.top.ShippingCoreConfig.fpSrcNorm1) {
       source := FpSource.intToExtended(trapImmDataQ(31 downto 0))
       switch(exc.entryFpuCmdQ(12 downto 10)) {
         is(B"3'b001") { source := FpSource.singleToExtended(trapImmDataQ(31 downto 0)) }
         is(B"3'b010") { source := trapImmDataQ }
         is(B"3'b101") { source := FpSource.doubleToExtended(trapImmDataQ(63 downto 0)) }
+      }
+      } else {
+        // CPU_FP_SRC_NORM1: one shared normalizer for the three converting formats.
+        val fmt = exc.entryFpuCmdQ(12 downto 10)
+        val isSgl = fmt === B"3'b001"
+        val isInt = (fmt =/= B"3'b001") && (fmt =/= B"3'b101")
+        source := Mux(fmt === B"3'b010", trapImmDataQ,
+          FpSource.toExtendedShared(isInt, isSgl, trapImmDataQ(31 downto 0),
+            trapImmDataQ(31 downto 0), trapImmDataQ(63 downto 0)))
       }
       when(fpuImmQ) { exc.committedFpSrcIn := source }
     }

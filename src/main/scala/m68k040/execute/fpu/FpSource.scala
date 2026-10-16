@@ -288,4 +288,49 @@ object FpSource {
     Mux(isZro, Fp80.packZero(sign),
       sign ## exp ## Mux(isSub, sigSub.asBits, sigNorm))
   }
+
+  /** CPU_FP_SRC_NORM1: `intToExtended` / `singleToExtended` / `doubleToExtended` with ONE
+    * normalizer. All three normalize the same way -- left-justify the significand in 64
+    * bits, `c = clz64`, `sig = m << c`, `exp = base - c` -- and only one of the three
+    * results is ever selected, so the three clz + barrel-shift cones collapse into one;
+    * only the 64-bit input placement and the exponent base are per format. Bit-identical
+    * to `Mux(isInt, intToExtended(intV), Mux(isSgl, singleToExtended(sglV),
+    * doubleToExtended(dblV)))` (FpSrcNormEquivSpec). */
+  def toExtendedShared(isInt: Bool, isSgl: Bool, intV: Bits, sglV: Bits, dblV: Bits,
+                       sharedClz: Boolean = true): Bits = {
+    require(intV.getWidth == 32 && sglV.getWidth == 32 && dblV.getWidth == 64)
+    // int
+    val ia   = intV.asSInt
+    val iNeg = ia < 0
+    val iMag = Mux(iNeg, (-ia).asBits, intV)
+    // single
+    val sSign = sglV(31); val sExp = sglV(30 downto 23).asUInt; val sSig = sglV(22 downto 0)
+    val sMax = sExp === 0xFF; val sSub = (sExp === 0) && (sSig =/= 0); val sZro = (sExp === 0) && (sSig === 0)
+    // double
+    val dSign = dblV(63); val dExp = dblV(62 downto 52).asUInt; val dSig = dblV(51 downto 0)
+    val dMax = dExp === 0x7FF; val dSub = (dExp === 0) && (dSig =/= 0); val dZro = (dExp === 0) && (dSig === 0)
+    // the shared normalizer
+    val m = Mux(isInt, iMag ## B(0, 32 bits), Mux(isSgl, sSig ## B(0, 41 bits), dSig ## B(0, 12 bits)))
+    // sharedClz=false: three narrow clz's in parallel with the input mux (a 7-bit count
+    // mux instead of a 64-bit clz behind it) -- only the barrel shifter is shared.
+    val c = if (sharedClz) Fp80.clz(m) else
+      Mux(isInt, Fp80.clz(iMag).resize(7), Mux(isSgl, Fp80.clz(sSig).resize(7), Fp80.clz(dSig).resize(7)))
+    val sigN = (m.asUInt |<< c.resize(6)).asBits              // c==64 only for m==0 (zero arms)
+    val base = Mux(isInt, U(0x401E, 15 bits), Mux(isSgl, U(0x3F80, 15 bits), U(0x3C00, 15 bits)))
+    val expN = base - c.resize(15)
+    // per-format packing (unchanged arms)
+    val intOut = Mux(intV === 0, Fp80.packZero(False), iNeg ## expN ## sigN)
+    val fSign = Mux(isSgl, sSign, dSign)
+    val fMax  = Mux(isSgl, sMax, dMax)
+    val fSub  = Mux(isSgl, sSub, dSub)
+    val fZro  = Mux(isSgl, sZro, dZro)
+    val fExpNorm = Mux(isSgl, sExp.resize(15) + U(0x3F80, 15 bits), dExp.resize(15) + U(0x3C00, 15 bits))
+    val fSigNorm = Mux(isSgl, B"1" ## sSig ## B(0, 40 bits), B"1" ## dSig ## B(0, 11 bits))
+    val fExp = UInt(15 bits)
+    when(fMax) { fExp := U(Fp80.ExpInf, 15 bits) }
+      .elsewhen(fSub) { fExp := expN }
+      .otherwise { fExp := fExpNorm }
+    val fOut = Mux(fZro, Fp80.packZero(fSign), fSign ## fExp ## Mux(fSub, sigN, fSigNorm))
+    Mux(isInt, intOut, fOut)
+  }
 }

@@ -1217,6 +1217,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpSglIn = Mux(fpS1Kind === FpSrcKind.SINGLEIMM, fpS1Imm(31 downto 0), fpS1IntA)
     val fpDblIn = Mux(fpS1Kind === FpSrcKind.DOUBLEIMM, fpS1Imm(63 downto 0),
                                                         fpS1IntA ## fpS1IntB)
+    // (CPU_FP_SRC_NORM1 deliberately NOT applied here: measured +3 logic levels on this
+    // conversion cone, which is a known FS1 critical path; it is applied only at the cold
+    // RobPlugin unimplemented-frame site.)
     val fpFromInt = FpSource.intToExtended(fpIntIn)
     val fpFromSgl = FpSource.singleToExtended(fpSglIn)
     val fpFromDbl = FpSource.doubleToExtended(fpDblIn)
@@ -1772,17 +1775,21 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val bf2T2        = RegNext(bf1B)      // the LO5/HI5 `res` source (srcB = T2)
 
     // ---- C+2: the rotate / shift / left-justify cone (cheap half) ----
-    val bf2Mid = Bitfield.stage1(bf2Cmd)
+    // CPU_BF_TRIM: the same cut, with the redundant shifters removed (Bitfield.stage1T).
+    val bfTrim = m68k040.top.ShippingCoreConfig.bfTrim
+    val bf2Mid  = if (!bfTrim) Bitfield.stage1(bf2Cmd) else null
+    val bf2MidT = if (bfTrim) Bitfield.stage1T(bf2Cmd) else null
     // ── C+2 -> C+3 CUT (the task-#123 split: the 32-input clz + 8-way mux is the deep
     // half and runs a cycle later off a REGISTERED BitfieldMid). ──
-    val bf3Mid       = RegNext(bf2Mid)
+    val bf3Mid       = if (!bfTrim) RegNext(bf2Mid) else null
+    val bf3MidT      = if (bfTrim) RegNext(bf2MidT) else null
     val bf3StoreForm = RegNext(bf2StoreForm)
     val bf3BitOff    = RegNext(bf2BitOff)
     val bf3InvSrc    = RegNext(bf2InvSrc)
     val bf3T2        = RegNext(bf2T2)
 
     // ---- C+3: clz + mask-modify + the 8-way result/flag mux (deep half) ----
-    val bfRsp = Bitfield.stage2(bf3Mid)
+    val bfRsp = if (!bfTrim) Bitfield.stage2(bf3Mid) else Bitfield.stage2T(bf3MidT)
     // `res` driving the inverse funnel: LO4 (form 1) recomputes it inline from the
     // funnel; LO5/HI5 (forms 2/3/4/5) read it from T2 (the b2 result of an earlier uop).
     val bf3InvRes = Mux(bf3StoreForm === U(1, 3 bits), bfRsp.result, bf3T2)
