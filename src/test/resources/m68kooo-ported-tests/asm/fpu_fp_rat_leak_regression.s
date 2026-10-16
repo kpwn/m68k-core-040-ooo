@@ -64,8 +64,13 @@ _start:
     lea     0x00018000, %a7
 
     lea     BUF, %a1
-    move.l  #0x3F800000, 0(%a1)
-    move.l  #0x40000000, 4(%a1)
+    | CPU_FP_UNSUPP_TRAP (2026-10-16): the extended operand below was {$3F80, $40000000,..}
+    | -- an UNNORMALIZED extended (J=0), which a real MC68040 refuses with vector 55
+    | (unsupported data type). The value is incidental to this test, so it is now a
+    | normal 1.0 ({$3FFF, $80000000, 0}); FP1 *= 1.0 keeps every iteration identical.
+    move.l  #0x3FFF0000, 0(%a1)
+    move.l  #0x80000000, 4(%a1)
+    clr.l   8(%a1)
 
     move.l  #0x3F800000, %d0
     .short  0xF200, 0x4000              | FMOVE.S D0,FP0

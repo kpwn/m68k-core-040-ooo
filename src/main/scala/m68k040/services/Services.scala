@@ -640,6 +640,12 @@ trait FpuControlService {
   /** Packed {cmd[175:160], src[159:80], dst[79:0]} = 176 bits. */
   def setUnimpFrame: Flow[Bits]
   def clearUnimp:    Flow[Bool]
+  /** CPU_FP_UNSUPP_TRAP: the latched frame came from a vector-55 (unsupported data type)
+    * delivery rather than vector 11 -- FSAVE then sets E1 and derives STAG 101 for a
+    * single/double denormal source. `setUnimpIsUnsupp` qualifies `setUnimpFrame` (sampled
+    * on its valid). Both null when the flag is off (no state elaborated). */
+  def uiUnsupp:         Bool = null
+  def setUnimpIsUnsupp: Bool = null
 }
 
 /** The external interrupt inputs (simple protocol): a 3-bit IPL plus the SoC's
@@ -904,6 +910,22 @@ trait FpImmTableService {
 /** Read-only exception view of FP immediates. Sole producer: DecodeStage.
   * RobPlugin reads the head's retained tag at exception entry. The backend
   * squash AFTER capture releases it; ordinary EU consumption remains separate. */
+/** CPU_FP_UNSUPP_TRAP: the operands of an FP operation that will take vector 55
+  * (unsupported data type), captured at the FP lane's FS1 stage -- the only place the
+  * memory-source value still exists. `src` is already in the MC68040 ETEMP form (a
+  * single/double denormal is its fraction left-justified under a clear J bit, which the
+  * FPSP re-exponents itself); `dst` is the FPn the op read back (FPTEMP).
+  * PRODUCER: DivEuPlugin exclusively (null port when the flag is off).
+  * CONSUMER: RobPlugin, which keeps the OLDEST in-flight capture for the frame. */
+case class FpUnsuppCapture() extends Bundle {
+  val robId = UInt(m68k040.Global.ROB_ID_W bits)
+  val src   = Bits(80 bits)
+  val dst   = Bits(80 bits)
+}
+trait FpUnsuppCaptureService {
+  def unsuppCapture: Flow[FpUnsuppCapture]
+}
+
 trait FpTrapImmediateService {
   def trapImmAddr: UInt
   def trapImmData: Bits

@@ -64,6 +64,10 @@ class FpuControlPlugin extends FiberPlugin with FpuControlService {
   override def uiDstOperand:    Bits       = _uiDstOperand
   override def setUnimpFrame:   Flow[Bits] = _setUnimpFrame
   override def clearUnimp:      Flow[Bool] = _clearUnimp
+  var _uiUnsupp: Bool = null
+  var _setUnimpIsUnsupp: Bool = null
+  override def uiUnsupp: Bool         = _uiUnsupp
+  override def setUnimpIsUnsupp: Bool = _setUnimpIsUnsupp
 
   override def roundingMode: Bits = _fpcr(5 downto 4).asBits
   override def precision:    Bits = _fpcr(7 downto 6).asBits
@@ -206,6 +210,13 @@ class FpuControlPlugin extends FiberPlugin with FpuControlService {
     // delivered, which the serializing sysOp/exception FSM makes impossible (both are
     // states of the SAME ExceptionUnit FSM) -- defence in depth, not a live arbitration.
     when(clearUnimp.valid) { uiValid := False }
+    // CPU_FP_UNSUPP_TRAP: which vector produced the latched frame (see the service doc).
+    if (m68k040.top.ShippingCoreConfig.fpUnsuppTrap) {
+      val unsuppReg = RegInit(False); unsuppReg.simPublic()
+      val unsuppIn  = Bool(); unsuppIn.allowOverride; unsuppIn := False
+      when(setUnimpFrame.valid) { unsuppReg := unsuppIn }
+      _uiUnsupp = unsuppReg; _setUnimpIsUnsupp = unsuppIn
+    }
 
     _fpcr = fpcr; _fpsr = fpsr; _fpiar = fpiar
     _setFpcr = setFpcr; _setFpsr = setFpsr; _setFpiar = setFpiar; _orFpsrExc = orFpsrExc

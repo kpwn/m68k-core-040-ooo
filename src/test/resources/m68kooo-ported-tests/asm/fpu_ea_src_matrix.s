@@ -28,9 +28,13 @@ _start:
     move.w  #0x3F80, 2(%a0)
     move.l  #0x3F800000, 4(%a0)
     move.l  #0x40000000, 16(%a0)
-    move.l  #0x3F800000, 32(%a0)
-    move.l  #0x40000000, 36(%a0)
-    move.l  #0x40400000, 40(%a0)
+    | CPU_FP_UNSUPP_TRAP (2026-10-16): the extended operand below was {$3F80, $40000000,..}
+    | -- an UNNORMALIZED extended (J=0), which a real MC68040 refuses with vector 55
+    | (unsupported data type). The value is incidental to this test, so it is now a
+    | normal 1.0 ({$3FFF, $80000000, 0}); the two FMUL.X shapes now multiply by 1.0.
+    move.l  #0x3FFF0000, 32(%a0)
+    move.l  #0x80000000, 36(%a0)
+    clr.l   40(%a0)
 
     | Seed FP0/FP1 with a real single conversion.
     move.l  #0x3F800000, %d0

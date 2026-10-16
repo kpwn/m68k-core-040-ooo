@@ -1938,8 +1938,17 @@ object Microcode {
                                 sz = fmt.loadSz, isFirst = (i == 0))
       }
     }.toVector
-    loads :+ fpMemIssueRow(fmt, isLast = false) :+
-      Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SFpAutoDelta, isLast = true)
+    // CPU_FP_UNSUPP_TRAP: the FP op must be the LAST row, so that a vector-55 trap on it
+    // (format $0, PC = next instruction) leaves the instruction COMPLETE from the integer
+    // unit's view -- An already advanced, exactly as a real 68040 does before it reports an
+    // unsupported data type. The loads read Ay before the update in both orders. Same row
+    // count, so every later ROM entry constant is unchanged.
+    if (m68k040.top.ShippingCoreConfig.fpUnsuppTrap)
+      loads :+ Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SFpAutoDelta) :+
+        fpMemIssueRow(fmt, isLast = true)
+    else
+      loads :+ fpMemIssueRow(fmt, isLast = false) :+
+        Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SFpAutoDelta, isLast = true)
   }
 
   // AUTO_PRE `-(Ay)`: [UAddDrop Ay-=delta] (isFirst) + [LOAD x chunks] + [UFpIssue] (isLast).
@@ -3131,7 +3140,10 @@ object Microcode {
     // NOT wired into any DUT as of this task (confirmed by repo-wide grep), so this change
     // introduces no live corruption path today.
     u.fpuSoftwareComplete := Bool(d.fpMemTrap)
-    u.fpuCmdWord          := (if (d.fpMemTrap) ctx.fpTrapCmd else B(0, 16 bits))
+    // CPU_FP_UNSUPP_TRAP: a hardware FP issue row also carries its raw command word, so a
+    // vector-55 (unsupported data type) delivery can stack it as CMDREG1B.
+    u.fpuCmdWord          := (if (d.fpMemTrap || (m68k040.top.ShippingCoreConfig.fpUnsuppTrap && d.uop == UFpIssue))
+                                ctx.fpTrapCmd else B(0, 16 bits))
     u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     val isMulDiv = d.uop == UMulLo || d.uop == UMulHi || d.uop == UDivQ || d.uop == UDivR
     u.divSigned := (if (isMulDiv) ctx.mdSigned else False)
@@ -3716,7 +3728,9 @@ object Microcode {
     // reads it as a register number at this site, and why the one FUTURE consumer that
     // would care -- ExceptionUnit's `fpuSrcArch`/`committedFpSrcIn` -- is unwired today).
     u.fpuSoftwareComplete := d.fpMemTrap
-    u.fpuCmdWord          := Mux(d.fpMemTrap, ctx.fpTrapCmd, B(0, 16 bits))
+    u.fpuCmdWord          := Mux((if (m68k040.top.ShippingCoreConfig.fpUnsuppTrap) d.fpMemTrap || d.uop === UOpHw.UFpIssue
+                                  else d.fpMemTrap),
+                                 ctx.fpTrapCmd, B(0, 16 bits))
     u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     val isMulDivHw = (d.uop === UOpHw.UMulLo) || (d.uop === UOpHw.UMulHi) ||
                      (d.uop === UOpHw.UDivQ) || (d.uop === UOpHw.UDivR)

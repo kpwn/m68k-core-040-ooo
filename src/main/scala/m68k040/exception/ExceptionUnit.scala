@@ -415,9 +415,24 @@ class ExceptionUnit(
   val fpUnimpCaptureNow = Bool(); fpUnimpCaptureNow := False
   val fpUnimpCaptureQ = RegNext(fpUnimpCaptureNow) init False
   fpUnimpCaptureQ.simPublic()
+  // CPU_FP_UNSUPP_TRAP: a vector-55 delivery reuses the SAME deferred capture, but its
+  // operands are the ones the FP lane latched at FS1 (`fpUnsuppSrcIn`/`fpUnsuppDstIn`,
+  // ETEMP already in 040 form) -- a memory source no longer exists anywhere else.
+  private val fpUnsuppTrap = m68k040.top.ShippingCoreConfig.fpUnsuppTrap
+  val fpUnsuppSrcIn: Bits = if (fpUnsuppTrap) { val b = Bits(80 bits); b.allowOverride; b := B(0, 80 bits); b } else null
+  val fpUnsuppDstIn: Bits = if (fpUnsuppTrap) { val b = Bits(80 bits); b.allowOverride; b := B(0, 80 bits); b } else null
+  val fpUnsuppCaptureNow: Bool = if (fpUnsuppTrap) { val b = Bool(); b := False; b } else null
+  val fpUnsuppCaptureQ: Bool = if (fpUnsuppTrap) RegNext(fpUnsuppCaptureNow) init False else null
+  if (fpUnsuppTrap) { fpUnsuppSrcIn.simPublic(); fpUnsuppDstIn.simPublic(); fpUnsuppCaptureQ.simPublic() }
   when(fpUnimpCaptureQ) {
     setUnimpFramePort.valid   := True
     setUnimpFramePort.payload := entryFpuCmdQ ## committedFpSrcIn ## committedFpDstIn
+    if (fpUnsuppTrap) {
+      if (fpuCtrl.setUnimpIsUnsupp != null) fpuCtrl.setUnimpIsUnsupp := fpUnsuppCaptureQ
+      when(fpUnsuppCaptureQ) {
+        setUnimpFramePort.payload := entryFpuCmdQ ## fpUnsuppSrcIn ## fpUnsuppDstIn
+      }
+    }
   }
   // Architectural FPSR WRITE -> the renamed FPCC's committed physical register. Mirrors
   // rteNzvcWriteValid/rteNzvcWriteData EXACTLY (see its doc comment below for the full
@@ -1454,12 +1469,30 @@ class ExceptionUnit(
     val unimpPacked = fsIsUnimp &&
       fpuCtrl.uiCmdReg1B(15 downto 13) === B"3'b010" &&
       fpuCtrl.uiCmdReg1B(12 downto 10) === B"3'b011"
+    // CPU_FP_UNSUPP_TRAP: an unsupported-data-type frame. E1 is set (the 040 reports the
+    // condition from its E1 stage); and a SINGLE/DOUBLE denormal source (R/M=1, format 001
+    // or 101, ETEMP exponent field 0) is tagged 101 rather than 100 -- x_unsupp's get_op
+    // branches on exactly that ($4088E1DE `btst #5,STAG`) to re-exponent it.
+    // `fpTag` (vector-11 frames, unchanged) classifies by exponent only; the 040's 100 tag
+    // is "extended denormalized OR UNNORMALIZED", so an unsupported-data-type frame also
+    // tags 0 < exp < $7FFF with J = 0 as 100 (both STAG and DTAG) -- get_op only
+    // normalises an operand whose tag has bit 7 set ($4088E1D4 / $4088E17A).
+    val (e1Bit, stag, dtag) = if (fpUnsuppTrap && fpuCtrl.uiUnsupp != null) {
+      val unsuppFrame = fsIsUnimp && fpuCtrl.uiUnsupp
+      def unnorm(v: Bits): Bool = v(78 downto 64) =/= 0 && !v(78 downto 64).andR && !v(63)
+      val stagSD = unsuppFrame && fpuCtrl.uiCmdReg1B(14) &&
+        (fpuCtrl.uiCmdReg1B(12 downto 10) === B"3'b001" || fpuCtrl.uiCmdReg1B(12 downto 10) === B"3'b101") &&
+        src(78 downto 64) === 0 && src(63 downto 0) =/= 0
+      (unimpPacked || unsuppFrame,
+       Mux(stagSD, B"3'b101", Mux(unsuppFrame && unnorm(src), B"3'b100", fpTag(src))),
+       Mux(unsuppFrame && unnorm(dst), B"3'b100", fpTag(dst)))
+    } else (unimpPacked, fpTag(src), fpTag(dst))
     switch(step) {
       is(U(0,  5 bits)) { out := hdr }                                        // $00 version|len
       // steps 2..5 ($04, $08) are the two longwords the 52-byte frame adds over the
       // 44-byte one. Reserved as far as this core is concerned -- see the field table
       // above for why zero is the CORRECT content here and not a placeholder.
-      is(U(6,  5 bits)) { out := fpTag(src) ## B(0, 13 bits) }                // $0C STAG  [31:29]
+      is(U(6,  5 bits)) { out := stag ## B(0, 13 bits) }                      // $0C STAG  [31:29]
       is(U(8,  5 bits)) {                                                     // $10 CMDREG1B [31:16]
         // CPU_FSAVE_CLEAN_IDLE_CMD: mask like ETEMP/FPTEMP/E1 -- `uiCmdReg1B` is never
         // cleared by the consume, so unmasked it leaks a stale, already-handled command.
@@ -1467,8 +1500,8 @@ class ExceptionUnit(
                   Mux(fsIsUnimp, fpuCtrl.uiCmdReg1B, B(0, 16 bits))
                 else fpuCtrl.uiCmdReg1B)
       }
-      is(U(10, 5 bits)) { out := fpTag(dst) ## B(0, 13 bits) }                // $14 DTAG  [31:29]
-      is(U(12, 5 bits)) { out := B(0, 5 bits) ## unimpPacked ## B(0, 10 bits) } // $18 E1
+      is(U(10, 5 bits)) { out := dtag ## B(0, 13 bits) }                      // $14 DTAG  [31:29]
+      is(U(12, 5 bits)) { out := B(0, 5 bits) ## e1Bit ## B(0, 10 bits) }       // $18 E1
       is(U(14, 5 bits)) { out := dst(79 downto 64) }                          // $1C FPTS|FPTE
       is(U(16, 5 bits)) { out := dst(63 downto 48) }                          // $20 FPTM[63:32]
       is(U(17, 5 bits)) { out := dst(47 downto 32) }
@@ -1793,6 +1826,18 @@ class ExceptionUnit(
           // "last FP exception PC"). `entryPc` is the POST-instruction PC for this class
           // (Task 10 sets faultUsesNextPc so a real FPSP can RTE past the instruction),
           // so the instruction's own PC is `ppc`.
+          setFpiarPort.valid   := True
+          setFpiarPort.payload := ppcOrTarget.resized
+        }
+        // CPU_FP_UNSUPP_TRAP: vector 55 (unsupported data type). Format $0 with the NEXT
+        // instruction's PC (the ROB selects predNextPc for this vector), so the FPSP that
+        // completes the operation in software RTEs straight past it -- x_unsupp's exit
+        // ($4088E112 rte, and its trace path at $4088E114, which re-uses the stacked PC as
+        // a format-$2 trace frame's next-PC) proves the stacked PC is post-instruction.
+        // FPIAR = the instruction itself, as for every FP exception.
+        if (fpUnsuppTrap) when(entryVector === 55 && !entryIsInterrupt) {
+          fpUnimpCaptureNow  := True
+          fpUnsuppCaptureNow := True
           setFpiarPort.valid   := True
           setFpiarPort.payload := ppcOrTarget.resized
         }

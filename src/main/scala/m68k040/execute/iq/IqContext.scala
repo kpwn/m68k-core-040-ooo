@@ -170,10 +170,13 @@ case class IqHot() extends Bundle {
         (Bool(earlyAutoStoreAddress) && u.eaAuto === m68k040.decode.EaAuto.POSTINC && u.pdstValid)) &&
       !u.movesAliasStore && !u.altAddrSpace && !u.needsSupervisor && !u.sysOp &&
       !u.leaAddr
-    srcBRegDespiteImm := (u.op === m68k040.decode.DecOp.PACK)     ||
+    val despiteImmBase = (u.op === m68k040.decode.DecOp.PACK)     ||
                          (u.op === m68k040.decode.DecOp.UNPK)     ||
                          (u.op === m68k040.decode.DecOp.BITFIELD) ||
                          (u.op === m68k040.decode.DecOp.BFRESOLVE)
+    // CPU_FP_MEM_SRCB_WAIT: the µcode FP issue row's T1 chunk is a real register source.
+    srcBRegDespiteImm := (if (m68k040.top.ShippingCoreConfig.fpMemSrcBWait)
+                            despiteImmBase || (u.op === m68k040.decode.DecOp.FPU) else despiteImmBase)
     isLsClass := u.cluster === m68k040.isa.Cluster.LS &&
       (u.memOp =/= m68k040.isa.MemOp.NONE || u.leaAddr)
     isCplxClass := u.cluster === m68k040.isa.Cluster.CPLX

@@ -99,6 +99,18 @@ class PortedM68kOooSpec extends AnyFunSuite {
 
   for (name <- names) {
     test(s"ported: $name", VerilatorTest) {
+      // `<name>.requires` names a ShippingCoreConfig flag the program's contract depends
+      // on (one per line); the case is CANCELLED, not failed, when that flag is off.
+      val requiresPath = dir.resolve(s"$name.requires")
+      if (Files.exists(requiresPath)) {
+        new String(Files.readAllBytes(requiresPath)).linesIterator.map(_.trim).filter(_.nonEmpty).foreach {
+          case "CPU_FP_UNSUPP_TRAP" =>
+            assume(m68k040.top.ShippingCoreConfig.fpUnsuppTrap, "requires CPU_FP_UNSUPP_TRAP=1")
+          case "CPU_FP_MEM_SRCB_WAIT" =>
+            assume(m68k040.top.ShippingCoreConfig.fpMemSrcBWait, "requires CPU_FP_MEM_SRCB_WAIT=1")
+          case other => fail(s"unknown requirement '$other' in $requiresPath")
+        }
+      }
       val src = new String(Files.readAllBytes(dir.resolve(s"$name.s")))
       val timeoutPath = dir.resolve(s"$name.timeout")
       val timeout =

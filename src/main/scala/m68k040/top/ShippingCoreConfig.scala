@@ -786,6 +786,31 @@ object ShippingCoreConfig {
     * Default OFF. Read by `ExceptionUnit`. */
   val fsaveCleanIdleCmd: Boolean = envFlag("CPU_FSAVE_CLEAN_IDLE_CMD", true)
 
+  /** CPU_FP_UNSUPP_TRAP: act like a real MC68040 on UNSUPPORTED DATA TYPES. A hardware FP
+    * operation (FMOVE/FSMOVE/FDMOVE to FPn, FABS/FNEG/FSQRT and their S/D forms, FADD/FSUB/
+    * FMUL/FDIV and forms, FCMP, FTST) whose SOURCE is an extended denormal/unnormal (FPm, .X
+    * memory/immediate) or a single/double denormal, or -- dyadic ops only -- whose
+    * DESTINATION FPn is an extended denormal/unnormal, takes vector 55 instead of computing:
+    * format-$0 frame, PC = next instruction, FPIAR = the instruction, no FPn/FPCC/FPSR
+    * update, and a later FSAVE yields the 52-byte frame (E1 set, CMDREG1B, STAG/DTAG,
+    * ETEMP/FPTEMP) the ROM FPSP's x_unsupp ($4088DAB0) reads. FP memory (An)+ is re-ordered
+    * so the An update retires before the FP op (the 040 completes the EA before trapping).
+    * Default OFF: with it off no trap logic is elaborated and the FP lane is unchanged.
+    * Read by `DivEuPlugin`, `RobPlugin`, `ExceptionUnit`, `FpuControlPlugin`,
+    * `MicroOpAssembler`, `Microcode`. */
+  val fpUnsuppTrap: Boolean = envFlag("CPU_FP_UNSUPP_TRAP", false)
+
+  /** CPU_FP_MEM_SRCB_WAIT: a microcoded FP memory-source issue row (UFpIssue: FMOVE/F<op>
+    * .D/.X <mem>,FPn) carries its packed command word in `imm` (useImm=True), and the IQ's
+    * `srcBRead` treats every useImm uop's psrcB as NOT a register -- so the row could issue
+    * before the T1 chunk load (the double's LOW long, the extended's mantissa-high long)
+    * had written it, and read a stale register. Measured on staging 81a3b1cf: every
+    * `fmove.d <mem>,FPn` / `fadd.d <mem>,FPn` loses the low 32 bits ({$3FF80000,5} ->
+    * $3FFF C000000000000000); .X survives only because its 3-load crack happens to leave
+    * T1 two loads old. ON: DecOp.FPU joins `srcBRegDespiteImm` (psrcBValid still gates).
+    * Default OFF. Read by `IqContext`. */
+  val fpMemSrcBWait: Boolean = envFlag("CPU_FP_MEM_SRCB_WAIT", true)
+
   /** CPU_UPC10: widen the microcode PC (OpSpec.ucEntry, DecodeStage ucPc/ucNextPc) from 9 to
     * 10 bits so the microcode ROM may grow past 512 rows, and append the decode-gap programs
     * that need the room (memory-indirect MOVE SR/CCR, CHK, CHK2/CMP2, MUL.W/DIV.W, memory

@@ -788,6 +788,8 @@ object GenSocketTopVerilog {
             s"divEarlyOut=${ShippingCoreConfig.divEarlyOut} " +
             s"oddTargetPrecise=${ShippingCoreConfig.oddTargetPrecise} " +
             s"fsaveCleanIdleCmd=${ShippingCoreConfig.fsaveCleanIdleCmd} " +
+            s"fpUnsuppTrap=${ShippingCoreConfig.fpUnsuppTrap} " +
+            s"fpMemSrcBWait=${ShippingCoreConfig.fpMemSrcBWait} " +
             s"upc10=${ShippingCoreConfig.upc10} " +
             s"shiftFunnel=${ShippingCoreConfig.shiftFunnel} " +
             s"fpSrcNorm1=${ShippingCoreConfig.fpSrcNorm1} " +

@@ -296,7 +296,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         val oldCplx = h.cluster === m68k040.isa.Cluster.CPLX
         val oldBException = h.op === m68k040.decode.DecOp.PACK ||
           h.op === m68k040.decode.DecOp.UNPK || h.op === m68k040.decode.DecOp.BITFIELD ||
-          h.op === m68k040.decode.DecOp.BFRESOLVE
+          h.op === m68k040.decode.DecOp.BFRESOLVE ||
+          (if (m68k040.top.ShippingCoreConfig.fpMemSrcBWait) h.op === m68k040.decode.DecOp.FPU else False)
         val oldBRead = h.psrcBValid && (!h.useImm || oldLs || oldBException)
         when(s.sel) {
           assert(h.isLsClass === oldLs, "IQ hot predicate: LS class mismatch")

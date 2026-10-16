@@ -2786,7 +2786,11 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // Fault PC (ROB-fold Slice A): re-derive the old faultPcStore content from the
     // payload Mem — Mux(faultUsesNextPc, predNextPc, pc), the exact expression the
     // deleted array captured at alloc (same sources, same cycle, same address).
-    val exceptionPc      = UInt(32 bits); exceptionPc     := Mux(privVec8, p0.pc,    Mux(p0.faultUsesNextPc, p0.predNextPc, p0.pc));  exceptionPc.simPublic()
+    // CPU_FP_UNSUPP_TRAP: vector 55 (unsupported data type, raised dynamically by the FP
+    // lane) stacks the NEXT instruction's PC like the decode-time faultUsesNextPc class.
+    val nextPcFault = if (m68k040.top.ShippingCoreConfig.fpUnsuppTrap)
+      p0.faultUsesNextPc || (faultDyn0 && faultVec0 === 55) else p0.faultUsesNextPc
+    val exceptionPc      = UInt(32 bits); exceptionPc     := Mux(privVec8, p0.pc,    Mux(nextPcFault, p0.predNextPc, p0.pc));  exceptionPc.simPublic()
     // Access-fault (vector 2) extras for the format-$7 frame: the faulting VA + the
     // SSW access attrs {write, sizeBits, supervisor}. Meaningful only when the head's
     // vector is 2; the exception FSM selects the $7 path on the vector.
@@ -3114,6 +3118,36 @@ class RobPlugin(val detailedPerf: Boolean = false,
       // registered command word, see ExceptionUnit `fpUnimpCaptureQ`).
       exc.committedFpSrcIn := Mux(!exc.entryFpuCmdQ(14), frameFpSrcRead.data, B(0, 80 bits))
       exc.committedFpDstIn := frameFpDstRead.data
+    }
+    // CPU_FP_UNSUPP_TRAP: keep the OLDEST in-flight vector-55 operand capture. Captures
+    // arrive from the FP lane's FS1 in issue (not program) order, so a younger one may
+    // land first; an older one replaces it (head-relative age). Every ROB flush squashes
+    // the entire ring, so the latch is simply dropped then. The delivered vector-55 head
+    // is necessarily the oldest captured op -- asserted in sim.
+    if (m68k040.top.ShippingCoreConfig.fpUnsuppTrap) host.get[m68k040.services.FpUnsuppCaptureService].foreach { svc =>
+      val cap = svc.unsuppCapture
+      if (cap != null) {
+        val lValid = RegInit(False); lValid.simPublic()
+        val lRobId = Reg(UInt(robIdW bits))
+        val lSrc   = Reg(Bits(80 bits))
+        val lDst   = Reg(Bits(80 bits))
+        val newAge = (cap.payload.robId - h0).resize(robIdW)
+        val oldAge = (lRobId - h0).resize(robIdW)
+        // A wrong-path op accepted around a flush can still emit its FS1 capture up to a
+        // few cycles later; ignore captures inside that window (the re-executed op, if any,
+        // re-captures after it). The FP lane's capture path is accept -> FS1 -> capQ.
+        val flushHist = History(flushing, 0 to 4, init = False)
+        val capOk = !flushHist.reduce(_ || _)
+        when(cap.valid && capOk && (!lValid || newAge < oldAge)) {
+          lValid := True; lRobId := cap.payload.robId
+          lSrc := cap.payload.src; lDst := cap.payload.dst
+        }
+        when(flushing) { lValid := False }
+        exc.fpUnsuppSrcIn := lSrc
+        exc.fpUnsuppDstIn := lDst
+        assert(!(excEntryTrigger && exceptionPending && exceptionVector === 55) || (lValid && lRobId === h0),
+          "vector-55 delivery without a matching FS1 operand capture")
+      }
     }
     host.get[FpTrapImmediateService].foreach { imm =>
       imm.trapImmAddr := p0.fpuImmTag
