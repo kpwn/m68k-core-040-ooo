@@ -14403,7 +14403,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       if (ic.lazy4 && ic.lazyPendS1.toBoolean && ic.s0Valid.toBoolean) pend += 1
     })
     println(s"[$name] lazy pending-group responses = $pend")
-    if (m68k040.top.ShippingCoreConfig.predecodeLazy4)
+    // (CPU_PREDECODE_LAZY_PAIR finishes a line in 4 cycles; these programs cannot catch it.)
+    if (m68k040.top.ShippingCoreConfig.predecodeLazy4 && !m68k040.top.ShippingCoreConfig.predecodeLazyPair)
       assert(pend > 0, s"[$name] no fetch ever read a not-yet-written predecode group")
   }
   test("lock-step: refill predecode hazards -- far-group entry into fresh lines, spread sets", VerilatorTest) {

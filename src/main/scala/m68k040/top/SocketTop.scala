@@ -711,6 +711,7 @@ object GenSocketTopVerilog {
             s"predecodeCoded=${ShippingCoreConfig.predecodeCoded} " +
             s"predecodePushOpFields=${ShippingCoreConfig.predecodePushOpFields} " +
             s"predecodeLazy4=${ShippingCoreConfig.predecodeLazy4} " +
+            s"predecodeLazyPair=${ShippingCoreConfig.predecodeLazyPair} " +
             s"predecodeCuts=${ShippingCoreConfig.predecodeCuts.toSeq.sorted.mkString("+")} " +
             s"beRetime=${ShippingCoreConfig.beRetime} " +
             s"tc3Retime=${ShippingCoreConfig.tc3Retime} " +

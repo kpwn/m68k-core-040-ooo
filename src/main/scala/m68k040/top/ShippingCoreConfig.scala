@@ -599,6 +599,11 @@ object ShippingCoreConfig {
     * are delivered `ambiguousLine` (the aligner's live-classify slow path). Echoed in
     * `SHIPPING_CONFIG`. */
   val predecodeLazy4: Boolean = envFlag("CPU_PREDECODE_LAZY4", false)
+  /** CPU_PREDECODE_LAZY4 variant (`CPU_PREDECODE_LAZY_PAIR`, default OFF): the background
+    * job classifies two 4-word groups per cycle (8 classifiers, 4 cycles per line), a
+    * predMem entry holds a group pair, and the not-ready check also matches the hit way.
+    * Echoed in `SHIPPING_CONFIG`. */
+  val predecodeLazyPair: Boolean = envFlag("CPU_PREDECODE_LAZY_PAIR", false)
   /** Refill-predecode coverage cuts (`CPU_PREDECODE_CUTS`, '+'-joined names from
     * `PredecodeCoded.cutNames`, default empty = none; needs CPU_PREDECODE_CODED). Each cut
     * turns a rare instruction shape AMBIGUOUS at refill, so the aligner's live classifier

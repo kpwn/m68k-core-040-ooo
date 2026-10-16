@@ -827,21 +827,30 @@ class IcachePlugin(val predecodeWords: Int = 16,
     // job (`lazyJob*`, below the installer datapath).
     val ufaReadLane = if (lazy4) UInt(2 bits) else null
     if (lazy4) ufaReadLane := U(0, 2 bits)
-    val predMem = if (lazy4) Seq.fill(ways)(Mem(Bits(4 * PRED_BITS_PER_WORD bits), sets * beatsPerLine * 4)) else null
-    val predBeat = if (lazy4) Vec(predMem.map(_.readSync((ufaReadAddr ## ufaReadLane).asUInt, ufaReadEn))) else null
+    // CPU_PREDECODE_LAZY_PAIR: the job classifies GP = 2 groups per cycle (8 classifiers);
+    // a predMem entry then holds a group PAIR, and the pending-group check is way-exact.
+    val lazyPair = lazy4 && m68k040.top.ShippingCoreConfig.predecodeLazyPair
+    val GP      = if (lazyPair) 2 else 1          // groups per job step / per predMem entry
+    val NSTEP   = 8 / GP                          // job steps per line
+    val stepBits = log2Up(NSTEP)
+    val predMem = if (lazy4) Seq.fill(ways)(Mem(Bits(GP * 4 * PRED_BITS_PER_WORD bits), sets * beatsPerLine * 4 / GP)) else null
+    val predBeat = if (lazy4) Vec(predMem.map(_.readSync(
+      (ufaReadAddr ## ufaReadLane(1 downto GP - 1)).asUInt, ufaReadEn))) else null
     // The job: the line it classifies (`jobRun`, set/way), the next group, groups left
     // (including this cycle's), and which groups are already WRITTEN (visible to a read
     // issued in a later cycle).
     val jobRun  = if (lazy4) RegInit(False) else null
     val jobSet  = if (lazy4) Reg(UInt(setBits bits)) init 0 else null
     val jobWay  = if (lazy4) Reg(UInt(wayBits bits)) init 0 else null
-    val jobG    = if (lazy4) Reg(UInt(3 bits)) init 0 else null
+    val jobG    = if (lazy4) Reg(UInt(stepBits bits)) init 0 else null
     val jobLeft = if (lazy4) Reg(UInt(4 bits)) init 0 else null
-    val jobDone = if (lazy4) Reg(Bits(8 bits)) init 0 else null
+    val jobDone = if (lazy4) Reg(Bits(NSTEP bits)) init 0 else null
     if (lazy4) { jobRun.simPublic(); jobSet.simPublic(); jobWay.simPublic(); jobDone.simPublic(); jobG.simPublic() }
     // An install may arm only once the running job's remaining reads of `jobLo`/`jobHi`
     // end before the new install overwrites them (lo at the end of its first dwell cycle).
-    val jobBlocksInstall = if (lazy4) jobRun && (jobLeft > U(2, 4 bits)) else null
+    // (The new install's first jobLo write lands 3 cycles after its arm, so the running
+    //  job may still own the copy for 3 more cycles: jobLeft <= 3 is safe; PAIR uses it.)
+    val jobBlocksInstall = if (lazy4) jobRun && (jobLeft > U(if (lazyPair) 3 else 2, 4 bits)) else null
     // A demand fill that completes while the job blocks the installer waits in REFILL.
     val refillDonePend = if (lazy4) RegInit(False) else null
     if (lazy4) refillDonePend.simPublic()
@@ -1305,7 +1314,8 @@ class IcachePlugin(val predecodeWords: Int = 16,
     // `windowPredBeat`'s one signature shared with the bypass path -- do not "unify"
     // them by changing the helper.
     val wayPred   = (0 until ways).map(w =>
-      if (lazy4) predBeat(w)
+      if (lazyPair) predBeat(w).subdivideIn(4 * PRED_BITS_PER_WORD bits)(s0Lane(0).asUInt)
+      else if (lazy4) predBeat(w)
       else if (pushOpFields) ufaPred(w).subdivideIn(4 * PRED_BITS_PER_WORD bits)(s0Pc(4 downto 3))
       else windowPredBeat(ufaPred(w), s0Pc).asBits)
 
@@ -1380,7 +1390,8 @@ class IcachePlugin(val predecodeWords: Int = 16,
                                4 * PRED_BITS_PER_WORD bits) else null
     val lazyPendS1 = if (lazy4)
       !s0Replay && RegNext(jobRun) && (RegNext(jobSet) === s0Set) &&
-        !RegNext(jobDone)((s0Beat ## s0Lane).asUInt)
+        !RegNext(jobDone)((s0Beat ## s0Lane(1 downto GP - 1)).asUInt) &&
+        (if (lazyPair) Vec(s1WayOh).asBits(RegNext(jobWay)) else True)
     else null
     if (lazy4) lazyPendS1.simPublic()
     val s1PredBits = if (lazy4) Mux(s0FromMiss || lazyPendS1, lazyAmb, ohOr(s1WayOh, wayPred))
@@ -3118,10 +3129,11 @@ class IcachePlugin(val predecodeWords: Int = 16,
         when(isLoBeat) { jobLo := beatSrc } otherwise { jobHi := beatSrc }
       }
       val jw = (jobHi ## jobLo).subdivideIn(16 bits).map(IcacheInstructionOrder.opword)
-      val win = (0 until 7).map { k =>
-        Vec((0 until 8).map(g => if (4 * g + k < 32) jw(4 * g + k) else B(0, 16 bits)))(jobG)
+      val WW = 4 * GP
+      val win = (0 until WW + 3).map { k =>
+        Vec((0 until NSTEP).map(g => if (WW * g + k < 32) jw(WW * g + k) else B(0, 16 bits)))(jobG)
       }
-      val winValid = (0 until 7).map(k => if (k < 4) True else jobG =/= U(7, 3 bits))
+      val winValid = (0 until WW + 3).map(k => if (k < WW) True else jobG =/= U(NSTEP - 1, stepBits bits))
       val recs = if (m68k040.top.ShippingCoreConfig.predecodeCoded)
         PredecodeCoded.classifyWindow(win, winValid, m68k040.top.ShippingCoreConfig.predecodeCuts)
       else (0 until 4).map(i => PredecodeWord.classify(win(i), win(i + 1), win(i + 2), win(i + 3),
@@ -3147,9 +3159,9 @@ class IcachePlugin(val predecodeWords: Int = 16,
         jobRun  := True
         jobSet  := installSet
         jobWay  := installWay
-        jobG    := missPC(5 downto 3)
-        jobLeft := U(8, 4 bits)
-        jobDone := B(0, 8 bits)
+        jobG    := missPC(5 downto 2 + GP)
+        jobLeft := U(NSTEP, 4 bits)
+        jobDone := B(0, NSTEP bits)
       }
     }
     when(ufaBypCapQ) {
