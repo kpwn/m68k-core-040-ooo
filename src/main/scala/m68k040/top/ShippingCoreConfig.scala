@@ -661,6 +661,21 @@ object ShippingCoreConfig {
   /** Experimental reuse of a resolved, clean-victim VIPT probe miss in the existing
     * MSHR allocation stage. Dirty or stale probes use the ordinary S1 path. */
   val dcacheNbProbeMissStage: Boolean = envFlag("CPU_DCACHE_NB_PROBE_MISS_STAGE", false)
+
+  /** Non-blocking D-cache store pipe: same-line stores stop waiting for each other.
+    * Default OFF. Three mechanisms, all qualified by flops (see `DcachePlugin`):
+    *   - B2B: a COPYBACK store directly behind an older COPYBACK store to the SAME line
+    *     advances S1->S2 back to back (the older store's S2 is no longer a same-set hold),
+    *     taking the older store's merged line through the existing `stS2UsesS3Line`;
+    *   - D1 forward: the `stS1SameLineAsS3` read-launch HOLD becomes a forward from the
+    *     registered copy of the last S3 write (`stS3WriteLineD1`);
+    *   - same-line load: a load in S1 of the store's OWN line no longer holds the store
+    *     (a same-line load cannot evict the store's line).
+    * Measured together: B2B alone regresses the byte-copy `-cb` kernels (+0.5..1.5% sim);
+    * the three together do not. */
+  val dcacheStoreSameLine: Boolean = envFlag("CPU_DCACHE_STORE_B2B", false)
+  require(!dcacheStoreSameLine || dcacheNonBlocking,
+    "CPU_DCACHE_STORE_B2B=1 requires the non-blocking D-cache")
   require(!dcacheNbProbeMissStage || (dcacheNonBlocking && !dcacheSectored),
     "CPU_DCACHE_NB_PROBE_MISS_STAGE=1 requires unsectored non-blocking D-cache")
   /** Integer PRF read-port diet, 17 -> 14 (Fable review item 8, §5.4). Default OFF.
