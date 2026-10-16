@@ -808,7 +808,9 @@ object GenSocketTopVerilog {
             s"fpuAddOneAdder=${ShippingCoreConfig.fpuAddOneAdder} " +
             s"fpuNarrowShare=${ShippingCoreConfig.fpuNarrowShare} " +
             s"sqVaddrLutram=${ShippingCoreConfig.sqVaddrLutram} " +
-            s"tail20=${ShippingCoreConfig.tail20}")
+            s"tail20=${ShippingCoreConfig.tail20} " +
+            s"lsProbeNoWait=${ShippingCoreConfig.lsProbeNoWait} " +
+            s"lsStoreCompDetach=${ShippingCoreConfig.lsStoreCompDetach}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

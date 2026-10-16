@@ -161,6 +161,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
                    * store-queue line filter); an explicit `p3FastLoad = false` wins. */
                  val p3Launch: Boolean = m68k040.top.ShippingCoreConfig.lsP3Launch,
                  val p1EarlyLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP1EarlyLoad,
+                 /** See `ShippingCoreConfig.lsProbeNoWait`. */
+                 val probeNoWait: Boolean = m68k040.top.ShippingCoreConfig.lsProbeNoWait,
+                 /** See `ShippingCoreConfig.lsStoreCompDetach`; effective only with
+                   * `detachLateStore`. */
+                 val storeCompDetach: Boolean = m68k040.top.ShippingCoreConfig.lsStoreCompDetach,
                  val fourCycleL1: Boolean = m68k040.top.ShippingCoreConfig.lsFourCycleL1,
                  /** See `ShippingCoreConfig.lsSpecWakeAlu`. */
                  val specAluWake: Boolean = m68k040.top.ShippingCoreConfig.lsSpecWakeAlu,
@@ -3841,6 +3846,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // Address/data remain in the SQ. The optional postincrement extension carries
     // the already-computed An result through this same completion owner, using
     // the existing integer write port. Plain-store profiles omit those fields.
+    val compDetachOn = storeCompDetach && detachLateStore
     val detachedStore = if(detachLateStore) Some(new Area {
       case class Context() extends Bundle {
         val slot = UInt(sq.ptrW bits)
@@ -3855,6 +3861,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
         val anResult = if(earlyAutoStoreAddress) Bits(32 bits) else null
         val pdst = if(earlyAutoStoreAddress) UInt(6 bits) else null
         val dstArch = if(earlyAutoStoreAddress) UInt(5 bits) else null
+        // `storeCompDetach`: the store's data is already in its SQ entry; only the
+        // completion is owed (no PRF capture, no publish).
+        val preCaptured = if(compDetachOn) Bool() else null
+        val preNzvc = if(compDetachOn) Bits(4 bits) else null
       }
       val reserve = Flow(Context())
       val valid = RegInit(False)
@@ -3934,13 +3944,17 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       when(admitHead.valid) {
         valid := True; captured := False; ctx := admitHead.payload
         readyPrior := False
+        if(compDetachOn) when(admitHead.payload.preCaptured) {
+          captured := True; nzvc := admitHead.payload.preNzvc
+        }
       }
       when(sqFlushSig || excActive) { valid := False; readyPrior := False }
       GenerationFlags.simulation {
         when(reserve.valid) {
           assert(reserveReady, "detached store owner overrun", FAILURE)
           if(detachedStoreEntries == 1) {
-            assert(query.queryTag === reserve.dataTag,
+            assert(query.queryTag === reserve.dataTag ||
+              (if(compDetachOn) reserve.preCaptured else False),
               "detached store admission inherited a different source's readiness", FAILURE)
           }
         }
@@ -4876,6 +4890,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     val p3LateDataPending = lateStoreData.map(_ => p3Front.lateDataPending).getOrElse(False)
     val p3Reserved = if(reserveLateStore && !detachLateStore) RegInit(False) else False
     val p3ReservationFire = Bool(); p3ReservationFire := False
+    /** `storeCompDetach`: a captured fast store allocated in P3 and handed its completion
+      * to the detached owner because an older completion owned comp* this cycle. */
+    val p3CompDetachFire: Bool = if (!compDetachOn) null else {
+      val b = Bool(); b := False; b.simPublic(); b
+    }
     val p3ReservedPublish = Bool()
     if(!reserveLateStore) p3ReservedPublish := False
     val p3LateDataCapture = Bool()
@@ -4939,6 +4958,15 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
         d.reserve.nzvcDst := p3Front.pNzvcDst
         d.reserve.crackDrop := p3Front.crackDrop
         d.reserve.keepCommit := p3Front.keepCommit
+        if(compDetachOn) {
+          d.reserve.preCaptured := False
+          d.reserve.preNzvc := p3Front.storeNzvc
+          when(p3CompDetachFire) {
+            d.reserve.valid := True
+            d.reserve.slot := sq.io.allocSlot
+            d.reserve.preCaptured := True
+          }
+        }
         if(earlyAutoStoreAddress) {
           d.reserve.autoAn := p3Front.autoStoreAn && p3Front.pdstValid
           d.reserve.anResult := p3Front.anWb
@@ -5014,9 +5042,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
             p3CanLeave       := True
           }
         } elsewhen(!sq.io.full && !(pendRingFull && !fastStore)) {
-          when(fastStore && olderThanP3Comp) {
-            frontCompHeld := True
-          } otherwise {
+          // The ordinary captured-data store arm (allocate + complete, or defer if precise).
+          def storeAllocAndComplete(): Unit = {
             sq.io.alloc.valid           := True
             sq.io.alloc.payload.precise := !fastStore
             when(fastStore) {
@@ -5026,6 +5053,29 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
               deferCompletion(p3Front)
             }
             p3CanLeave := True
+          }
+          if (!compDetachOn) {
+            when(fastStore && olderThanP3Comp) {
+              frontCompHeld := True
+            } otherwise { storeAllocAndComplete() }
+          } else {
+            // `storeCompDetach` eligibility: exactly the late-data reservation's set of
+            // detachable stores (see the detached owner's admission assertion), minus split
+            // accesses; the owner must have room.
+            val compDetachOk =
+              !p3Front.stkPush && !p3Front.ccrRestore && !p3Front.writesX && !p3Front.leaAddr &&
+              !p3Front.twoAccess &&
+              ((!p3Front.pdstValid && !p3Front.autoStoreAn) ||
+               (Bool(earlyAutoStoreAddress) && p3Front.pdstValid && p3Front.autoStoreAn)) &&
+              detachedStore.get.reserveReady
+            when(fastStore && olderThanP3Comp && !compDetachOk) {
+              frontCompHeld := True
+            } elsewhen(fastStore && olderThanP3Comp) {
+              sq.io.alloc.valid           := True
+              sq.io.alloc.payload.precise := False
+              p3CompDetachFire := True
+              p3CanLeave := True
+            } otherwise { storeAllocAndComplete() }
           }
         }
       } elsewhen(p3IsLoad) {
@@ -5241,8 +5291,23 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // carries `!sqFlushSig && !dcLoadHeldByOther`, so under it `!splitReqArm` reduces
     // to `!xlateBArm`) and it keeps the split's command PRIORITY independent of the
     // arbitration gate, exactly as the payload select now is.
-    normalReqArm := tValid && tIsMem && txReady && !xlateBArm &&
-                    !sqFlushSig && !dcLoadHeldByOther && (!tIsLoad || dcache.loadProbe.ready)
+    // `probeNoWait`: a T-stage load PREDICTED to be satisfied by the store queue does not
+    // wait for the early-probe credit; a refused probe is not taken and the resolved
+    // command takes the ordinary read (see `ShippingCoreConfig.lsProbeNoWait`). The
+    // prediction is a REGISTER written on the P1->P2 edge: the load's page-offset word
+    // (VA[11:2], identical in the PA) matches one of the last four stores through P1.
+    // A hint only -- a wrong guess costs the one cycle a dropped probe costs.
+    val pnStoreWord  = if (probeNoWait) Vec.fill(4)(Reg(UInt(10 bits)) init 0) else null
+    val pnStoreValid = if (probeNoWait) Vec.fill(4)(RegInit(False)) else null
+    val tPredFwd     = if (probeNoWait) RegInit(False) else null
+    if (probeNoWait) tPredFwd.simPublic()
+    if (probeNoWait)
+      normalReqArm := tValid && tIsMem && txReady && !xlateBArm &&
+                      !sqFlushSig && !dcLoadHeldByOther &&
+                      (!tIsLoad || dcache.loadProbe.ready || tPredFwd)
+    else
+      normalReqArm := tValid && tIsMem && txReady && !xlateBArm &&
+                      !sqFlushSig && !dcLoadHeldByOther && (!tIsLoad || dcache.loadProbe.ready)
     // Paired P1 launch: never present one side until BOTH independent grants are
     // high. DTLB req.ready is independent of req.valid; probe.ready is a flop.
     // Thus a P1 request either fires atomically with its probe or is never
@@ -5264,6 +5329,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       p1ReqArm.simPublic()
     }
     val normalReqFire = xlate.req.fire && normalReqArm && !excActive
+    /** SIM-ONLY (null with `probeNoWait` off): a T-stage load launched its DTLB request
+      * while the early-probe credit was closed, i.e. without a probe. */
+    val probeSkipped: Bool = if (!probeNoWait) null else {
+      val b = normalReqFire && tIsLoad && !dcache.loadProbe.ready
+      b.simPublic(); b
+    }
     val p1ReqFire = if (p1EarlyLoad) xlate.req.fire && p1ReqArm && !excActive else False
     if (p1EarlyLoad) p1ReqFire.simPublic()
     if (p1EarlyLoad) GenerationFlags.simulation {
@@ -5417,6 +5488,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     when(s1ToT) {
       tValid := True
       captureFrontCtx(tCtx)
+    }
+    // `probeNoWait` forward prediction (see `tPredFwd`), written on the same P1->P2 edge.
+    if (probeNoWait) {
+      val w = s1Va(11 downto 2)
+      when(s1ToT) {
+        tPredFwd := (u1.memOp === MemOp.LOAD) &&
+          (0 until 4).map(i => pnStoreValid(i) && pnStoreWord(i) === w).reduce(_ || _)
+        when(u1.memOp === MemOp.STORE) {
+          pnStoreWord(0) := w; pnStoreValid(0) := True
+          for (i <- 1 until 4) { pnStoreWord(i) := pnStoreWord(i - 1); pnStoreValid(i) := pnStoreValid(i - 1) }
+        }
+      }
     }
     if (p1EarlyLoad) when(p1ReqFire) { s1Valid := False }
     when(issuePort.fire) {

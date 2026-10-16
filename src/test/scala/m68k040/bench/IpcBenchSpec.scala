@@ -113,7 +113,9 @@ class IpcBenchSpec extends CoreBenchHarness {
       (if (sys.env.get("IPC_JTAB_KERNEL").contains("1")) Seq(
         kBrJumpTable(), kBrJumpTable(call = true, label = "br-jtab-jsr")) else Nil) ++
       // IPC_DIV_KERNEL=1 appends the divide-heavy loop (opt-in; default aggregate unchanged).
-      (if (sys.env.get("IPC_DIV_KERNEL").contains("1")) Seq(kDivMix(200)) else Nil)
+      (if (sys.env.get("IPC_DIV_KERNEL").contains("1")) Seq(kDivMix(200)) else Nil) ++
+      // IPC_LS_CB=1 appends `load/store-cb` (the load/store kernel with copyback D-space).
+      (if (sys.env.get("IPC_LS_CB").contains("1")) Seq(kLoadStoreV(copyback = true)) else Nil)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
