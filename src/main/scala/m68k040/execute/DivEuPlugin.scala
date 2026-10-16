@@ -206,7 +206,7 @@ object DivEuPlugin {
   *   S1  CHK: compare -> complete (no write) or euFault. DIV: launch the iterative
   *       core; while busy, hold; on done -> writeback + complete + wakeup (or euFault).
   */
-class DivEuPlugin extends FiberPlugin with DivEuService {
+class DivEuPlugin extends FiberPlugin with DivEuService with m68k040.services.FpUnsuppCaptureService {
   /** `CPU_PRF_TRIM_DIVH`: no dedicated `rdH` int-PRF read port. A uop with a valid third
     * source (DIV.L 64/32 Dr, CMP2/CHK2 Rn, BF* srcC, FMOVE.X T2 chunk) spends one extra
     * cycle in the registered issue slot reading `psrcC` through `rdA`. */
@@ -279,6 +279,10 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
   override def fpccWakeup: Flow[UInt]   = fpccWakeupPort
   override def fpFault: Flow[EuFault]   = fpFaultPort
   override def cplxFlush: Bool          = flushSig
+  /** CPU_FP_UNSUPP_TRAP: FS1-time operand capture for a vector-55 op (null when off). */
+  private val fpUnsuppTrap: Boolean = m68k040.top.ShippingCoreConfig.fpUnsuppTrap
+  var unsuppCapturePort: Flow[m68k040.services.FpUnsuppCapture] = null
+  override def unsuppCapture: Flow[m68k040.services.FpUnsuppCapture] = unsuppCapturePort
 
   during setup {
     issuePort      = Stream(IqContext())
@@ -286,6 +290,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(m68k040.Global.PHYS_NZVC_ID_W bits))
     euFaultPort    = Flow(EuFault()); euFaultPort.simPublic()
+    if (fpUnsuppTrap) { unsuppCapturePort = Flow(m68k040.services.FpUnsuppCapture()); unsuppCapturePort.simPublic() }
     flushSig       = Bool()
     // default-driven idle (allowOverride) so a standalone test that does not wire a
     // flush still elaborates; the BackendWiring drives it from doFlush.
@@ -1253,6 +1258,64 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     fpu.io.precision := fpS1Prec
     fpu.io.cromSel := fpS1Opmode      // meaningful only when fpSrcKind === ROMCONST
 
+    // ---- CPU_FP_UNSUPP_TRAP: MC68040 unsupported-data-type detection (COLD) ----
+    // Computed from the FS1 REGISTERS in parallel with the conversion cone (it reads the
+    // RAW operands, never `fpSrcVal`), and it only ever lands in its own registers (the
+    // shadow bits below and the capture flow) -- no FS1->FpuCore or result path gains a
+    // level. The MC68040 traps (vector 55) on an extended DENORMAL (exp 0, mantissa != 0,
+    // incl. pseudo-denormals) or UNNORMAL (0 < exp < $7FFF, J = 0, incl. unnormal zeros)
+    // source, a SINGLE/DOUBLE denormal memory/register/immediate source, and -- only for
+    // the dyadic ops, the ones that read it -- such a DESTINATION FPn (FPSP chk_dy_mo:
+    // opmode bit5 && (!bit4 || opmode == $38)). FINT/FINTRZ ($01/$03) and FMOVECR are
+    // FPSP-only on silicon (they take vector 11 there before any data-type check), so this
+    // core keeps computing them in hardware exactly as before. FMOVEM.X is exempt too.
+    val fpS1Unsupp: Bool = if (fpUnsuppTrap) Bool() else null
+    val fpS1UnsuppEtemp: Bits = if (fpUnsuppTrap) Bits(80 bits) else null
+    if (fpUnsuppTrap) {
+      def extUnsupp(v: Bits): Bool = {
+        val e = v(78 downto 64); val m = v(63 downto 0)
+        (e === 0 && m =/= 0) || (e =/= 0 && e =/= B(0x7FFF, 15 bits) && !v(63))
+      }
+      val srcIsSgl = (fpS1Kind === FpSrcKind.INTREG && fpFmt === B"3'b001") || fpS1Kind === FpSrcKind.SINGLEIMM
+      val srcIsDbl = fpS1Kind === FpSrcKind.DOUBLEIMM || fpS1Kind === FpSrcKind.MEMPAIR
+      val srcIsExt = fpS1Kind === FpSrcKind.FPREG || fpS1Kind === FpSrcKind.EXTIMM || fpS1Kind === FpSrcKind.MEMEXT
+      val srcExt = fpS1Kind.mux(
+        FpSrcKind.FPREG  -> fpS1FpSrc,
+        FpSrcKind.EXTIMM -> fpS1Imm,
+        default          -> (fpS1IntA(31 downto 16) ## fpS1IntB ## fpS1IntC))
+      // Local copies of the format pre-muxes (NOT `fpSglIn`/`fpDblIn`): those nets feed
+      // the conversion cone, and this cold logic must not load them.
+      val uSgl = Mux(fpS1Kind === FpSrcKind.SINGLEIMM, fpS1Imm(31 downto 0), fpS1IntA)
+      val uDbl = Mux(fpS1Kind === FpSrcKind.DOUBLEIMM, fpS1Imm(63 downto 0), fpS1IntA ## fpS1IntB)
+      val sglDen = uSgl(30 downto 23) === 0 && uSgl(22 downto 0) =/= 0
+      val dblDen = uDbl(62 downto 52) === 0 && uDbl(51 downto 0) =/= 0
+      val srcUns = (srcIsExt && extUnsupp(srcExt)) || (srcIsSgl && sglDen) || (srcIsDbl && dblDen)
+      val opm    = fpS1Opmode
+      val dyadic = opm(5) && (!opm(4) || opm === B(0x38, 7 bits))
+      // FMOVEM.X's per-register load rows are FMOVE µops that write no FPCC (the only FP
+      // µops that do not): FMOVEM moves raw bits and never checks data types on the 040.
+      val exempt = fpS1IsRomConst || opm === B(0x01, 7 bits) || opm === B(0x03, 7 bits) ||
+                   !fpS1Ctx.fpccWrite
+      fpS1Unsupp := fpS1Valid && !exempt && (srcUns || (dyadic && extUnsupp(fpS1FpDst)))
+      // ETEMP exactly as the 040 presents it: extended sources verbatim; a single/double
+      // denormal as {sign, exp field 0, J=0, fraction left-justified} -- x_unsupp's get_op
+      // (STAG 101, $4088E202) overwrites the exponent word with sign|$3F81 / sign|$3C01
+      // and normalises the mantissa itself.
+      fpS1UnsuppEtemp := Mux(srcIsSgl,
+        uSgl(31) ## B(0, 16 bits) ## uSgl(22 downto 0) ## B(0, 40 bits),
+        Mux(srcIsDbl,
+          uDbl(63) ## B(0, 16 bits) ## uDbl(51 downto 0) ## B(0, 11 bits),
+          srcExt))
+      // The capture: one more register stage, so FS1's fanout ends in flops here.
+      val capV = RegNext(fpS1Unsupp) init False
+      val capQ = Reg(m68k040.services.FpUnsuppCapture())
+      when(fpS1Unsupp) {
+        capQ.robId := fpS1Ctx.robId; capQ.src := fpS1UnsuppEtemp; capQ.dst := fpS1FpDst
+      }
+      unsuppCapturePort.valid   := capV
+      unsuppCapturePort.payload := capQ
+    }
+
     // ---- fixed lane: a descriptor shadow pipe, sized from FpuCore.FixedLatency ----
     // Identical construction to mulCtx/mulCtxValid above (load index 0 at start, shift up,
     // read `.last` on done); FpuCore.io.doneFixed is an unconditional 1-cycle pulse exactly
@@ -1269,6 +1332,14 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       when(fpFixedCtxValid(i - 1)) { fpFixedCtx(i) := fpFixedCtx(i - 1) }
     }
     when(flushSig) { fpFixedCtxValid.foreach(_ := False) }
+    // CPU_FP_UNSUPP_TRAP: the vector-55 bit rides beside the descriptor shadow pipe (its own
+    // registers, so FpPipeContext -- and the flag-off netlist -- is unchanged).
+    val fpUnsFixed: Vec[Bool] = if (fpUnsuppTrap) Vec.fill(FpuCore.FixedLatency)(Reg(Bool()) init False) else null
+    if (fpUnsuppTrap) {
+      when(fpS1Fixed) { fpUnsFixed(0) := fpS1Unsupp }
+      for (i <- 1 until FpuCore.FixedLatency)
+        when(fpFixedCtxValid(i - 1)) { fpUnsFixed(i) := fpUnsFixed(i - 1) }
+    }
 
     // ---- iterative lane: ONE held context for its whole data-dependent duration ----
     val fpIterCtx = Reg(FpPipeContext())
@@ -1297,6 +1368,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       loadFpCtx(fpIterCtx)
     }
     when(flushSig && fpIterBusy) { fpIterFlushed := True }
+    // The iterative op's FS1 cycle is the one after its accept (`fpIterStart`).
+    val fpUnsIter: Bool = if (fpUnsuppTrap) Reg(Bool()) init False else null
+    if (fpUnsuppTrap) when(fpS1Valid && !fpS1Fixed) { fpUnsIter := fpS1Unsupp }
 
     // ---- completion arbitration, FP-internal only ----
     // The fixed lane cannot be back-pressured (its `doneFixed` is an unconditional pulse) so
@@ -1378,7 +1452,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     /** Task 14b: the narrowing converter's own EXC byte, in the same architectural order. */
     val fpStoreExcNow = fpsrExcByte(fpNarrow.io.exc)
 
-    def fpWriteback(ctx: FpPipeContext, res: FpResult, esc: FpEscalation): Unit = {
+    def fpWriteback(ctx: FpPipeContext, res: FpResult, esc: FpEscalation, uns: Bool = null): Unit = {
       fpCompExc       := fpsrExcByte(res.exc)
       fpCompValid     := True
       fpCompRobId     := ctx.robId
@@ -1390,13 +1464,24 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       fpCompFpcc      := res.fpcc
       fpCompFault     := esc.esc
       fpCompFaultVec  := Mux(esc.esc, esc.vec, U(0, 8 bits))
+      if (uns != null) {
+        // Vector 55 is a PRE-instruction exception: it outranks every arithmetic trap, and
+        // the (meaningless) result must accrue nothing into FPSR -- FPn/FPCC are already
+        // suppressed by the fault itself.
+        when(uns) {
+          fpCompExc      := 0
+          fpCompFault    := True
+          fpCompFaultVec := U(55, 8 bits)
+        }
+      }
     }
 
     when(!flushSig) {
       when(fpFixedDone) {
-        fpWriteback(fpFixedCtx.last, fpu.io.resFixed, fpEscFixed)
+        fpWriteback(fpFixedCtx.last, fpu.io.resFixed, fpEscFixed,
+                    if (fpUnsuppTrap) fpUnsFixed.last else null)
       } elsewhen(fpIterDone && !fpIterFlushed) {
-        fpWriteback(fpIterCtx, fpu.io.resIter, fpEscIter)
+        fpWriteback(fpIterCtx, fpu.io.resIter, fpEscIter, if (fpUnsuppTrap) fpUnsIter else null)
       }
     }
     when(flushSig) { fpCompValid := False }

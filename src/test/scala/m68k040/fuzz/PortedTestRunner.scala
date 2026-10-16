@@ -791,6 +791,19 @@ object PortedTestRunner {
       // PORTED_TRACE_WBDBG is set.
       // Correlate FP completions with the existing committed-PC trace when
       // narrowing a numerical failure inside the unmodified ROM FPSP handler.
+      // CPU_FP_UNSUPP_TRAP: the FS1 operand capture and the vector-55 frame capture.
+      if (sys.env.contains("PORTED_TRACE_UNSUPP") && m68k040.top.ShippingCoreConfig.fpUnsuppTrap) {
+        var c = 0
+        cd.onSamplings {
+          c += 1
+          val cap = dut.divEu.unsuppCapturePort
+          if (cap.valid.toBoolean)
+            println(f"[unsupp] cyc=$c CAP robId=${cap.payload.robId.toInt} src=0x${cap.payload.src.toBigInt.toString(16)} dst=0x${cap.payload.dst.toBigInt.toString(16)}")
+          val e = dut.rob.logic.exc
+          if (e.fpUnsuppCaptureQ.toBoolean)
+            println(f"[unsupp] cyc=$c FRAME src=0x${e.fpUnsuppSrcIn.toBigInt.toString(16)} dst=0x${e.fpUnsuppDstIn.toBigInt.toString(16)}")
+        }
+      }
       if (sys.env.contains("PORTED_TRACE_FP")) {
         var fpTraceCycle = 0
         cd.onSamplings {

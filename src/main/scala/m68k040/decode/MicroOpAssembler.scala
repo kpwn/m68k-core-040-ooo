@@ -2428,6 +2428,9 @@ object MicroOpAssembler {
       opUop.isBranch := False
       opUop.firstOfInstr := True          // a single uop: it IS the macro boundary
       opUop.fpuOp    := fpOpmode
+      // CPU_FP_UNSUPP_TRAP: carry the raw command word so a vector-55 delivery can stack
+      // it as CMDREG1B (fpuSoftwareComplete stays False: this is a HARDWARE op).
+      if (m68k040.top.ShippingCoreConfig.fpUnsuppTrap) opUop.fpuCmdWord := fpExt
       // The integer CCR is untouched by every FP op (FPCC is a separate rename class).
       opUop.readsNzvc := False; opUop.writesNzvc := False
       opUop.readsX    := False; opUop.writesX    := False
