@@ -27,6 +27,7 @@ for ((i = 0; i < total; i += BATCH)); do
   for name in "${names[@]:i:BATCH}"; do
     cp "$ASMDIR/$name.s" "$batch_dir/"
     [ -f "$ASMDIR/$name.timeout" ] && cp "$ASMDIR/$name.timeout" "$batch_dir/"
+    [ -f "$ASMDIR/$name.requires" ] && cp "$ASMDIR/$name.requires" "$batch_dir/"
   done
   n=$(ls "$batch_dir"/*.s | wc -l)
   log="$LOGDIR/batch_${i}.log"

@@ -101,7 +101,12 @@ class PortedM68kOooSpec extends AnyFunSuite {
     test(s"ported: $name", VerilatorTest) {
       // `<name>.requires` names a ShippingCoreConfig flag the program's contract depends
       // on (one per line); the case is CANCELLED, not failed, when that flag is off.
-      val requiresPath = dir.resolve(s"$name.requires")
+      // A staged corpus shard may contain only the assembly source. Keep the
+      // canonical requirement in force even when an older runner omits sidecars.
+      val stagedRequires = dir.resolve(s"$name.requires")
+      val requiresPath =
+        if (Files.exists(stagedRequires)) stagedRequires
+        else canonicalAsmDir.resolve(s"$name.requires")
       if (Files.exists(requiresPath)) {
         new String(Files.readAllBytes(requiresPath)).linesIterator.map(_.trim).filter(_.nonEmpty).foreach {
           case "CPU_FP_UNSUPP_TRAP" =>

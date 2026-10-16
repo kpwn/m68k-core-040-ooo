@@ -68,6 +68,7 @@ for name in "${names[@]}"; do
   shard=$((idx % N))
   cp "$ASMDIR/$name.s" "${SHARD_DIRS[$shard]}/"
   [ -f "$ASMDIR/$name.timeout" ] && cp "$ASMDIR/$name.timeout" "${SHARD_DIRS[$shard]}/"
+  [ -f "$ASMDIR/$name.requires" ] && cp "$ASMDIR/$name.requires" "${SHARD_DIRS[$shard]}/"
   idx=$((idx + 1))
 done
 
