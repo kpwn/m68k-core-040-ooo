@@ -2695,6 +2695,47 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "addq.l #1,%d4"
     )).mkString(" ; "))
   }
+  // STATIC width 32 (raw 0) with bitOff != 0: the field spans FIVE bytes, so the spill byte
+  // at byteAddr+4 must be loaded (read-only) / stored (RMW). Regression: the decode-time
+  // width was computed in 5 bits (32 wrapped to 0), so needHi was false and the spill
+  // byte was dropped (e.g. bfextu (a0){#4:#32} gave 0x23456780 instead of 0x23456789).
+  test("lock-step: BF mem STATIC width 32 + bitOff != 0 (5-byte span, load-only)", VerilatorTest) {
+    runLockStep("bfmem-w32-ro", (bfMemSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "bfextu (%a0){#1:#32},%d1", "bfextu (%a0){#4:#32},%d2", "bfextu (%a0){#7:#32},%d3",
+      "bfextu (%a0){#12:#32},%d4", "bfextu (%a0){#31:#32},%d5",
+      "bfexts (%a0){#3:#32},%d6", "bftst (%a0){#5:#32}",
+      "move.l #0,%d0", "move.l %d0,8(%a0)", "move.l %d0,12(%a0)", "move.l #0xff000000,%d0", "move.l %d0,12(%a0)",
+      "bftst 8(%a0){#4:#32}",                            // only the spill byte is non-zero -> Z=0
+      "bfffo 8(%a0){#1:#32},%d7",                        // first set at index 31 -> 32
+      "bfextu 8(%a0){#6:#32},%d0"
+    )).mkString(" ; "))
+  }
+  test("lock-step: BF mem STATIC width 32 + bitOff != 0 (5-byte span, RMW)", VerilatorTest) {
+    runLockStep("bfmem-w32-rmw", (bfMemSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "bfchg (%a0){#4:#32}",
+      "moveq #0,%d0", "move.l %d0,8(%a0)", "move.l %d0,12(%a0)",
+      "bfset 8(%a0){#5:#32}",
+      "bfclr 4(%a0){#3:#32}",
+      "move.l #0x87654321,%d1", "bfins %d1,1(%a0){#3:#32}",
+      "move.l (%a0),%d2", "move.l 4(%a0),%d3", "move.l 8(%a0),%d4", "move.l 12(%a0),%d5"
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L, 0x3008L, 0x300CL), checkSpan = 4)
+  }
+  test("lock-step: BF mem DYNAMIC width 0/32 + nonzero/negative offset (5-byte span)", VerilatorTest) {
+    runLockStep("bfmem-w32-dyn", (bfMemSeed ++ Seq(
+      "moveq #0,%d0", "move.l %d0,8(%a0)",               // seed the spill long (DUT/oracle agree)
+      "ori #0x10,%ccr",
+      "moveq #0,%d7",  "bfextu (%a0){#4:%d7},%d1",
+      "moveq #32,%d7", "bfextu (%a0){#5:%d7},%d2",
+      "moveq #3,%d6",  "bfextu (%a0){%d6:#32},%d3",
+      "moveq #9,%d6",  "moveq #0,%d7", "bfexts (%a0){%d6:%d7},%d4",
+      "lea 4(%a0),%a1", "moveq #-4,%d6", "bfextu (%a1){%d6:%d7},%d5",
+      "moveq #-29,%d6", "bfffo (%a1){%d6:#32},%d0",
+      "moveq #2,%d6", "moveq #32,%d7", "bfset (%a1){%d6:%d7}",
+      "move.l (%a0),%d2", "move.l 4(%a0),%d3", "move.l 8(%a0),%d4"
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L, 0x3008L), checkSpan = 4)
+  }
 
   // ════════════════════════════════════════════════════════════════════════════
   // Bit-field DYNAMIC offset/width MEMORY read-only forms (slice 3c). Dn-sourced

@@ -1944,7 +1944,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val ucBfEaDec  = EaDecoder.decode(ucEntryPkt.words(0)(5 downto 0), Size.LONG, ucBfEaWords)
     val ucBfOffset5 = ucBfExt(10 downto 6).asUInt              // static offset 0..31
     val ucBfWidthRaw= ucBfExt(4 downto 0).asUInt               // raw width (0->32)
-    val ucBfWidth   = (((ucBfWidthRaw - 1) & U(31, 5 bits)) + 1)   // 1..32
+    val ucBfWidth   = (((ucBfWidthRaw - 1) & U(31, 5 bits)).resize(6) + 1)   // 1..32 (6 bits: 32 must not wrap to 0)
     val ucBfDn2     = ucBfExt(14 downto 12).asUInt.resize(5)
     // ── DYNAMIC offset/width (slice 3c) ─────────────────────────────────────────
     val ucBfDo      = ucBfExt(11)                              // offset is dynamic (Dn[off])
