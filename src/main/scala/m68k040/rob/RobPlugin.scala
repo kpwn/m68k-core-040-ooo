@@ -3149,6 +3149,19 @@ class RobPlugin(val detailedPerf: Boolean = false,
           "vector-55 delivery without a matching FS1 operand capture")
       }
     }
+    // CPU_FP_UNSUPP_TRAP phase 2: the busy-frame CU restart's FP-lane request/response.
+    if (m68k040.top.ShippingCoreConfig.fpUnsuppTrap) host.get[m68k040.services.FpColdExecService].foreach { svc =>
+      if (svc.coldReq != null) {
+        svc.coldReq.valid       := exc.fpColdReqValid
+        svc.coldReq.payload.op  := exc.fpColdReqOp
+        svc.coldReq.payload.src := exc.fpColdReqSrc
+        svc.coldReq.payload.dst := exc.fpColdReqDst
+        exc.fpColdReady    := svc.coldReady
+        exc.fpColdRspValid := svc.coldRsp.valid
+        exc.fpColdRspValue := svc.coldRsp.payload.value
+        exc.fpColdRspFpcc  := svc.coldRsp.payload.fpcc
+      }
+    }
     host.get[FpTrapImmediateService].foreach { imm =>
       imm.trapImmAddr := p0.fpuImmTag
       exc.fpuOperandValidIn := !p0.fpuImm || imm.trapImmValid

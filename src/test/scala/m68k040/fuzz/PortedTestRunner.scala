@@ -794,12 +794,22 @@ object PortedTestRunner {
       // CPU_FP_UNSUPP_TRAP: the FS1 operand capture and the vector-55 frame capture.
       if (sys.env.contains("PORTED_TRACE_UNSUPP") && m68k040.top.ShippingCoreConfig.fpUnsuppTrap) {
         var c = 0
+        var lastBody = false
         cd.onSamplings {
           c += 1
           val cap = dut.divEu.unsuppCapturePort
           if (cap.valid.toBoolean)
             println(f"[unsupp] cyc=$c CAP robId=${cap.payload.robId.toInt} src=0x${cap.payload.src.toBigInt.toString(16)} dst=0x${cap.payload.dst.toBigInt.toString(16)}")
           val e = dut.rob.logic.exc
+          val bodyNow = e.fsRdBody.toBoolean
+          if (bodyNow != lastBody)
+            println(f"[unsupp] cyc=$c BODY ${if (bodyNow) "start" else "done"} body=${e.fsBodyW.map(_.toBigInt.toString(16)).mkString(",")}")
+          lastBody = bodyNow
+          if (e.fpColdReqValid.toBoolean)
+            println(f"[unsupp] cyc=$c COLDREQ op=0x${e.fpColdReqOp.toBigInt.toString(16)} src=0x${e.fpColdReqSrc.toBigInt.toString(16)} dst=0x${e.fpColdReqDst.toBigInt.toString(16)} body=${e.fsBodyW.map(_.toBigInt.toString(16)).mkString(",")}")
+          val cr = dut.divEu.coldRspPort
+          if (cr.valid.toBoolean)
+            println(f"[unsupp] cyc=$c COLDRSP value=0x${cr.payload.value.toBigInt.toString(16)} fpcc=${cr.payload.fpcc.toInt}")
           if (e.fpUnsuppCaptureQ.toBoolean)
             println(f"[unsupp] cyc=$c FRAME src=0x${e.fpUnsuppSrcIn.toBigInt.toString(16)} dst=0x${e.fpUnsuppDstIn.toBigInt.toString(16)}")
         }

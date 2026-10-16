@@ -20,10 +20,26 @@
 | Stage 5  `fmove.x fp4,fp5` with FP4 holding an unnormal (loaded by FMOVEM.X, which does
 |          no data-type check) -- the FPREG source path -> 3*2^-62.
 | Stage 6  `ftst.x fp4` (unnormal) -> trap, software sets FPCC = positive (FBGT taken).
+| Stages 7-17 (phase 2: the handler normalizes the operand(s) and FRESTOREs a BUSY
+|          frame with CU_SAVEPC=$FE; the 040 -- and this core -- RE-EXECUTES the saved
+|          command on them). Hand-computed exact 68040 results:
+|   7  fadd.x  U3,fp1   1.0  + 3*2^-62  = {$3FFF, $80000000, $00000006}
+|   8  fsub.x  U3,fp1   1.0  - 3*2^-62  = {$3FFE, $FFFFFFFF, $FFFFFFF4}
+|   9  fmul.x  U3,fp1   2.0  * 3*2^-62  = {$3FC3, $C0000000, 0}
+|  10  fdiv.x  U3,fp1   3.0  / 3*2^-62  = 2^62   {$403D, $80000000, 0}
+|  11  fcmp.x  U3,fp1   fp1 = 3*2^-62 (normal) -> FBEQ taken
+|  12  fsqrt.x U4,fp2   sqrt(2^-60)     = 2^-30  {$3FE1, $80000000, 0}
+|  13  fadd.x  fp4,fp3  fp3 = U3 by FMOVEM (DESTINATION unnormal) -> as stage 7
+|  14  fmul.s  1sd,fp1  2^149  * 2^-149  = 1.0  (single denormal source)
+|  15  fmul.d  1dd,fp1  2^1074 * 2^-1074 = 1.0  (double denormal source)
+|  16  fsqrt.s 2sd,fp2  sqrt(2^-148)    = 2^-74  {$3FB5, $80000000, 0}
+|  17  fdiv.s  1sd,fp1  1.0 / 2^-149    = 2^149  {$4094, $80000000, 0}
+|  (U3 = unnormal {$4000, 0, 3} = 3*2^-62, U4 = {$4000, 0, 4}.) Each stage: exactly one
+|  vector-55 entry and the exact 80-bit result.
 |
 | FAIL codes at 0xFFFF0000:
 |   0xDF00eeee  stage-1 KWhet wrong (eeee = exponent word FMOVE.X produced)
-|   0xBAD5000s  stage s: wrong value / SP / trap count
+|   0xBAD5000s  stage s: wrong value / SP / trap count (s in hex, 1..$11)
 |   0xBAD00002/3/4/A/B  unexpected vector 2/3/4/10/11
     .text
     .org 0
@@ -139,6 +155,89 @@ _start:
     cmp.l   #1, %d6
     bne     _f6
 
+
+    | ── Stages 7-17: dyadic / FSQRT restart through the busy frame ──────
+    .macro XCONST addr, e, mh, ml
+    move.l  #\e, \addr
+    move.l  #\mh, \addr+4
+    move.l  #\ml, \addr+8
+    .endm
+    .macro EXPECT stage, e, mh, ml
+    lea     SCR+0x3F0, %a1
+    fmove.x %fp1, (%a1)
+    move.l  #\e, %d2
+    move.l  #\mh, %d3
+    move.l  #\ml, %d4
+    moveq   #\stage, %d5
+    bsr     _chk
+    .endm
+    .equ U3,  SCR+0x300
+    .equ U4,  SCR+0x310
+    .equ C3N, SCR+0x320
+    .equ P149, SCR+0x330
+    .equ P1074, SCR+0x340
+    .equ SD1, SCR+0x350
+    .equ DD1, SCR+0x360
+    .equ SD2, SCR+0x370
+    XCONST U3,  0x40000000, 0x00000000, 0x00000003
+    XCONST U4,  0x40000000, 0x00000000, 0x00000004
+    XCONST C3N, 0x3FC20000, 0xC0000000, 0x00000000
+    XCONST P149, 0x40940000, 0x80000000, 0x00000000
+    XCONST P1074, 0x44310000, 0x80000000, 0x00000000
+    move.l  #1, SD1
+    clr.l   DD1
+    move.l  #1, DD1+4
+    move.l  #2, SD2
+    lea     U3, %a0
+
+    moveq   #0, %d6
+    fmove.l #1, %fp1
+    fadd.x  (%a0), %fp1
+    EXPECT  7, 0x3FFF0000, 0x80000000, 0x00000006
+    moveq   #0, %d6
+    fmove.l #1, %fp1
+    fsub.x  (%a0), %fp1
+    EXPECT  8, 0x3FFE0000, 0xFFFFFFFF, 0xFFFFFFF4
+    moveq   #0, %d6
+    fmove.l #2, %fp1
+    fmul.x  (%a0), %fp1
+    EXPECT  9, 0x3FC30000, 0xC0000000, 0x00000000
+    moveq   #0, %d6
+    fmove.l #3, %fp1
+    fdiv.x  (%a0), %fp1
+    EXPECT  10, 0x403D0000, 0x80000000, 0x00000000
+    moveq   #11, %d5
+    fmove.x C3N, %fp1
+    moveq   #0, %d6
+    fcmp.x  (%a0), %fp1
+    fbne    _fx
+    cmp.l   #1, %d6
+    bne     _fx
+    moveq   #0, %d6
+    fsqrt.x U4, %fp1
+    EXPECT  12, 0x3FE10000, 0x80000000, 0x00000000
+    fmovem.x U3, %fp3
+    fmove.l #1, %fp4
+    moveq   #0, %d6
+    fadd.x  %fp4, %fp3
+    fmove.x %fp3, %fp1
+    EXPECT  13, 0x3FFF0000, 0x80000000, 0x00000006
+    moveq   #0, %d6
+    fmove.x P149, %fp1
+    fmul.s  SD1, %fp1
+    EXPECT  14, 0x3FFF0000, 0x80000000, 0x00000000
+    moveq   #0, %d6
+    fmove.x P1074, %fp1
+    fmul.d  DD1, %fp1
+    EXPECT  15, 0x3FFF0000, 0x80000000, 0x00000000
+    moveq   #0, %d6
+    fsqrt.s SD2, %fp1
+    EXPECT  16, 0x3FB50000, 0x80000000, 0x00000000
+    moveq   #0, %d6
+    fmove.l #1, %fp1
+    fdiv.s  SD1, %fp1
+    EXPECT  17, 0x40940000, 0x80000000, 0x00000000
+
     move.l  #0xC0FFEE00, PASS_SENT
 _halt:
     bra     _halt
@@ -147,6 +246,21 @@ _fk:
     andi.l  #0xFFFF, %d1
     ori.l   #0xDF000000, %d1
     move.l  %d1, PASS_SENT
+    bra     _halt
+_chk:
+    cmp.l   (%a1), %d2
+    bne     _fx
+    cmp.l   4(%a1), %d3
+    bne     _fx
+    cmp.l   8(%a1), %d4
+    bne     _fx
+    cmp.l   #1, %d6
+    bne     _fx
+    rts
+_fx:
+    andi.l  #0xFF, %d5
+    ori.l   #0xBAD50000, %d5
+    move.l  %d5, PASS_SENT
     bra     _halt
 _f1: move.l #0xBAD50001, PASS_SENT
     bra     _halt
