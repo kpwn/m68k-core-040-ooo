@@ -206,7 +206,7 @@ object DivEuPlugin {
   *   S1  CHK: compare -> complete (no write) or euFault. DIV: launch the iterative
   *       core; while busy, hold; on done -> writeback + complete + wakeup (or euFault).
   */
-class DivEuPlugin extends FiberPlugin with DivEuService with m68k040.services.FpUnsuppCaptureService {
+class DivEuPlugin extends FiberPlugin with DivEuService with m68k040.services.FpUnsuppCaptureService with m68k040.services.FpColdExecService {
   /** `CPU_PRF_TRIM_DIVH`: no dedicated `rdH` int-PRF read port. A uop with a valid third
     * source (DIV.L 64/32 Dr, CMP2/CHK2 Rn, BF* srcC, FMOVE.X T2 chunk) spends one extra
     * cycle in the registered issue slot reading `psrcC` through `rdA`. */
@@ -283,6 +283,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService with m68k040.services.Fp
   private val fpUnsuppTrap: Boolean = m68k040.top.ShippingCoreConfig.fpUnsuppTrap
   var unsuppCapturePort: Flow[m68k040.services.FpUnsuppCapture] = null
   override def unsuppCapture: Flow[m68k040.services.FpUnsuppCapture] = unsuppCapturePort
+  var coldReqPort: Flow[m68k040.services.FpColdReq] = null
+  var coldRspPort: Flow[m68k040.services.FpColdRsp] = null
+  var coldReadyPort: Bool = null
+  override def coldReq: Flow[m68k040.services.FpColdReq] = coldReqPort
+  override def coldRsp: Flow[m68k040.services.FpColdRsp] = coldRspPort
+  override def coldReady: Bool = coldReadyPort
 
   during setup {
     issuePort      = Stream(IqContext())
@@ -291,6 +297,13 @@ class DivEuPlugin extends FiberPlugin with DivEuService with m68k040.services.Fp
     wakeupNzvcPort = Flow(UInt(m68k040.Global.PHYS_NZVC_ID_W bits))
     euFaultPort    = Flow(EuFault()); euFaultPort.simPublic()
     if (fpUnsuppTrap) { unsuppCapturePort = Flow(m68k040.services.FpUnsuppCapture()); unsuppCapturePort.simPublic() }
+    if (fpUnsuppTrap) {
+      coldReqPort = Flow(m68k040.services.FpColdReq())
+      coldReqPort.valid.allowOverride; coldReqPort.valid := False
+      coldReqPort.payload.allowOverride; coldReqPort.payload.assignDontCare()
+      coldRspPort = Flow(m68k040.services.FpColdRsp()); coldRspPort.simPublic()
+      coldReadyPort = Bool()
+    }
     flushSig       = Bool()
     // default-driven idle (allowOverride) so a standalone test that does not wire a
     // flush still elaborates; the BackendWiring drives it from doFlush.
@@ -1200,6 +1213,21 @@ class DivEuPlugin extends FiberPlugin with DivEuService with m68k040.services.Fp
                       u0.fpSrcKind === FpSrcKind.ROMCONST, fpPrecIn)
       loadFpCtx(fpS1Ctx)
     }
+    // ---- CPU_FP_UNSUPP_TRAP phase 2: cold re-execution request (COLD) ----
+    // Loads the FS1 registers exactly as an FPm,FPn issue would, from the request instead
+    // of the PRF. Only legal while the exception FSM owns the core (no FP µop can be
+    // accepted then), so the two loads are mutually exclusive by construction.
+    val fpS1Cold: Bool = if (fpUnsuppTrap) RegNext(coldReqPort.valid) init False else null
+    if (fpUnsuppTrap) when(coldReqPort.valid) {
+      fpS1FpDst  := coldReqPort.payload.dst
+      fpS1FpSrc  := coldReqPort.payload.src
+      fpS1Kind   := FpSrcKind.FPREG
+      fpS1KindB  := FpSrcKind.FPREG
+      fpS1Fmt    := B"3'b010"
+      fpS1Opmode := coldReqPort.payload.op
+      fpS1Rmode  := fpRmodeIn
+      fpS1Prec   := FpSource.opmodeToPrecision(coldReqPort.payload.op, False, fpPrecIn)
+    }
 
     // ---- FS1: source-operand gateway (conversion cone) ---------------------
     // The INT-register-borne source kinds all read the ORDINARY int PRF ports this EU
@@ -1253,7 +1281,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService with m68k040.services.Fp
     // below) and only clears on a real `doneIter`, so suppressing the start of a request that
     // was flushed one cycle after acceptance would wedge that lane permanently. Wrong-path
     // FIXED results are dropped by the shadow pipe's flush clear instead, as before.
-    fpu.io.start   := fpS1Valid
+    fpu.io.start   := (if (fpUnsuppTrap) fpS1Valid || fpS1Cold else fpS1Valid)
     fpu.io.op      := FpSource.opmodeToFpOp(fpS1Opmode, fpS1IsRomConst)
     fpu.io.dst     := fpS1FpDst
     fpu.io.src     := fpSrcVal
@@ -1529,6 +1557,42 @@ class DivEuPlugin extends FiberPlugin with DivEuService with m68k040.services.Fp
     fpExcAccrualPort.valid   := fpLaneAccrualLive || fpStoreAccrualLive
     fpExcAccrualPort.payload := Mux(fpLaneAccrualLive,  fpCompExc,     B(0, 8 bits)) |
                                 Mux(fpStoreAccrualLive, fpStoreExcReg, B(0, 8 bits))
+
+    // ---- CPU_FP_UNSUPP_TRAP phase 2: cold re-execution completion (COLD) ----
+    // Deliberately IGNORES flushSig (high for the whole exception FSM run): the cold op
+    // has its own 1-bit shadow beside the fixed-lane descriptor pipe, and on the
+    // iterative lane it is marked flushed so the ordinary writeback never sees it. Its
+    // result goes only to the exception sequencer; the FPSR EXC/AEXC accrual is the same
+    // OR-in an ordinary FP op performs.
+    if (fpUnsuppTrap) {
+      val coldIsIter = FpSource.isIterativeOpmode(coldReqPort.payload.op, False)
+      val coldFixed  = Vec.fill(FpuCore.FixedLatency)(RegInit(False))
+      val coldIterP  = RegInit(False)
+      val coldBusy   = RegInit(False)
+      val coldGoFixed = RegNext(coldReqPort.valid && !coldIsIter) init False
+      coldFixed(0) := coldGoFixed
+      for (i <- 1 until FpuCore.FixedLatency) coldFixed(i) := coldFixed(i - 1)
+      when(coldReqPort.valid) {
+        coldBusy := True
+        when(coldIsIter) { fpIterBusy := True; fpIterFlushed := True; coldIterP := True }
+      }
+      val takeFixed = coldFixed.last && fpu.io.doneFixed
+      val takeIter  = coldIterP && fpu.io.doneIter
+      val rspV = RegInit(False); rspV := False
+      val rsp  = Reg(m68k040.services.FpColdRsp()); rsp.simPublic(); rspV.simPublic()
+      when(takeFixed || takeIter) {
+        val r = Mux(takeFixed, fpu.io.resFixed, fpu.io.resIter)
+        rspV := True; rsp.value := r.value; rsp.fpcc := r.fpcc; rsp.exc := fpsrExcByte(r.exc)
+        coldBusy := False
+      }
+      when(takeIter) { coldIterP := False }
+      coldRspPort.valid := rspV; coldRspPort.payload := rsp
+      coldReadyPort := !coldBusy && !fpIterBusy && !fpS1Valid
+      when(rspV && rsp.exc =/= 0) {
+        fpExcAccrualPort.valid := True
+        fpExcAccrualPort.payload := rsp.exc
+      }
+    }
 
     // ---- sim-only whitebox for the FP lane (zero synth impact) ----
     fpCompValid.simPublic(); fpCompRobId.simPublic(); fpCompData.simPublic()

@@ -2,8 +2,9 @@
 | delivery contract, checked field by field by a minimal handler (no FPSP):
 |   * stack frame: format $0 / vector 55 (word $00DC), stacked PC = the NEXT instruction
 |   * FPIAR = the trapping instruction
-|   * FSAVE: 52-byte frame, header $41300000, CMDREG1B (+$10), STAG (+$0C [31:29]),
-|     DTAG (+$14 [31:29], dyadic only), E1 (+$18 bit 26), FPTEMP (+$1C), ETEMP (+$28)
+|   * FSAVE: the 100-byte BUSY frame a 68040 holds after vector 55, header $41600000,
+|     CMDREG1B (+$40), STAG (+$3C [31:29]), DTAG (+$44 [31:29], dyadic only), E1 (+$48
+|     bit 26), FPTEMP (+$4C), ETEMP (+$58) -- top-aligned exactly like the 52-byte frame
 |     -- the fields x_unsupp's get_op/res_func ($4088E146/$4088E8D0) read
 |   * pre-instruction semantics: no FPn and no FPSR update; but an (An)+ source EA has
 |     completed (An advanced) -- the MC68040 finishes the EA before it reports
@@ -159,45 +160,45 @@ _v55:
     bne     _fh
     fsave   -(%sp)
     moveq   #4, %d5
-    cmp.l   #0x41300000, (%sp)
+    cmp.l   #0x41600000, (%sp)
     bne     _fh
     moveq   #5, %d5
-    move.w  0x10(%sp), %d0
+    move.w  0x40(%sp), %d0
     cmp.w   8(%a5), %d0
     bne     _fh
     moveq   #6, %d5
-    move.b  0x0C(%sp), %d0
+    move.b  0x3C(%sp), %d0
     andi.b  #0xE0, %d0
     cmp.b   10(%a5), %d0
     bne     _fh
     moveq   #7, %d5
-    btst    #2, 0x18(%sp)
+    btst    #2, 0x48(%sp)
     beq     _fh
     moveq   #8, %d5
-    move.l  0x28(%sp), %d0
+    move.l  0x58(%sp), %d0
     cmp.l   12(%a5), %d0
     bne     _fh
-    move.l  0x2C(%sp), %d0
+    move.l  0x5C(%sp), %d0
     cmp.l   16(%a5), %d0
     bne     _fh
-    move.l  0x30(%sp), %d0
+    move.l  0x60(%sp), %d0
     cmp.l   20(%a5), %d0
     bne     _fh
     tst.b   11(%a5)
     beq     1f
     moveq   #9, %d5
-    move.b  0x14(%sp), %d0
+    move.b  0x44(%sp), %d0
     andi.b  #0xE0, %d0
     cmp.b   11(%a5), %d0
     bne     _fh
     moveq   #10, %d5
-    move.l  0x1C(%sp), %d0
+    move.l  0x4C(%sp), %d0
     cmp.l   24(%a5), %d0
     bne     _fh
-    move.l  0x20(%sp), %d0
+    move.l  0x50(%sp), %d0
     cmp.l   28(%a5), %d0
     bne     _fh
-    move.l  0x24(%sp), %d0
+    move.l  0x54(%sp), %d0
     cmp.l   32(%a5), %d0
     bne     _fh
 1:  frestore (%sp)+

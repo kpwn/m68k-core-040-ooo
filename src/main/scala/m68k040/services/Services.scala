@@ -926,6 +926,29 @@ trait FpUnsuppCaptureService {
   def unsuppCapture: Flow[FpUnsuppCapture]
 }
 
+/** CPU_FP_UNSUPP_TRAP phase 2: run ONE FP operation on the FP lane on behalf of the
+  * serialized exception sequencer -- FRESTORE of an MC68040 BUSY frame whose CU is to
+  * restart (the FPSP's unsupported-data-type hand-back) re-executes the saved command on
+  * the saved, now-normalized operands. Only ever used while the exception FSM owns the
+  * core (pipeline drained), so it never competes with a real FP µop.
+  * PRODUCER: DivEuPlugin exclusively (null ports when the flag is off).
+  * CONSUMER: RobPlugin (its ExceptionUnit). */
+case class FpColdReq() extends Bundle {
+  val op  = Bits(7 bits)    // raw cpGEN opmode (CMDREG1B[6:0])
+  val src = Bits(80 bits)   // ETEMP
+  val dst = Bits(80 bits)   // FPTEMP
+}
+case class FpColdRsp() extends Bundle {
+  val value = Bits(80 bits)
+  val fpcc  = Bits(4 bits)  // internal {NaN, I, Z, N}
+  val exc   = Bits(8 bits)  // architectural FPSR[15:8] order (already OR-accrued by the EU)
+}
+trait FpColdExecService {
+  def coldReq: Flow[FpColdReq]   // driven by the consumer: one pulse per operation
+  def coldRsp: Flow[FpColdRsp]   // one pulse when the result is ready
+  def coldReady: Bool            // the FP lane can accept a request now
+}
+
 trait FpTrapImmediateService {
   def trapImmAddr: UInt
   def trapImmData: Bits

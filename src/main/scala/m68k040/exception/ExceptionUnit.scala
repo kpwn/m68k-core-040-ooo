@@ -2,6 +2,7 @@ package m68k040.exception
 
 import m68k040.cache.{DLoadCmd, DLoadRsp, DStoreCmd, TranslationReq, TranslationRsp}
 import m68k040.isa.Size
+import m68k040.execute.fpu.FpSource
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -424,6 +425,33 @@ class ExceptionUnit(
   val fpUnsuppCaptureNow: Bool = if (fpUnsuppTrap) { val b = Bool(); b := False; b } else null
   val fpUnsuppCaptureQ: Bool = if (fpUnsuppTrap) RegNext(fpUnsuppCaptureNow) init False else null
   if (fpUnsuppTrap) { fpUnsuppSrcIn.simPublic(); fpUnsuppDstIn.simPublic(); fpUnsuppCaptureQ.simPublic() }
+  // CPU_FP_UNSUPP_TRAP phase 2: FRESTORE of a BUSY frame whose CU restarts re-executes
+  // the saved operation on the FP lane (`FpColdExecService`, wired by RobPlugin).
+  val fpColdReqValid: Bool = if (fpUnsuppTrap) { val b = Bool(); b := False; b } else null
+  val fpColdReqOp:  Bits = if (fpUnsuppTrap) Reg(Bits(7 bits))  else null
+  val fpColdReqSrc: Bits = if (fpUnsuppTrap) Reg(Bits(80 bits)) else null
+  val fpColdReqDst: Bits = if (fpUnsuppTrap) Reg(Bits(80 bits)) else null
+  val fpColdReady:  Bool = if (fpUnsuppTrap) { val b = Bool(); b.allowOverride; b := False; b } else null
+  val fpColdRspValid: Bool = if (fpUnsuppTrap) { val b = Bool(); b.allowOverride; b := False; b } else null
+  val fpColdRspValue: Bits = if (fpUnsuppTrap) { val b = Bits(80 bits); b.allowOverride; b := 0; b } else null
+  val fpColdRspFpcc:  Bits = if (fpUnsuppTrap) { val b = Bits(4 bits); b.allowOverride; b := 0; b } else null
+  // The busy-frame body words the restart needs (offsets from the frame base; the busy
+  // frame is 100 bytes, fields top-aligned exactly like the 52-byte one, so x_unsupp's
+  // `%fp@(-2xx)` references land at frame+$64-(-192-addr)):
+  //   $08 CU_SAVEPC ($FE = restart the CU) | $3C STAG (+ETE15 bit 4) | $40 CMDREG1B
+  //   $44 DTAG (+FPTE15 bit 4) | $48 E_BYTE (E1 bit 2, E3 bit 1)
+  //   $4C FPTEMP sign/exp, $50..$56 FPTEMP mantissa | $58 ETEMP sign/exp, $5C..$62 mantissa
+  val fsBodyOffs = Seq(0x08, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x52, 0x54, 0x56, 0x58, 0x5C, 0x5E, 0x60, 0x62)
+  val fsRdOff:  UInt = if (fpUnsuppTrap) Reg(UInt(7 bits)) init 0 else null
+  val fsRdBody: Bool = if (fpUnsuppTrap) RegInit(False) else null
+  val fsRdIdx:  UInt = if (fpUnsuppTrap) Reg(UInt(4 bits)) init 0 else null
+  val fsBodyW:  Vec[Bits] = if (fpUnsuppTrap) Vec.fill(fsBodyOffs.size)(Reg(Bits(16 bits))) else null
+  val fsColdShS: UInt = if (fpUnsuppTrap) Reg(UInt(7 bits)) else null
+  val fsColdShD: UInt = if (fpUnsuppTrap) Reg(UInt(7 bits)) else null
+  if (fpUnsuppTrap) {
+    fpColdReqValid.simPublic(); fsRdBody.simPublic(); fpColdReqOp.simPublic()
+    fpColdReqSrc.simPublic(); fpColdReqDst.simPublic(); fsBodyW.foreach(_.simPublic())
+  }
   when(fpUnimpCaptureQ) {
     setUnimpFramePort.valid   := True
     setUnimpFramePort.payload := entryFpuCmdQ ## committedFpSrcIn ## committedFpDstIn
@@ -1286,7 +1314,8 @@ class ExceptionUnit(
   val fsSize      = Reg(UInt(8 bits))                            // total frame size in BYTES
   val fsIsNull    = RegInit(False)
   val fsIsUnimp   = RegInit(False)
-  val fsStep      = Reg(UInt(5 bits)) init 0; fsStep.simPublic() // WORD index, 0..25
+  // CPU_FP_UNSUPP_TRAP: 6 bits -- a vector-55 FSAVE emits the 50-word BUSY frame.
+  val fsStep      = Reg(UInt((if (m68k040.top.ShippingCoreConfig.fpUnsuppTrap) 6 else 5) bits)) init 0; fsStep.simPublic() // WORD index, 0..25 (0..49)
   val fsSplitLow  = RegInit(False)
   // ── p167 (2026-09-09): FRESTORE's header READ carries the SAME cross-line hole the
   // FSAVE store side closed with `fsSplitLow` (task #163) and the RTE frame-word read
@@ -1446,7 +1475,21 @@ class ExceptionUnit(
   }
 
   def fsFrameWordAddr(step: UInt): UInt = (fsFrameBase + (step << 1)).resized
-  def fsFrameWordData(step: UInt): Bits = {
+  def fsFrameWordData(step6: UInt): Bits = if (!fpUnsuppTrap || fpuCtrl.uiUnsupp == null) fsFrameWordData5(step6.resize(5)) else {
+    // CPU_FP_UNSUPP_TRAP: after a vector-55 delivery the 68040 holds a BUSY frame
+    // (version $41, length $60 = 100 bytes), and the FPSP depends on it: res_func plants
+    // CU_SAVEPC=$FE at frame+$08 (%fp@(-284)), which only lies INSIDE the frame when the
+    // frame is 100 bytes -- with the 52-byte frame gen_except's $30->busy conversion
+    // ($4088E02C) zero-fills that word and the restart is lost. All the fields the FPSP
+    // reads are top-aligned, so the busy frame is the unimplemented frame's 48-byte body
+    // moved up by 48 bytes (24 words) with zeros below it.
+    val busy = fsIsUnimp && fpuCtrl.uiUnsupp
+    val mapped = Mux(!busy, step6.resize(5),
+                 Mux(step6 === 0, U(0, 5 bits), Mux(step6 >= 26, (step6 - 24).resize(5), U(1, 5 bits))))
+    val w = fsFrameWordData5(mapped)
+    Mux(busy && step6 === 0, B((FPU_FRAME_VERSION << 8) | 0x60, 16 bits), w)
+  }
+  def fsFrameWordData5(step: UInt): Bits = {
     val out = Bits(16 bits); out := B(0, 16 bits)
     // Header word: [15:8] = version, [7:0] = the length-in-hex indicator (NOT a format
     // enum -- the pop size is 4 + this byte, for every frame flavour).
@@ -1499,6 +1542,13 @@ class ExceptionUnit(
         out := (if (m68k040.top.ShippingCoreConfig.fsaveCleanIdleCmd)
                   Mux(fsIsUnimp, fpuCtrl.uiCmdReg1B, B(0, 16 bits))
                 else fpuCtrl.uiCmdReg1B)
+        // CPU_FP_UNSUPP_TRAP: the 040 re-encodes FSQRT ($04) as $05 in an unsupported-
+        // data-type frame's CMDREG1B, so res_func's "opmode bit 0 = FSQRT family" test
+        // ($4088E960) routes it to the restart path rather than the FMOVE-like CU path.
+        if (fpUnsuppTrap && fpuCtrl.uiUnsupp != null)
+          when(fsIsUnimp && fpuCtrl.uiUnsupp && fpuCtrl.uiCmdReg1B(6 downto 0) === B(0x04, 7 bits)) {
+            out := fpuCtrl.uiCmdReg1B(15 downto 1) ## True
+          }
       }
       is(U(10, 5 bits)) { out := dtag ## B(0, 13 bits) }                      // $14 DTAG  [31:29]
       is(U(12, 5 bits)) { out := B(0, 5 bits) ## e1Bit ## B(0, 10 bits) }       // $18 E1
@@ -1518,7 +1568,9 @@ class ExceptionUnit(
   }
   /** 26 words ($34 bytes) for the unimplemented-instruction frame, 2 words (4 bytes) for
     * null and idle alike (both are a single longword, unchanged between manual editions). */
-  val fsLastStep = U(25, 5 bits)   // every FSAVE frame is now 26 words / 52 bytes
+  val fsLastStep: UInt = if (fpUnsuppTrap && fpuCtrl.uiUnsupp != null)
+      Mux(fsIsUnimp && fpuCtrl.uiUnsupp, U(49, 6 bits), U(25, 6 bits))   // busy: 50 words
+    else U(25, (if (fpUnsuppTrap) 6 else 5) bits)   // every FSAVE frame is now 26 words / 52 bytes
 
   // ── p167 (2026-09-09): RTE frame-word READ split at a 16-byte line boundary ──
   // A format-$0/$2/$7 frame sits at SSP-8/-12/-60. Mac OS legitimately runs stretches
@@ -1711,6 +1763,11 @@ class ExceptionUnit(
     val F_HDRWAIT = new State   // FRESTORE: dispatch on version / length byte
     val F_RDONE   = new State   // FRESTORE: An += popSize
     val F_HALT    = new State   // terminal: a frame translation faulted (see below)
+    // CPU_FP_UNSUPP_TRAP phase 2 (busy-frame CU restart): decode, denormalize, run, write.
+    val F_CDEC   = if (fpUnsuppTrap) new State else null
+    val F_CSHIFT = if (fpUnsuppTrap) new State else null
+    val F_CREQ   = if (fpUnsuppTrap) new State else null
+    val F_CWAIT  = if (fpUnsuppTrap) new State else null
 
     IDLE.whenIsActive {
       // Arm the "this sysOp wrote A7 itself" latch fresh for every episode (see its
@@ -3076,7 +3133,9 @@ class ExceptionUnit(
           // unchanged. FRESTORE still pops 4 + the frame's own size byte, so a frame
           // the FPSP manufactures itself is popped by ITS size, not by this one.
           val isUnimp = fpuCtrl.uiValid
-          val size    = U(52, 8 bits)
+          val size    = if (fpUnsuppTrap && fpuCtrl.uiUnsupp != null)
+                          Mux(isUnimp && fpuCtrl.uiUnsupp, U(100, 8 bits), U(52, 8 bits))
+                        else U(52, 8 bits)
           fsIsNull  := False
           fsIsUnimp := isUnimp
           fsSize    := size
@@ -3111,6 +3170,7 @@ class ExceptionUnit(
           fsFrameBase := sysCapVal.asUInt
           fsAnWrite   := sysCapRc(3 downto 1) === U(3, 3 bits)   // (An)+ postincrement
           fsRdSplitLow := False   // p167: no split-header carry into this episode
+          if (fpUnsuppTrap) { fsRdOff := 0; fsRdBody := False }
           fsVpnValid  := False
         }
       }
@@ -3422,8 +3482,9 @@ class ExceptionUnit(
     // p167: the FRESTORE header read's split-aware address / VPN (see `fsRdSplitLow`).
     // Deriving the VPN from `fsRdCurVa` is what makes a header at page offset $FFF
     // re-translate for its second byte, exactly as `fsCurVa` does on the store side.
-    val fsRdCrosses = fsFrameBase(3 downto 0) === U(15, 4 bits)
-    val fsRdCurVa   = Mux(fsRdSplitLow, fsFrameBase + U(1, 32 bits), fsFrameBase)
+    val fsRdWordVa  = if (fpUnsuppTrap) fsFrameBase + fsRdOff.resize(32) else fsFrameBase
+    val fsRdCrosses = fsRdWordVa(3 downto 0) === U(15, 4 bits)
+    val fsRdCurVa   = Mux(fsRdSplitLow, fsRdWordVa + U(1, 32 bits), fsRdWordVa)
     val fsRdCurVpn  = fsRdCurVa(31 downto 12)
     val fsRdNeedXlate = !fsVpnValid || (fsRdCurVpn =/= fsLastVpn)
 
@@ -3637,6 +3698,7 @@ class ExceptionUnit(
         fsRdSplitLow := False
         val hdr     = Mux(fsRdCrosses, fsRdHiByte ## dcLoadRsp.payload.data(7 downto 0),
                                        dcLoadRsp.payload.data(15 downto 0))
+        def frestoreHeader(): Unit = {
         val version = hdr(15 downto 8)
         val lenByte = hdr(7 downto 0).asUInt
         // Pop size = 4 + the length-in-hex indicator, for EVERY frame flavour. This is
@@ -3667,6 +3729,22 @@ class ExceptionUnit(
           setEverExecutedPort.valid := True; setEverExecutedPort.payload := True
         }
         goto(F_RDONE)
+        // CPU_FP_UNSUPP_TRAP phase 2: a BUSY frame ($60) may carry an operation the
+        // FPU must finish -- read its body before popping it.
+        if (fpUnsuppTrap) when(version =/= B(0, 8 bits) && lenByte === U(0x60, 8 bits)) {
+          fsRdBody := True; fsRdIdx := 0; fsRdOff := U(fsBodyOffs.head, 7 bits)
+          goto(F_HDRREQ)
+        }
+        }
+        if (!fpUnsuppTrap) frestoreHeader() else when(!fsRdBody) { frestoreHeader() } otherwise {
+          // CPU_FP_UNSUPP_TRAP phase 2: one busy-frame body word.
+          fsBodyW(fsRdIdx) := hdr
+          val last = fsRdIdx === U(fsBodyOffs.size - 1, 4 bits)
+          val offTab = Vec(fsBodyOffs.map(o => U(o, 7 bits)))
+          fsRdIdx := fsRdIdx + 1
+          fsRdOff := offTab((fsRdIdx + 1).resize(4))
+          when(last) { fsRdBody := False; fsRdOff := 0; goto(F_CDEC) } otherwise { goto(F_HDRREQ) }
+        }
       }
     }
     // The An write-back for FRESTORE (An)+ has to happen HERE, not in S_APPLY: the pop
@@ -3721,6 +3799,81 @@ class ExceptionUnit(
     // that ordinary entry/RTE frame stores mark `precise := True` specifically so a bus
     // error there never reaches the diagnostic channel at all is a SEPARATE, pre-existing
     // gap -- not introduced by Task 11 and not closed by it.
+    // ══ CPU_FP_UNSUPP_TRAP phase 2: busy-frame CU restart ══════════════════════════
+    // A real 68040 FRESTOREd with a busy frame whose CU micro-PC is $FE (and E1/E3 clear)
+    // re-issues CMDREG1B on ETEMP/FPTEMP. That is exactly the frame x_unsupp's res_func
+    // builds when it has normalized an unsupported operand of a dyadic op or FSQRT
+    // ($4088EB72: CU_SAVEPC := $FE, E1 cleared; gen_except $4088E07E converts the frame to
+    // busy and FRESTOREs it). The operands are in the 040's internal extended-range form:
+    // 15 exponent bits + ETE15/FPTE15 (STAG/DTAG bit 4). get_op's mk_norm sets that bit
+    // whenever the exponent is <= $3FFF and res_func's nrm_set leaves a NEGATIVE exponent
+    // as its low 15 bits with the bit set, so the biased exponent is
+    //   B = (bit4 && exp[14]) ? exp - $8000 : exp
+    // on the 040's own scale (exp 0 = 2^-16383). B >= 1 is an ordinary extended; B <= 0
+    // goes to this FPU as its exp-0 denormal with the mantissa shifted right by 1 - B
+    // (exact unless the operand was an extended denormal whose last bit the two exp-0
+    // conventions disagree on).
+    if (fpUnsuppTrap) {
+      val cuSavePc = fsBodyW(0)(15 downto 8)
+      val stagB    = fsBodyW(1)(15 downto 8)
+      val cmd      = fsBodyW(2)
+      val dtagB    = fsBodyW(3)(15 downto 8)
+      val eByte    = fsBodyW(4)(15 downto 8)
+      val fptExp   = fsBodyW(5)
+      val fptMan   = fsBodyW(6) ## fsBodyW(7) ## fsBodyW(8) ## fsBodyW(9)
+      val etExp    = fsBodyW(10)
+      val etMan    = fsBodyW(11) ## fsBodyW(12) ## fsBodyW(13) ## fsBodyW(14)
+      val opm      = Mux(cmd(6 downto 0) === B(0x05, 7 bits), B(0x04, 7 bits), cmd(6 downto 0))  // FSQRT re-encode
+      val restart  = cuSavePc === B(0xFE, 8 bits) && !eByte(2) && !eByte(1) &&
+                     FpSource.isNativeOpmode(opm)
+      // 1 - B, or 0 when B >= 1 (no shift); saturated at 64 (the value is then zero).
+      def denShift(expW: Bits, tag: Bits): UInt = {
+        val e = expW(14 downto 0).asUInt
+        val b = Mux(tag(4) && e(14), e.resize(17).asSInt - S(0x8000, 17 bits), e.resize(17).asSInt)
+        val sh = (S(1, 17 bits) - b)
+        Mux(b >= 1, U(0, 7 bits), Mux(sh >= 64, U(64, 7 bits), sh.asUInt.resize(7)))
+      }
+      F_CDEC.whenIsActive {
+        when(restart) {
+          fpColdReqOp  := opm
+          fpColdReqSrc := etExp(15) ## Mux(denShift(etExp, stagB) =/= 0, B(0, 15 bits), etExp(14 downto 0)) ## etMan
+          fpColdReqDst := fptExp(15) ## Mux(denShift(fptExp, dtagB) =/= 0, B(0, 15 bits), fptExp(14 downto 0)) ## fptMan
+          fsColdShS := denShift(etExp, stagB)
+          fsColdShD := denShift(fptExp, dtagB)
+          goto(F_CSHIFT)
+        } otherwise {
+          goto(F_RDONE)
+        }
+      }
+      // One bit per cycle (cold; avoids two 64-bit barrel shifters).
+      F_CSHIFT.whenIsActive {
+        when(fsColdShS =/= 0) {
+          fpColdReqSrc(63 downto 0) := (fpColdReqSrc(63 downto 0).asUInt |>> 1).asBits
+          fsColdShS := fsColdShS - 1
+        }
+        when(fsColdShD =/= 0) {
+          fpColdReqDst(63 downto 0) := (fpColdReqDst(63 downto 0).asUInt |>> 1).asBits
+          fsColdShD := fsColdShD - 1
+        }
+        when(fsColdShS === 0 && fsColdShD === 0) { goto(F_CREQ) }
+      }
+      F_CREQ.whenIsActive {
+        when(fpColdReady) { fpColdReqValid := True; goto(F_CWAIT) }
+      }
+      F_CWAIT.whenIsActive {
+        when(fpColdRspValid) {
+          // The op's architectural effects, exactly as the hardware op: FPn (unless an
+          // FCMP/FTST-class opmode), FPCC, and (DivEu side) the EXC/AEXC accrual.
+          when(!FpSource.isNoFpDstOpmode(fpColdReqOp)) {
+            fmFpWrite.valid := True
+            fmFpWrite.payload.fpReg := cmd(9 downto 7).asUInt
+            fmFpWrite.payload.value := fpColdRspValue
+          }
+          fpccWriteValid := True; fpccWriteData := fpColdRspFpcc
+          goto(F_RDONE)
+        }
+      }
+    }
     F_HALT.whenIsActive {
       fsXlateFault := True   // hold it asserted; the ROB-side latch is sticky anyway
     }
