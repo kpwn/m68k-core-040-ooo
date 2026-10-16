@@ -48,13 +48,57 @@ object PredecodeCoded {
   /** Classify `op` given its three lookahead words, their validity, and their shared `ix`. */
   def classify(op: Bits, extW: Bits, extW2: Bits, extW3: Bits,
                extWKnown: Bool, extW2Known: Bool, extW3Known: Bool,
-               ix1: UInt, ix2: UInt, ix3: UInt): ChunkPredecode = {
+               ix1: UInt, ix2: UInt, ix3: UInt): ChunkPredecode =
+    classifyD(op, extW, extW2, extW3, extWKnown, extW2Known, extW3Known, ix1, ix2, ix3,
+      Seq(!extWKnown, !extW2Known, !extW3Known), Set.empty)
+
+  /** Coverage cuts (CPU_PREDECODE_COMMON_ONLY study). Every cut only turns results
+    * AMBIGUOUS (the aligner's live-classify slow path), never changes a resolved length:
+    *  word-level (applied to the lookahead view by `cutView`):
+    *    "idx"  every indexed EA ambiguous (no lookahead word content used for EA length)
+    *    "full" full-format indexed EA ambiguous (no fullExtLen)
+    *    "la2"  lookahead limited to 2 words; "la1" to 1 word
+    *  case-level (inside `classifyD`): "imm" line-0 immediates to memory, "bitop", "line0x"
+    *    (MOVEP/CMP2/CHK2/CAS/CAS2/MOVES), "move", "moveDstIdx", "mull", "movem",
+    *    "bitfield", "fpu", "fpuEa" (FPU general with an <ea>). */
+  val cutNames = Seq("idx", "full", "la2", "la1", "imm", "bitop", "line0x", "move", "moveDstIdx",
+                     "mull", "movem", "bitfield", "fpu", "fpuEa")
+
+  /** The (known, ix, ambiguous-if-selected) view of one lookahead word at position `pos`
+    * (1..3) under the word-level cuts. */
+  def cutView(w: Bits, known: Bool, pos: Int, drop: Set[String]): (Bool, UInt, Bool) = {
+    val k: Bool = if ((drop("la1") && pos >= 2) || (drop("la2") && pos >= 3)) False else known
+    if (drop("idx")) (k, U(1, 3 bits), True)
+    else if (drop("full")) (k, U(1, 3 bits), !k || w(8))
+    else (k, ix(w, k), !k)
+  }
+
+  /** Classify the 4..16 words of a contiguous window `win` (opwords, `win.size - 3` of
+    * them classified, the last three are lookahead only) under the cuts `drop`; `valid(k)`
+    * = window word k is real. Per-word `ix` is shared across the classifiers. */
+  def classifyWindow(win: Seq[Bits], valid: Seq[Bool], drop: Set[String]): Seq[ChunkPredecode] = {
+    val n = win.size - 3
+    if (drop.isEmpty) {
+      val ixs = win.indices.map(j => ix(win(j), valid(j)))
+      (0 until n).map(i => classify(win(i), win(i + 1), win(i + 2), win(i + 3),
+        valid(i + 1), valid(i + 2), valid(i + 3), ixs(i + 1), ixs(i + 2), ixs(i + 3)))
+    } else (0 until n).map { i =>
+      val v = (1 to 3).map(p => cutView(win(i + p), valid(i + p), p, drop))
+      classifyD(win(i), win(i + 1), win(i + 2), win(i + 3), v(0)._1, v(1)._1, v(2)._1,
+        v(0)._2, v(1)._2, v(2)._2, v.map(_._3), drop)
+    }
+  }
+
+  /** Classify under the cuts `drop`; `ab(j)` = word j+1 makes an indexed EA ambiguous. */
+  def classifyD(op: Bits, extW: Bits, extW2: Bits, extW3: Bits,
+               extWKnown: Bool, extW2Known: Bool, extW3Known: Bool,
+               ix1: UInt, ix2: UInt, ix3: UInt, ab: Seq[Bool], drop: Set[String]): ChunkPredecode = {
     val r = ChunkPredecode()
     r.size := m68k040.decode.OperationDecoder.decode(op).size
 
     r.ctrlXfer := ctrlXfer(op)
 
-    val knV = Vec(extWKnown, extW2Known, extW3Known)
+    val abV = Vec(ab)
     val ixV = Vec(ix1, ix2, ix3)
     val W1 = B"3'b001"; val W2 = B"3'b010"; val W3 = B"3'b100"; val WN = B"3'b000"
 
@@ -71,6 +115,7 @@ object PredecodeCoded {
     def setLenK(k: UInt): Unit = { lenC := k.resize(4); lenSel := WN; useMove := False }
     def setLenN(n: Int): Unit = setLenK(U(n, 4 bits))
     def setAmb(sel: Bits): Unit = { ambC := False; ambSel := sel }
+    def cutAmb(): Unit = { lenC := U(1, 4 bits); lenSel := WN; useMove := False; ambC := True; ambSel := WN }
 
     // Mirrors classify's memDestExt: (ok, ext, amb) -- amb selector = ext selector.
     def memDestExt(mode: UInt, reg: UInt, wsel: Bits): (Bool, Ext) = {
@@ -124,7 +169,7 @@ object PredecodeCoded {
     val mvDstReg  = op(11 downto 9).asUInt
     val (mvSOk, mvS) = eaExt(mvSrcMode, mvSrcReg, mvSizeL, allowImm = true, W1)
     val mvSExt = mvS.c + Mux(mvS.sel(0), ix1, U(0, 3 bits))
-    val mvSAmb = mvS.sel(0) && !extWKnown
+    val mvSAmb = mvS.sel(0) && ab(0)
     val mvDstKn = mvSExt.mux(0 -> extWKnown, 1 -> extW2Known, 2 -> extW3Known, default -> False)
     val mvDstIx = mvSExt.mux(0 -> ix1, 1 -> ix2, 2 -> ix3, default -> U(1, 3 bits))
     val mvDOk  = Bool(); val mvDExt = UInt(3 bits); val mvDAmb = Bool()
@@ -137,7 +182,7 @@ object PredecodeCoded {
       }
     } elsewhen(mvDstMode === U(6, 3 bits)) {
       mvDExt := mvDstIx
-      when(!mvDstKn) { mvDAmb := True }
+      mvDAmb := mvSExt.mux(0 -> ab(0), 1 -> ab(1), 2 -> ab(2), default -> True)
     } elsewhen(mvDstMode === U(5, 3 bits)) {
       mvDExt := U(1, 3 bits)
     }
@@ -196,7 +241,7 @@ object PredecodeCoded {
               setLenK(bitBase + U(1, 4 bits))
             } elsewhen(isBtstOp && (mode === U(7, 3 bits)) && (reg === U(3, 3 bits))) {
               // only when known: ix(word) = the full/brief length then.
-              when(bitDstKnown) { lenC := bitBase; lenSel := bitDstSel; useMove := False }
+              when(bitDstKnown) { lenC := bitBase; lenSel := bitDstSel; useMove := False; setAmb(bitDstSel) }
             }
             if (m68k040.top.ShippingCoreConfig.upc10) {
               bitLenChain.elsewhen(isBtstOp && isDynBit && (mode === U(7, 3 bits)) && (reg === U(4, 3 bits))) {
@@ -237,13 +282,18 @@ object PredecodeCoded {
           val (ok, e) = eaExt(mode, reg, sizeL = False, allowImm = false, W2)
           when(ok && movesOk) { setLen(2, e); setAmb(e.sel) }
         }
+        if (drop("imm")) when(isImmOp && sizeOk && !isToCcrSr && mode =/= U(0, 3 bits)) { cutAmb() }
+        if (drop("bitop")) when((isDynBit || isStatBit) && mode =/= U(0, 3 bits)) { cutAmb() }
+        if (drop("line0x")) when(isMovep || isCmp2Chk2 || isCasFamily || isMovesFamily) { cutAmb() }
       }
 
       is(U(1, 4 bits), U(2, 4 bits), U(3, 4 bits)) {
+        if (drop("move")) cutAmb() else
         when(mvOk) {
           useMove := True
           ambC := mvSAmb || mvDAmb; ambSel := WN
         }
+        if (drop("moveDstIdx")) when(mvDstMode === U(6, 3 bits)) { cutAmb() }
       }
 
       is(U(4, 4 bits)) {
@@ -382,6 +432,8 @@ object PredecodeCoded {
           val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = true, W1)
           when(ok) { setLen(1, e); setAmb(e.sel) }
         }
+        if (drop("mull")) when(isDivL || isMulL) { cutAmb() }
+        if (drop("movem")) when(isMovem) { cutAmb() }
       }
 
       is(U(5, 4 bits)) {
@@ -515,10 +567,11 @@ object PredecodeCoded {
           val (mok, me) = memDestExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, W1)
           when(mok) { setLen(1, me); setAmb(me.sel) }
         }
+        if (drop("bitfield")) when(isBitfieldReg || isBitfieldMem) { cutAmb() }
       }
 
       is(U(0xA, 4 bits)) { setLenN(1) }
-      is(U(0xF, 4 bits)) {
+      is(U(0xF, 4 bits)) { if (drop("fpu")) cutAmb() else {
         val fpIsGen   = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b000")
         val fpSaveRest = (op(11 downto 9) === B"3'b001") &&
                          ((op(8 downto 6) === B"3'b100") || (op(8 downto 6) === B"3'b101"))
@@ -584,7 +637,8 @@ object PredecodeCoded {
         } .otherwise {
           setLenN(1)
         }
-      }
+        if (drop("fpuEa")) when(fpIsGen && !(fpIsRegForm || fpIsMovecr)) { cutAmb() }
+      } }
 
       default { }
     }
@@ -592,7 +646,7 @@ object PredecodeCoded {
     // ---- the ONE length add / ambiguity reduction ----
     val ixPick = Vec((0 until 3).map(j => ixV(j) & U(3 bits, default -> lenSel(j)))).reduce(_ | _)
     r.lenWords      := Mux(useMove, mvTotal.resize(4), lenC + ixPick.resize(4))
-    r.ambiguousLine := ambC || (ambSel & ~knV.asBits).orR
+    r.ambiguousLine := ambC || (ambSel & abV.asBits).orR
     r
   }
 }

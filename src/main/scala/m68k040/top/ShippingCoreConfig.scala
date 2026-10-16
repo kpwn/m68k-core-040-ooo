@@ -591,6 +591,24 @@ object ShippingCoreConfig {
     * `rspPredReg`. The pushed IBuf record is identical by construction (same function of
     * the same word). Echoed in `SHIPPING_CONFIG`. */
   val predecodePushOpFields: Boolean = envFlag("CPU_PREDECODE_PUSH_OPFIELDS", false)
+  /** Lazy refill predecode with FOUR shared classifiers (`CPU_PREDECODE_LAZY4`, default
+    * OFF; implies CPU_PREDECODE_PUSH_OPFIELDS). The refill installs data + tag/valid as
+    * before; {lenWords, ambiguousLine} live in their own per-way array (one 4-word group per
+    * entry) and are written after install by a background job, one group per cycle,
+    * starting at the requested group. Fetch reads of a group the job has not written yet
+    * are delivered `ambiguousLine` (the aligner's live-classify slow path). Echoed in
+    * `SHIPPING_CONFIG`. */
+  val predecodeLazy4: Boolean = envFlag("CPU_PREDECODE_LAZY4", false)
+  /** Refill-predecode coverage cuts (`CPU_PREDECODE_CUTS`, '+'-joined names from
+    * `PredecodeCoded.cutNames`, default empty = none; needs CPU_PREDECODE_CODED). Each cut
+    * turns a rare instruction shape AMBIGUOUS at refill, so the aligner's live classifier
+    * frames it instead. Echoed in `SHIPPING_CONFIG`. */
+  val predecodeCuts: Set[String] = {
+    val c = sys.env.getOrElse("CPU_PREDECODE_CUTS", "").split('+').map(_.trim).filter(_.nonEmpty).toSet
+    require(c.forall(m68k040.frontend.PredecodeCoded.cutNames.contains), s"unknown CPU_PREDECODE_CUTS entry in $c")
+    require(c.isEmpty || predecodeCoded, "CPU_PREDECODE_CUTS needs CPU_PREDECODE_CODED=1")
+    c
+  }
   /** Physical NZVC (condition-code) register pool size. Rename stalls on an empty NZVC
     * freelist (16 phys - 1 arch = 15 in flight) while the 32-entry ROB is half empty,
     * because nearly every ALU op writes NZVC. 16 is the shipping default; 32 is the
