@@ -352,6 +352,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    val nbDynamicRelease: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbDynamicRelease,
                    /** Experimental clean-victim miss metadata from the queued VIPT probe. */
                    val nbProbeMissStage: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbProbeMissStage,
+                   /** The three halves of `ShippingCoreConfig.dcacheStoreSameLine`
+                     * (CPU_DCACHE_STORE_B2B), separable for directed tests. */
+                   storeB2bFlag: Boolean = m68k040.top.ShippingCoreConfig.dcacheStoreSameLine,
+                   storeD1FwdFlag: Boolean = m68k040.top.ShippingCoreConfig.dcacheStoreSameLine,
+                   storeLdLineFlag: Boolean = m68k040.top.ShippingCoreConfig.dcacheStoreSameLine,
                    /** Legacy-cache allocate-without-fill for a complete 16-byte COPYBACK store.
                      * Non-blocking mode implements this natively from its merge strobe. */
                    val fullLineNoFill: Boolean = m68k040.top.ShippingCoreConfig.dcacheFullLineNoFill,
@@ -396,6 +401,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
   require(!nbProbeMissStage || (nonBlocking && !sectored),
     "DcachePlugin: nbProbeMissStage requires unsectored nonBlocking")
   require(!nonBlocking || !sectored, "DcachePlugin: nonBlocking is designed for 16-byte lines; sectoring must be OFF")
+  // The three store-pipe levers are non-blocking-only; a DUT that pins the blocking L1D
+  // gets them OFF whatever the environment says (they act on `nbStoreHold`'s terms).
+  val storeB2b: Boolean    = storeB2bFlag && nonBlocking
+  val storeD1Fwd: Boolean  = storeD1FwdFlag && nonBlocking
+  val storeLdLine: Boolean = storeLdLineFlag && nonBlocking
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
   require(!nonBlocking || (nMshr >= 2 && nMshr <= 4), "DcachePlugin: nMshr must be 2..4 (hot-door ID is 2 bits)")
@@ -1299,6 +1309,15 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // refill finish, then re-launches it in order. One slot is sufficient because
     // the load FSM leaves IDLE immediately after the miss decision, so there can be
     // at most one such shadow request before ready drops structurally.
+    /** `storeLdLine`: which source launched THIS cycle's S1 load read (one-hot or none),
+      * so the registered `ldS1LineEqStS1R` can compare that source's line with the store
+      * pipe's next S1 line. Defaults False; set beside each `ldS1Valid := True`. */
+    val ldS1SrcCmd: Bool    = if (!storeLdLine) null else Bool()
+    val ldS1SrcMiss: Bool   = if (!storeLdLine) null else Bool()
+    val ldS1SrcShadow: Bool = if (!storeLdLine) null else Bool()
+    if (storeLdLine) { ldS1SrcCmd := False; ldS1SrcMiss := False; ldS1SrcShadow := False }
+    val ldS1LineEqStS1R: Bool = if (!storeLdLine) null else RegInit(False)
+    if (storeLdLine) ldS1LineEqStS1R.simPublic()
     val loadShadowValid = RegInit(False)
     val loadShadowCmd   = Reg(DLoadCmd())
     loadShadowValid.simPublic()
@@ -2455,7 +2474,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // BRAM read-during-write behaviour is not part of the architectural contract.
     val stS2UsesS3Line = stS3ArrayWrite && stS2HitAny &&
       (stS2Set === stS3Set) && (stS2Tag === stS3Tag) && (stS2HitWay === stS3Way)
-    val stS2CapturedLine = Mux(stS2UsesS3Line, stS3MergedLine, stS2RawHitLine)
+    /** `storeD1Fwd`: this S2 store launched its read on the cycle an older store to the
+      * SAME line wrote it in S3 (`stS1SameLineAsS3` at its S1 advance). That write is now
+      * in `stS3WriteLineD1`; take it instead of the stale read. A same-line store in S3
+      * NOW is newer still (it captured the D1 line itself), so it keeps priority. One flop;
+      * no tag-compare term: same line and a hit imply the same way, and a miss never
+      * consumes the captured line. */
+    val stS2UsesD1Line: Bool = if (!storeD1Fwd) null else RegInit(False)
+    if (storeD1Fwd) stS2UsesD1Line.simPublic()
+    val stS2CapturedLine =
+      if (!storeD1Fwd) Mux(stS2UsesS3Line, stS3MergedLine, stS2RawHitLine)
+      else Mux(stS2UsesS3Line, stS3MergedLine, Mux(stS2UsesD1Line, stS3WriteLineD1, stS2RawHitLine))
     stS2UsesS3Line.simPublic()
     // Historical test/debug alias: the physical write moved to registered S3.
     val stS2ArrayWrite = stS3ArrayWrite
@@ -2801,6 +2830,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         ldS1LineOnly := missLineOnly
         ldS1Cmode    := missCmode
         ldS1Paddr    := missPaddr
+        if (storeLdLine) ldS1SrcMiss := True
         // THE RESPONSE IDENTITY, which this site used to inherit by accident. Every
         // other S1 launch stamps it; this one did not, and was correct only because
         // nothing else wrote `ldS1Token`/`ldS1Rid` between the miss and the replay --
@@ -2869,6 +2899,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1LineOnly := loadCmdPort.payload.lineOnly
           ldS1Cmode    := loadCmdPort.payload.cacheMode
           ldS1Paddr    := loadCmdPort.payload.paddr
+          if (storeLdLine) ldS1SrcCmd := True
           // DISCARD any queued probe entry this command owns, exactly as IDLE's ordinary
           // read arm does. Required, not tidiness: the registered credit's next-state
           // replica (`earlyProbeValidsNext`'s `consumeClr`) is written as
@@ -3131,6 +3162,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1LineOnly := loadShadowCmd.lineOnly
           ldS1Cmode    := loadShadowCmd.cacheMode
           ldS1Paddr    := loadShadowCmd.paddr
+          if (storeLdLine) ldS1SrcShadow := True
           loadShadowValid := False
           loadShadowLaunchEv := True
         } elsewhen(if (!nonBlocking) loadCmdPort.fire && ldS1Valid && !ldS1Hit
@@ -3179,6 +3211,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // fault generated by the cache itself is a physical AXI refill error,
           // delivered through busFaultResp below.
           ldS1Paddr    := cmdPaddr
+          if (storeLdLine) ldS1SrcCmd := True
         }
         // S1 resolution of a launched load read. A HIT drives the response
         // one cycle later out of S2. A MISS starts the refill.
@@ -4837,6 +4870,30 @@ class DcachePlugin(val socketMerged: Boolean = false,
     stS1SameLineAsS3.simPublic()   // test-visibility only (pea-cache-evict-2026-08-19
                                     // regression); no-op for synthesis
 
+    /** `storeB2b` (CPU_DCACHE_STORE_B2B): the store in S1 and the store in S2 are COPYBACK,
+      * non-precise and target the SAME line. Then the S1 store may launch its read now:
+      *   - S2's store hits -> it writes in S3 next cycle, and this store's S2 capture takes
+      *     that merged line through `stS2UsesS3Line` (the read it launches now is stale
+      *     and discarded whole);
+      *   - S2's store misses -> the live `storeMissAny` already holds S1, as without the
+      *     flag.
+      * The same S2 store also covers `stS1SameLineAsS3`: an older same-line store writing
+      * in S3 this cycle is already folded into the S2 store's own capture (which forwarded
+      * it the same way), so the S2 store's S3 line is the newest one. A store hit writes
+      * only `dataMem` and the dirty bit, never the tag or valid, so the stale read's
+      * hit/way are exact.
+      *
+      * `stB2bR` is one flop: the next-cycle S1-vs-S2 qualifier, computed from S0 and S1.
+      * Exact wherever it is read: `stS2Valid` is set only by `stS1Advance` (loading S2 from
+      * S1), and S1 is valid in the same cycle only if `s0Advance` refilled it from S0 on
+      * that same edge. */
+    val stB2bR: Bool = if (!storeB2b) null else RegInit(False)
+    val stB2bOk: Bool = if (!storeB2b) null else (stB2bR && stS1Valid && stS2Valid)
+    if (storeB2b) { stB2bR.simPublic(); stB2bOk.simPublic() }
+    val stS1SameLineAsS3Eff: Bool =
+      if (storeD1Fwd) False
+      else if (!storeB2b) stS1SameLineAsS3 else (stS1SameLineAsS3 && !stB2bOk)
+
     /** The NON-PROBE half of "the load side might drive `rdSet`/`rdEn` this cycle".
       * Read together with `storeClaimReg` (the probe half) in `stS1Advance` below.
       *
@@ -4973,9 +5030,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
       storeMissDiscovered || loadMissDiscovered
     val stS1AdvanceNd: Bool = if (!tagCeRetime) null else {
       if (!nonBlocking) stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
-        !storePipeHeldNd && !stS1SameLineAsS3
+        !storePipeHeldNd && !stS1SameLineAsS3Eff
       else stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
-        !storePipeHeldNd && !stS1SameLineAsS3 && !nbStoreHold
+        !storePipeHeldNd && !stS1SameLineAsS3Eff && !nbStoreHold
     }
     val s0AdvanceNd: Bool = if (!tagCeRetime) null else {
       if (!nonBlocking) s0Valid && (!stS1Valid || stS1AdvanceNd) && !storePipeHeldNd && !s0ConflictR
@@ -4984,9 +5041,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val stS1Advance =
       if (tagCeRetime) stS1AdvanceNd && !storeMissAny
       else if (!nonBlocking) stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
-        !storePipeHeld && !stS1SameLineAsS3
+        !storePipeHeld && !stS1SameLineAsS3Eff
       else stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
-        !storePipeHeld && !stS1SameLineAsS3 && !nbStoreHold
+        !storePipeHeld && !stS1SameLineAsS3Eff && !nbStoreHold
     // test-visibility only (DcacheStorePortReservationSpec's gap sweep and drain-rate
     // measurement); simPublic is a no-op for synthesis.
     loadPortReserved.simPublic(); stS1Advance.simPublic()
@@ -4999,6 +5056,54 @@ class DcachePlugin(val socketMerged: Boolean = false,
     stS1LineEqS2Prev := Mux(s0Advance,
       s0Payload.paddr(31 downto offBits) === stS2Payload.paddr(31 downto offBits),
       stS1Payload.paddr(31 downto offBits) === stS2Payload.paddr(31 downto offBits))
+    if (storeLdLine) {
+      // Next-cycle S1-load line vs next-cycle S1-store line, per source, with the store
+      // side's `s0Advance` select LAST (the `stS1LineEqS2Prev` shape).
+      def ln(pa: UInt): UInt = pa(31 downto offBits)
+      def eqNext(pa: UInt): Bool =
+        Mux(s0Advance, ln(pa) === ln(s0Payload.paddr), ln(pa) === ln(stS1Payload.paddr))
+      ldS1LineEqStS1R := (ldS1SrcCmd && eqNext(cmdPaddr)) || (ldS1SrcMiss && eqNext(missPaddr)) ||
+        (ldS1SrcShadow && eqNext(loadShadowCmd.paddr))
+      GenerationFlags.simulation {
+        when(ldS1Valid && stS1Valid) {
+          assert(ldS1LineEqStS1R === (ln(ldS1Paddr) === ln(stS1Payload.paddr)),
+            "DcachePlugin(storeLdLine): registered ldS1LineEqStS1R drifted from the live S1 load-vs-store line compare",
+            FAILURE)
+        }
+      }
+    }
+    if (storeD1Fwd) {
+      stS2UsesD1Line := stS1Advance && stS1SameLineAsS3
+      GenerationFlags.simulation {
+        when(stS2Valid && stS2UsesD1Line && stS2HitAny) {
+          assert(stS2UsesS3Line || (stS3WriteD1 && (stS3WriteSetD1 === stS2Set) &&
+                                    (stS3WriteTagD1 === stS2Tag) && (stS3WriteWayD1 === stS2HitWay)),
+            "DcachePlugin(storeD1Fwd): the D1 line forward selected a line other than this store's own",
+            FAILURE)
+        }
+      }
+    }
+    if (storeB2b) {
+      def b2bEligible(p: DStoreCmd): Bool = (p.cacheMode === CacheMode.COPYBACK) && !p.precise
+      stB2bR := (s0Payload.paddr(31 downto offBits) === stS1Payload.paddr(31 downto offBits)) &&
+        b2bEligible(s0Payload) && b2bEligible(stS1Payload)
+      GenerationFlags.simulation {
+        when(stS1Valid && stS2Valid) {
+          assert(stB2bR === ((stS1Payload.paddr(31 downto offBits) === stS2Payload.paddr(31 downto offBits)) &&
+                             b2bEligible(stS1Payload) && b2bEligible(stS2Payload)),
+            "DcachePlugin(storeB2b): registered stB2bR drifted from the live S1-vs-S2 same-line compare",
+            FAILURE)
+        }
+        // The whole safety argument: a store that advanced on the b2b qualifier and hits
+        // must capture the older store's S3 merged line, never its own stale read.
+        val b2bAdvD1 = RegNext(stB2bOk && stS1Advance) init False
+        when(b2bAdvD1 && stS2HitAny) {
+          assert(stS2UsesS3Line,
+            "DcachePlugin(storeB2b): a back-to-back same-line store hit without the S3 line forward",
+            FAILURE)
+        }
+      }
+    }
     GenerationFlags.simulation {
       when(stS3Valid) {
         assert(stS1LineEqS2Prev === ((stS1Set === stS3Set) && (stS1Tag === stS3Tag)),
@@ -5014,8 +5119,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * `stS1Advance` by construction. Replaces the old
       * `freshLoadUsesPort && stS1Valid` setter (that signal is now gone); see `loadPortReserved`. */
     val storeDeniedPort =
-      if (!nonBlocking) stS1Valid && !stS1Advance && !storePipeHeld && !stS1SameLineAsS3
-      else stS1Valid && !stS1Advance && !storePipeHeld && !stS1SameLineAsS3 && !nbStoreHold
+      if (!nonBlocking) stS1Valid && !stS1Advance && !storePipeHeld && !stS1SameLineAsS3Eff
+      else stS1Valid && !stS1Advance && !storePipeHeld && !stS1SameLineAsS3Eff && !nbStoreHold
     storeDeniedPort.simPublic()
 
     GenerationFlags.simulation {
@@ -6874,9 +6979,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val inflightAllocs = pendingStoreMiss.asUInt.resize(3) + stgValid.asUInt.resize(3) + s2CbRes
       val resShort = (freeCnt.resize(3) < (U(1, 3 bits) + inflightAllocs)) ||
                      (wbFree < (U(1, 3 bits) + inflightAllocs))
+      def s2SameSetHold: Bool =
+        if (!storeB2b) stS2Valid && stS2Set === stS1Set
+        else stS2Valid && stS2Set === stS1Set && !stB2bOk
+      def ldS1SameSetHold: Bool =
+        if (!storeLdLine) ldS1Valid && ldS1Set === stS1Set
+        else ldS1Valid && ldS1Set === stS1Set &&
+          !(ldS1LineEqStS1R && (ldS1Cmode =/= CacheMode.INHIBITED))
       nbStoreHold := anyInv ||
-        (stgValid && stgSet === stS1Set) || (ldS1Valid && ldS1Set === stS1Set) ||
-        (stS2Valid && stS2Set === stS1Set) || (pendingStoreMiss && sSet === stS1Set) ||
+        (stgValid && stgSet === stS1Set) || ldS1SameSetHold ||
+        s2SameSetHold || (pendingStoreMiss && sSet === stS1Set) ||
         (cbS1 && setConfS1) || (cbS1 && !camS1 && resShort)
 
       nbIdle := !validVec.asBits.orR && (wbCount === 0) && !wbIssued && !anyW && !rV &&
