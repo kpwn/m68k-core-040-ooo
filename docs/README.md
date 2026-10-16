@@ -7,6 +7,7 @@ Start with the [core README](../README.md) for build commands and board status.
 - [Debug trace taps](debug-trace-taps.md)
 - [IPC experiment ledger](ipc-experiments.md)
 - [IPC at 200 MHz: fifteen design alternatives](ipc-design-options.md)
+- [Five fanout levers: matched 200 MHz measurement](FANOUT_FIVE_LEVERS_200MHZ_2026-10-16.md)
 - [Memory-dependency design and integration status](memory-dependencies.md)
 - [Synthesis tooling](../synth/README.md)
 - [Third-party notices](../THIRD_PARTY_NOTICES.md)
