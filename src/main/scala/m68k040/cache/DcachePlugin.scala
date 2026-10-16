@@ -2388,7 +2388,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val stS3WriteLineD1 = Reg(Bits(128 bits))
     val stS3WriteCopybackD1 = Reg(Bool())
     stS3WriteD1.simPublic()
-    when(stS3ArrayWrite) {
+    // `CPU_DC_FREE_CAPTURE`: the D1 payload loads EVERY cycle (no clock enable); every
+    // reader qualifies it with `stS3WriteD1`, the registered valid. Exact.
+    when(if (m68k040.top.ShippingCoreConfig.dcFreeCapture) True else stS3ArrayWrite) {
       stS3WriteSetD1      := stS3Set
       stS3WriteWayD1      := stS3Way
       stS3WriteTagD1      := stS3Tag
@@ -4657,7 +4659,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
       if (!tagCeRetime) OneHotSafe.evidence(fire, addr, dbgMultiHotClear)
       else OneHotSafe.evidence(RegNext(fire) init False, RegNext(addr), dbgMultiHotClear)
     val dbgMultiHotLoad = mhEvidence(ldS1Valid && ldS1MultiHot, ldS1Paddr)
-    val dbgMultiHotProbe = OneHotSafe.evidence(
+    // `CPU_DC_PROBE_MH_LAG`: the probe site lags one cycle too (registered fire + address).
+    val dbgMultiHotProbe = if (m68k040.top.ShippingCoreConfig.dcProbeMhLag)
+      OneHotSafe.evidence(RegNext(probeReadValid && probeMultiHot) init False,
+        RegNext((probeReadTag ## probeReadSet ## U(0, offBits bits)).asUInt), dbgMultiHotClear)
+    else OneHotSafe.evidence(
       probeReadValid && probeMultiHot,
       (probeReadTag ## probeReadSet ## U(0, offBits bits)).asUInt, dbgMultiHotClear)
     val dbgMultiHotStore = mhEvidence(stS2Valid && stS2MultiHot, stS2Payload.paddr)
@@ -5456,6 +5462,33 @@ class DcachePlugin(val socketMerged: Boolean = false,
           "the free-running pendingVictim capture would not load it", FAILURE)
       }
     }
+    // `CPU_DC_FREE_CAPTURE` (fable `fanout`): the rest of the store-miss payload --
+    // `pendingStorePaddr/MergeData/MergeStrb/VictimWay/VictimDirty` (~180 flops) -- loads
+    // EVERY cycle while no store miss is pending, exactly like `pendingVictimTag/Line`
+    // under CPU_BE_RETIME, so the S2 tag-compare miss decision drives one flop's D
+    // (`pendingStoreMiss`) instead of ~180 clock enables. Exact: every reader is
+    // qualified by `pendingStoreMiss`, which the miss arm sets on the very edge this
+    // capture last loads, and a miss is never discovered while one is pending (asserted).
+    val dcFreeCap = m68k040.top.ShippingCoreConfig.dcFreeCapture
+    if (dcFreeCap) {
+      val pVwC = if (!sectored) victim(stS2Set)
+                 else Mux(stS2SectorMiss, stS2SectorWay, victim(lineOf(stS2Set)))
+      val fromS3C   = stS3ArrayWrite && (stS3Set === stS2Set) && (stS3Way === pVwC)
+      val fromS3D1C = stS3WriteD1 && (stS3WriteSetD1 === stS2Set) && (stS3WriteWayD1 === pVwC)
+      when(!pendingStoreMiss) {
+        pendingStorePaddr  := stS2Payload.paddr
+        pendingMergeData   := stS2MergeData
+        pendingMergeStrb   := stS2MergeStrb
+        pendingVictimWay   := pVwC
+        pendingVictimDirty := (if (sectored) rdLineDirty(pVwC) else rdDirty(pVwC)) ||
+          (fromS3C && stS3Copyback) || (fromS3D1C && stS3WriteCopybackD1)
+        if (sectored) when(stS2SectorMiss) { pendingVictimDirty := False }
+      }
+      GenerationFlags.simulation {
+        assert(!(storeMissDiscovered && pendingStoreMiss),
+          "DcachePlugin(dcFreeCapture): a store miss was discovered while another is pending", FAILURE)
+      }
+    }
     // S2 either discovers the variable-latency COPYBACK miss or captures a fixed
     // resident/serial result into S3.  `storeMissDiscovered` already freezes the
     // younger S1 and S0 in this same cycle; they relaunch their lookup after refill,
@@ -5498,9 +5531,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
         stAwDone := True
         stWDone  := True
         pendingStoreMiss  := True
-        pendingStorePaddr := stS2Payload.paddr
-        pendingMergeData  := stS2MergeData
-        pendingMergeStrb  := stS2MergeStrb
+        if (!dcFreeCap) {
+          pendingStorePaddr := stS2Payload.paddr
+          pendingMergeData  := stS2MergeData
+          pendingMergeStrb  := stS2MergeStrb
+        }
         // Task P4.3 Finding 1 fix: lock the victim way/dirty/tag/line HERE, not at
         // the eventual IDLE pickup cycle -- see the `pendingVictim*` decl comment.
         // Slice `D3-BURST`: a tag-matching store miss is a SECTOR miss into that way
@@ -5517,6 +5552,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         val pVictimFromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === stS2Set) &&
           (stS3WriteWayD1 === pVw)
         storeVictimFromS3Dbg := pVictimFromS3 || pVictimFromS3D1
+        if (!dcFreeCap) {
         pendingVictimWay   := pVw
         // Slice `D3-BURST`: see the load-side twin -- the victim LINE's conservative
         // dirty OR, and a SECTOR miss displaces nothing so it never evicts.
@@ -5527,6 +5563,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // later-assignment-wins clear rather than an `&& !stS2SectorMiss` term, so the
         // unsectored netlist keeps today's expression with no extra AND gate.
         if (sectored) when(stS2SectorMiss) { pendingVictimDirty := False }
+        }
         if (!beRetime) {
           pendingVictimTag   := Mux(pVictimFromS3, stS3Tag,
             Mux(pVictimFromS3D1, stS3WriteTagD1, rdTag(pVw)))

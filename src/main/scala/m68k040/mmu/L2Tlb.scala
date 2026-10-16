@@ -279,11 +279,20 @@ class L2Tlb(entries: Int, clients: Int = 2, survive: Boolean = false,
     val overflow = insNew && full
     when(snoopHit || overflow || twoIns || invalR) { flushNow := True }
     val freeOh = OHMasking.first(Vec(free))
+    // `CPU_DC_FREE_CAPTURE` (fable `fanout`): a granule register is read only while its
+    // `fValid` is set, so a FREE entry loads `insGSel` every cycle and only entry 0 keeps
+    // a clock enable that sees the flush (it is the one rewritten while valid). The
+    // filter-CAM insert decision then drives the `fValid` D pins only. Exact.
+    val freeCap = m68k040.top.ShippingCoreConfig.dcFreeCapture
+    if (freeCap) {
+      for (i <- 1 until granules) when(!fValid(i)) { fGran(i) := insGSel }
+      when(!fValid(0) || anyFlush) { fGran(0) := insGSel }
+    }
     when(anyFlush) {
       fValid.foreach(_ := False)
-      when(insAny) { fValid(0) := True; fGran(0) := insGSel }
+      when(insAny) { fValid(0) := True; if (!freeCap) fGran(0) := insGSel }
     } elsewhen(insNew && !full) {
-      for (i <- 0 until granules) when(freeOh(i)) { fValid(i) := True; fGran(i) := insGSel }
+      for (i <- 0 until granules) when(freeOh(i)) { fValid(i) := True; if (!freeCap) fGran(i) := insGSel }
     }
     GenerationFlags.simulation {
       val snoopFlushes = Reg(UInt(32 bits)) init 0

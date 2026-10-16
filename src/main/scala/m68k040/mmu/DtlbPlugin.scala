@@ -1270,7 +1270,12 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainAckWait = RegInit(False)
     val drainByteOff = umq.io.drain.payload.addr(3 downto 0)
     val drainAddrReg = Reg(UInt(32 bits))
-    val drainBeatReg = Reg(Bits(128 bits))
+    // `CPU_TLB_DRAIN_NARROW`: the beat is the merged descriptor byte in EVERY lane (only the
+    // strobed lane is written -- `useStrb`), so one 8-bit register replaces 128 flops and
+    // the per-lane placement decode. See `ShippingCoreConfig.tlbDrainNarrow`.
+    val drainNarrow = m68k040.top.ShippingCoreConfig.tlbDrainNarrow
+    val drainBeatReg = if (drainNarrow) null else Reg(Bits(128 bits))
+    val drainByteReg = if (drainNarrow) Reg(Bits(8 bits)) else null
     val drainStrbReg = Reg(Bits(16 bits))
 
     // ── MERGE, DO NOT OVERWRITE (2026-09-10) ────────────────────────────────────
@@ -1414,7 +1419,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
           mStrb(i) := True
         }
       }
-      drainBeatReg := mBeat
+      if (drainNarrow) drainByteReg := merged else drainBeatReg := mBeat
       drainStrbReg := mStrb
       drainArmed   := True
     }
@@ -1471,7 +1476,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore.payload.size       := m68k040.isa.Size.LONG   // ditto
     _walkStore.payload.useStrb    := True
     _walkStore.payload.strb       := drainStrbReg
-    _walkStore.payload.lineData   := drainBeatReg
+    _walkStore.payload.lineData   := (if (drainNarrow) Cat(Seq.fill(16)(drainByteReg)) else drainBeatReg)
     // Overwritten by the arbiter with the SAME fixed policy expression the walker's
     // reads use (`CACR.DE ? WRITETHROUGH : INHIBITED`). A per-half cache mode is
     // forbidden: the read and the write halves of one table search must agree, or the
