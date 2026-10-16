@@ -727,6 +727,12 @@ object ShippingCoreConfig {
     * is a 1-cycle ALU op off the push's early A7. Costs one ROB/IQ entry per RTS.
     * Read by `MicroOpAssembler`. Default OFF. */
   val rtsSplitA7: Boolean = envFlag("CPU_RTS_SPLIT_A7", false)
+  /** CPU_RTD_PRECISE_A7: RTD's A7 dealloc is computed into T1 by the (dropped) ADD and
+    * committed by the ibranch itself (A7 := T1), so an RTD whose popped return address is
+    * odd leaves A7 unchanged (68040 restart semantics). Without it the separate A7 ADD
+    * retires before the ibranch raises the address error and A7 has already moved.
+    * Read by `MicroOpAssembler`. Default OFF. */
+  val rtdPreciseA7: Boolean = envFlag("CPU_RTD_PRECISE_A7", false)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")

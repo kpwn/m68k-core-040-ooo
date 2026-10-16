@@ -24,6 +24,30 @@ class RtsSplitA7Spec extends AnyFunSuite {
   private val A7 = 15
   private val T0 = MicroOpAssembler.T0
 
+  test("RTD #8 crack shape follows CPU_RTD_PRECISE_A7", VerilatorTest) {
+    val precise = m68k040.top.ShippingCoreConfig.rtdPreciseA7
+    val T1 = MicroOpAssembler.T1
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      dut.pkt.valid #= true; dut.pkt.pc #= 0x1000; dut.pkt.simple #= true; dut.pkt.complex #= false
+      dut.pkt.lenWords #= 2; dut.pkt.wordCount #= 2; dut.pkt.fault #= false
+      dut.pkt.words.foreach(_ #= 0); dut.pkt.words(0) #= 0x4E74; dut.pkt.words(1) #= 8
+      sleep(1)
+      assert(dut.count.toInt == 3)
+      val add = dut.uops(1); val br = dut.uops(2)
+      assert(add.op.toEnum == DecOp.ADD && add.srcAReg.toInt == A7 && add.imm.toLong == 12L)
+      assert(add.divIsRem.toBoolean && br.ibranch.toBoolean && br.isReturn.toBoolean)
+      assert(br.srcAReg.toInt == T0 && br.anInc.toInt == 0)
+      if (precise) {
+        assert(add.dstReg.toInt == T1, "the dealloc goes to T1, not A7")
+        assert(br.srcBReg.toInt == T1 && br.srcBValid.toBoolean)
+        assert(br.dstReg.toInt == A7 && br.dstValid.toBoolean, "the ibranch commits A7")
+      } else {
+        assert(add.dstReg.toInt == A7)
+        assert(!br.dstValid.toBoolean)
+      }
+    }
+  }
+
   test("RTS crack shape follows CPU_RTS_SPLIT_A7", VerilatorTest) {
     val split = m68k040.top.ShippingCoreConfig.rtsSplitA7
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
@@ -46,7 +70,8 @@ class RtsSplitA7Spec extends AnyFunSuite {
         assert(!add.isBranch.toBoolean && !add.firstOfInstr.toBoolean && !add.lastOfInstr.toBoolean)
         assert(br.isBranch.toBoolean && br.ibranch.toBoolean && br.isReturn.toBoolean)
         assert(br.srcAReg.toInt == T0 && br.srcAValid.toBoolean)
-        assert(!br.dstValid.toBoolean && br.anInc.toInt == 0, "the ibranch no longer writes A7")
+        assert(!br.dstValid.toBoolean, "the ibranch no longer writes A7")
+        assert(br.anInc.toInt == 4, "anInc = 4 marks the split RTS for the odd-target A7 restore")
         assert(br.lastOfInstr.toBoolean)
       } else {
         assert(dut.count.toInt == 2, "folded RTS must be 2 uops")

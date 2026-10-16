@@ -4037,6 +4037,27 @@ object MicroOpAssembler {
     // with the flag on, so the flag-off elaboration is unchanged.
     val rtsA7     = if (m68k040.top.ShippingCoreConfig.rtsSplitA7)
       addUop(U(A7, 5 bits), B(4, 32 bits), U(A7, 5 bits), first = False, drop = True) else null
+    // The split RTS's ibranch: RTD's (no int dst) with anInc = 4 kept as a MARKER. With no
+    // dst the branch EU writes nothing from it; RobPlugin records `isReturn && ibranch &&
+    // !pdstValid && anInc == 4` as `retUndo4`, so an odd-target address error from this
+    // ibranch gives back the A7 += 4 its already-retired ADD made (ExceptionUnit).
+    val rtsSplitBranch = if (m68k040.top.ShippingCoreConfig.rtsSplitA7)
+      mkUop(isBranch = True, ibranch = True,
+            srcAReg = U(T0, 5 bits), srcAValid = True,
+            useImm  = True, imm = B(0, 32 bits), anInc = U(4, 3 bits), first = False,
+            isReturn = True) else null
+    // CPU_RTD_PRECISE_A7: [load.l (A7) -> T0] + [T1 := A7 + (4+disp16) (drop)] +
+    // [ibranch -> T0 ; A7 := T1]. The A7 commit rides the ibranch, so an odd return
+    // address faults with A7 untouched.
+    val rtdT1     = if (m68k040.top.ShippingCoreConfig.rtdPreciseA7)
+      addUop(U(A7, 5 bits), rtdDealloc, U(T1, 5 bits), first = False, drop = True) else null
+    val rtdBranchA7 = if (m68k040.top.ShippingCoreConfig.rtdPreciseA7)
+      mkUop(isBranch = True, ibranch = True,
+            srcAReg = U(T0, 5 bits), srcAValid = True,     // target = T0 + 0
+            useImm  = True, imm = B(0, 32 bits),
+            srcBReg = U(T1, 5 bits), srcBValid = True,     // A7 := T1 + anInc(0)
+            dstReg  = U(A7, 5 bits), dstValid = True,
+            isReturn = True, first = False) else null
 
     // LINK An,#disp16 — [stkPush store dst=An, push old An] + [A7 := A7+disp (drop)]
     //                   + [An := A7-disp (kept)].
@@ -4422,7 +4443,7 @@ object MicroOpAssembler {
         cnt   := 3
         out.uops(0) := rtsLoad
         out.uops(1) := rtsA7
-        out.uops(2) := rtdBranch
+        out.uops(2) := rtsSplitBranch
       } else {
         // RTS -> [load.l (A7) -> T0] + [ibranch -> T0 ; A7 += 4].
         cnt   := 2
@@ -4433,8 +4454,13 @@ object MicroOpAssembler {
       // RTD -> [load.l (A7) -> T0] + [A7 := A7 + (4+disp16) (drop)] + [ibranch -> T0].
       cnt   := 3
       out.uops(0) := rtdLoad
-      out.uops(1) := rtdA7
-      out.uops(2) := rtdBranch
+      if (m68k040.top.ShippingCoreConfig.rtdPreciseA7) {
+        out.uops(1) := rtdT1
+        out.uops(2) := rtdBranchA7
+      } else {
+        out.uops(1) := rtdA7
+        out.uops(2) := rtdBranch
+      }
     } elsewhen(isRtrOp) {
       // RTR -> [pop.w (A7) -> CCR] + [pop.l (A7+2) -> T0] + [ibranch -> T0 ; A7 += 6].
       cnt   := 3
