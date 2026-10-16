@@ -1090,4 +1090,10 @@ object ShippingCoreConfig {
     * per push source. A row is read only under its `busy` bit, which is set only together
     * with an insert of that row, so every observed value is identical. Default OFF; echoed. */
   val iqPositionLutram: Boolean = envFlag("CPU_IQ_POS_LUTRAM", false)
+  /** Fmax tail (i20 census, 2026-10-15): cycle-identical restructures of the routed
+    * tail families -- IQ log-depth first-one select + `valid` from the candidate OR,
+    * exception-store payload captured without a data reset, the merged AXI write
+    * response not re-qualified by the arbiter `busy` flop, and fanout caps on the
+    * D-cache array read set. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val tail20: Boolean = envFlag("CPU_TAIL20", true)
 }

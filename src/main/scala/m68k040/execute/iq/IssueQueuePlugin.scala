@@ -242,6 +242,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         // contested logic in the machine -- no wider than it was with seven separate bits.
         val dynWaitAny  = Reg(Bool()) init False
         dynWaitAny  := dynWaitNext.orR
+        // CPU_TAIL20: routed fo~85 at ~0.5 ns at the head of the select->triggers tail.
+        if (m68k040.top.ShippingCoreConfig.tail20) dynWaitAny.addAttribute("max_fanout", "24")
         // CPU_LS_SPEC_WAKE_ALU: the ALU-class twin of `dynWaitAny` -- the registered OR of
         // the SAME next vector with this cycle's announced load's LS source bits masked off
         // (`specMaskNext`, driven near the dynamic-wakeup clear). Equal to `dynWaitAny`
@@ -742,9 +744,22 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // (a slow SHIFT is never eu0-only, so masking only the fast arm is exact).
     val alu1Candidates = if (alu1Lean) ~B(slots.map(_.alu1Inel)) else allAluCandidates
     val cand1 = aluReady & Mux(aluFastAcceptNextPorts(1), alu1Candidates, aluSlowSlots)
-    val oh0 = OHMasking.first(cand0)
-    val oh1 = OHMasking.first(cand1 & ~oh0)
-    val ohB = OHMasking.first(brReady)
+    // CPU_TAIL20: `OHMasking.first` is `x & ~(x - 1)`, and in the routed i20 netlist
+    // Vivado maps that 16-bit decrement into a 12-deep LUT5 ripple that sits between
+    // `dynWaitAny` and every slot's `triggers` CE/D (the core's largest failing family).
+    // `firstOh` computes the identical one-hot (bit i = x(i) && no lower bit set) as a
+    // flat per-bit OR tree, so its depth is log, not linear. Bit-for-bit the same value.
+    val tail20 = m68k040.top.ShippingCoreConfig.tail20
+    def firstOh(x: Bits): Bits = if (!tail20) OHMasking.first(x) else {
+      val r = Bits(x.getWidth bits)
+      for (i <- 0 until x.getWidth)
+        r(i) := x(i) && (if (i == 0) True else !x(i - 1 downto 0).orR)
+      r
+    }
+    val oh0 = firstOh(cand0)
+    val cand1m: Bits = if (tail20) cand1 & ~oh0 else null
+    val oh1 = firstOh(if (tail20) cand1m else cand1 & ~oh0)
+    val ohB = firstOh(brReady)
     // ---- LS issue is IN PROGRAM ORDER (no MOB / no load-store disambiguation) ----
     // The L1D is write-no-allocate and stores are visible only at commit (SQ drain),
     // so a load disambiguates against older stores ONLY via the SQ-forward — which can
@@ -765,7 +780,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // OCCUPIED LS slots only (an empty slot's context is garbage and must NOT be
     // mistaken for the oldest LS — that would block real LS issue forever -> deadlock).
     val lsPresent = B(slots.map(s => s.sel && isLs(s.hot)))
-    val ohLoldest = OHMasking.first(lsPresent)         // oldest occupied LS slot (ready or not)
+    val ohLoldest = firstOh(lsPresent)         // oldest occupied LS slot (ready or not)
     // ---- LS port (3): REGISTERED slot ready via a one-entry skid (2026-09-14) ----
     // See the port-3 pipe in the registered-issue-stage block below for the full
     // design. `lsSkidValid` is the ONLY thing `selPorts(3).ready` reads, so the LS
@@ -944,7 +959,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       // is vacated by the P4 park and, beyond it, by the LS EU's liveness replay.
       val lsStoreVec = B(lsStorePresent)
       val eligible = (lsPresent & ~lsStoreVec & ~olderStorePresent.asBits & intraMacroOk) | ohLoldest
-      OHMasking.first(eligible & lsReady)
+      firstOh(eligible & lsReady)
     }
     val ohLbase = (if (loadBypassUnreadyLoad) ohLrelaxed
                else ohLoldest & lsReady) & B(slotCount bits, default -> !lsSkidValid)
@@ -1009,9 +1024,10 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // for the oldest divide.
     val divFamPresent = B(slots.map(s => s.sel &&
       s.hot.isDivFam))
-    val divFamOldest  = OHMasking.first(divFamPresent)
+    val divFamOldest  = firstOh(divFamPresent)
     val divFamBlocked = divFamPresent & ~divFamOldest  // every divide-family slot but the oldest
-    val ohC = OHMasking.first(cplxReady & ~divFamBlocked)
+    val candC: Bits = if (tail20) cplxReady & ~divFamBlocked else null
+    val ohC = firstOh(if (tail20) candC else cplxReady & ~divFamBlocked)
 
     // ---- FMax: REGISTERED issue->operand-read boundary ----
     // The combinational select (above) + MuxOH(contexts) feeding each EU's S0
@@ -1090,15 +1106,17 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val selKill: Bool = if (specAluOn) (RegInit(False)) else False
     if (specAluOn) selKill.simPublic()
     val selBlock = flushSignal || selKill
-    selPorts(0).valid   := oh0.orR && !selBlock
+    // CPU_TAIL20: the first-one of a vector is non-zero exactly when the vector is, so
+    // each port's `valid` reads the (shallow) candidate OR instead of the one-hot's OR.
+    selPorts(0).valid   := (if (tail20) cand0.orR  else oh0.orR) && !selBlock
     selPorts(0).payload := ohSelect(oh0)
-    selPorts(1).valid   := oh1.orR && !selBlock
+    selPorts(1).valid   := (if (tail20) cand1m.orR else oh1.orR) && !selBlock
     selPorts(1).payload := ohSelect(oh1)
-    selPorts(2).valid   := ohB.orR && !selBlock
+    selPorts(2).valid   := (if (tail20) brReady.orR else ohB.orR) && !selBlock
     selPorts(2).payload := ohSelect(ohB)
     selPorts(3).valid   := ohL.orR && !selBlock
     selPorts(3).payload := ohSelect(ohL)
-    selPorts(4).valid   := ohC.orR && !selBlock
+    selPorts(4).valid   := (if (tail20) candC.orR else ohC.orR) && !selBlock
     selPorts(4).payload := ohSelect(ohC)
 
     // Registered issue stage: drop the in-flight registered uop on a flush (it is
