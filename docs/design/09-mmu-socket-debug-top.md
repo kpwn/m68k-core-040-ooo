@@ -231,6 +231,11 @@ OR any URP/SRP write, OR an ITT0/ITT1 write. It:
 
 `umFlush` (pipeline flush) poisons only the U-write (`walkUmPoison`), drops the latch
 (`:833-835`), and causes a poisoned latch to expire after one cycle (`:827-828`).
+The D-side `walkFlushPoison` and `walkUmPoison` latches clear when the captured miss
+starts its walk, before any walker result can be consumed. The flush/squash set arms
+have priority on a coincident launch. Clearing at launch removes the combinational
+current-request TLB hit/permission cone from these latch inputs while preserving the
+per-walk poison lifetime.
 
 **U-bit write-back** (`:853-1068`):
 

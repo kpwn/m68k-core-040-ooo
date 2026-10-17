@@ -808,8 +808,6 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       } otherwise {
         missReqReg.valid := True
         missPending      := True
-        walkFlushPoison  := False
-        walkUmPoison     := False
       }
     }
 
@@ -857,6 +855,15 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                               else missReqReg.valid && !umQueueFull && !atcFlush)
     walker.io.start       := (if (vic.enabled) startBase && vic.go else startBase)
     when(walker.io.start) { missReqReg.valid := False }
+    // The poison bits belong to a launched walk. Clearing them at `_req.fire`
+    // made their D inputs depend on the current TLB hit/permission lookup and
+    // LSU request cone. Launch is a registered miss decision, one cycle later;
+    // no walker result or deferred U/M write can be consumed before that edge.
+    // Flush/owner-squash arms below retain priority if they coincide with start.
+    when(walker.io.start) {
+      walkFlushPoison := False
+      walkUmPoison    := False
+    }
 
     // VPN a walk is servicing: latched at walk-LAUNCH (the registered-trigger cycle)
     // so the fill/result target the right VPN even if a later command changes it.
