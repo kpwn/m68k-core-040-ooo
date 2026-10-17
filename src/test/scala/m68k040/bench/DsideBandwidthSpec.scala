@@ -429,8 +429,12 @@ class DsideBandwidthSpec extends CoreBenchHarness {
           val freeAfterStore = bits(pre.freeMask & ~pre.storeMask)
           assert(pre.freeOk == (freeAfterStore >= 1 + pre.s2Reserve),
             s"${k.name}: observed lFreeOk disagrees with store/copyback reservation")
-          assert((pre.lingerEligible & post.freeMask) == pre.lingerEligible,
-            s"${k.name}: eligible LINGER did not release on the sampled edge")
+          // The eligibility predicate models the dynamic-release option. With the
+          // shipping default OFF, LINGER uses its fixed countdown and may remain
+          // occupied even after the stale-read stages and waiters have drained.
+          if (m68k040.top.ShippingCoreConfig.dcacheNbDynamicRelease)
+            assert((pre.lingerEligible & post.freeMask) == pre.lingerEligible,
+              s"${k.name}: eligible LINGER did not release on the sampled edge")
           assert((pre.filledWinner & ~pre.filledCandidate) == 0,
             s"${k.name}: install winner is not a FILLED install candidate")
         }
