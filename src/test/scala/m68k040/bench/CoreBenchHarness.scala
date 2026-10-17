@@ -482,6 +482,7 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin(lean = m68k040.top.ShippingCoreConfig.alu1Lean)
     val branchEu = new BranchEuPlugin
+    // Preserve the historical all-off bench baseline as shipping defaults advance.
     val lsEu   = if (shippingProfile) m68k040.top.ShippingPlugins.lsEu(
       shippingIpc, shippingLate, shippingSpecWake, shippingLsOoo)
     else new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
@@ -493,7 +494,8 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       earlyStoreDataWake = earlyStoreDataWake,
       specLoadWakeup = specLoadWakeup,
       p3FastLoad = p3FastLoad,
-      lsOooIssue = loadBypassUnreadyLoad)
+      lsOooIssue = loadBypassUnreadyLoad,
+      probeNoWait = false, storeCompDetach = false)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc

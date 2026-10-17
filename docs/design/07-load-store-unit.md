@@ -216,9 +216,14 @@ The context is replicated in P2, P2T, P3 and P4.
 
 **P2 — translation request and VIPT probe** (`LSU:2050-2193`, `4775-4862`)
 
-- `normalReqArm := tValid && tIsMem && txReady && !xlateBArm && !sqFlushSig &&
-  !dcLoadHeldByOther && (!tIsLoad || dcache.loadProbe.ready)` (`LSU:4789-4790`).
-  A load therefore takes a D-cache probe credit atomically with the DTLB request.
+- `normalReqArm` requires `tValid && tIsMem && txReady && !xlateBArm &&
+  !sqFlushSig && !dcLoadHeldByOther`. Loads also require D-cache probe credit,
+  except when `probeNoWait` has registered a predicted SQ forward. That hint
+  matches the load's page-offset word against the last four stores through P1.
+  A load with the hint may launch its DTLB request while probe credit is closed;
+  the refused probe is skipped, and a load that does not forward takes the
+  ordinary S1 cache read after translation. Other loads take the probe credit
+  atomically with the DTLB request.
 - The request payload comes from `tCtx`, or from `txCtx.addrB` for the second
   translation of a split access, which takes priority (`LSU:2088-2107`).
 - `dcache.loadProbe` presents `tCtx.vaddr` with `resolved = False`, `paddrHint = 0`
@@ -515,6 +520,11 @@ on `!sq.io.full` (`LSU:4583`). `full` is `CountOne(valids) == depth` (`SQ:1567`)
    (`LSU:3655-3659`) and `publish`es the data into the slot (`SQ:1175-1180`).
 5. It then completes through the shared `comp*` stage. With `earlyAutoStoreAddress`,
    this includes the POSTINC An result.
+6. With `storeCompDetach`, a fast store whose data is already captured may
+   allocate its SQ entry and hand a pre-captured completion to this owner when
+   an older LS completion occupies `comp*`. It may do so only for the owner's
+   detachable store class, a non-split access, and available owner capacity.
+   This frees P3 without overtaking the older completion.
 
 While the data capture uses `rdData`, `issuePort.ready` is forced low (`LSU:4875`).
 
@@ -666,6 +676,8 @@ the shipping build's environment (`ST:615`).
 | `sqSubwordForwarding` | false | **true** | BYTE/WORD forward out of an aligned LONG store. |
 | `reserveLateStore` | false | **true** | SQ reservation without data. |
 | `detachLateStore` | false | **true** | The detached owner frees P3. |
+| `storeCompDetach` | `SCC` (true) | **true** | Fast store uses the detached completion owner when an older LS completion occupies `comp*`. |
+| `probeNoWait` | `SCC` (true) | **true** | Predicted SQ-forward load can launch translation without early-probe credit. |
 | `forwardOnPublish` | false | **true** | Forward on the publish cycle. |
 | `detachedStoreEntries` | 1 | **4** | Detached contexts: 1 active + 3 FIFO. |
 | `earlyAutoStoreAddress` | false | **true** (late store) | The POSTINC An result rides the detached completion. |
@@ -713,14 +725,16 @@ IQ knobs that shape LS behaviour (`SP:73-76`): `earlyStoreAddress = true`,
   can hand off each cycle:
   - the DTLB response must be consumed in the same cycle as the next request
     (`DTLB:428`);
-  - the probe credit must be available;
+  - the probe credit must be available, unless `probeNoWait` predicts SQ forwarding;
   - P4 must not be retrying;
-  - the completion stage must be free for stores and LEAs.
+  - the completion stage must be free for LEAs and ordinary stores; a detachable
+    fast store may use the detached owner when `storeCompDetach` is enabled.
 - **Completion bandwidth.** One `comp*` capture per cycle shared by: load completions
   (head or early writeback), fast stores, LEA, detached-store completions, precise
-  replays and replays. A store completes in P3 and needs this stage, so a store burst
-  interleaved with load responses serializes on it (`frontCompHeld`, `LSU:4552-4553`,
-  `4584-4585`).
+  replays and replays. A store normally completes in P3 and needs this stage.
+  An eligible fast store can instead allocate its SQ entry in P3 and defer only
+  completion when an older LS completion occupies the stage. Other store bursts
+  interleaved with load responses still serialize on it (`frontCompHeld`).
 - **DTLB miss.** P2T holds the request, and the DTLB accepts nothing new while
   `missPending` (`DTLB:428`). Every younger LS op is blocked behind a TLB miss; there
   is no hit-under-TLB-miss.

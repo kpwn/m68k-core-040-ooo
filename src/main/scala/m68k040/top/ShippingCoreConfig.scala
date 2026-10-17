@@ -1191,8 +1191,9 @@ object ShippingCoreConfig {
     * needs the array at all. Waiting held the WHOLE in-order LS pipe (T -> P1 -> issue) for
     * every cycle the credit was closed by a draining store's grant, which on a store/load
     * stream throttles LS issue to 2 per 3 cycles. Removes a term from `normalReqArm`
-    * (no new logic level). Default OFF; echoed in `SHIPPING_CONFIG`. */
-  val lsProbeNoWait: Boolean = envFlag("CPU_LS_PROBE_NOWAIT", false)
+    * (no new logic level). Default ON after the 35-kernel board-profile A/B with
+    * `lsStoreCompDetach`: no kernel slower, seven faster; echoed in `SHIPPING_CONFIG`. */
+  val lsProbeNoWait: Boolean = envFlag("CPU_LS_PROBE_NOWAIT", true)
 
   /** CPU_LS_STORE_COMP_DETACH (2026-10-15, `load/store` IPC agent). A fast (copyback/
     * write-through, MMU-on) store whose data is ALREADY captured, reaching P3 on a cycle an
@@ -1203,8 +1204,11 @@ object ShippingCoreConfig {
     * the in-order LS front (P3 -> P2T -> DTLB req.ready -> T -> issue) one cycle per
     * store->load pair. Same eligibility as the late-data reservation it reuses (no stack push,
     * CCR restore, X write, LEA, or split access). Requires the detached owner
-    * (`detachLateStore`, shipping); inert otherwise. Default OFF; echoed in `SHIPPING_CONFIG`. */
-  val lsStoreCompDetach: Boolean = envFlag("CPU_LS_STORE_COMP_DETACH", false)
+    * (`detachLateStore`, shipping); inert otherwise. Default ON after the paired
+    * board-profile A/B (aggregate 542015 -> 538181 cycles, IPC 0.502 -> 0.505;
+    * 200 MHz routed WNS -0.549 -> -0.306 ns, still timing-failing). Echoed in
+    * `SHIPPING_CONFIG`. */
+  val lsStoreCompDetach: Boolean = envFlag("CPU_LS_STORE_COMP_DETACH", true)
 
   /** Fanout/area (fable `fanout`, 2026-10-15): the aligned-load ring no longer parks a
     * 128-bit LINE per entry (`alignedRLine`, 4x128 flops + a 128-bit 4:1 read mux, and four
