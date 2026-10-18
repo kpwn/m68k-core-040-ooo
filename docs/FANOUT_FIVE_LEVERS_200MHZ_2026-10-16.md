@@ -123,3 +123,18 @@ about -1.24 ns. Its place checkpoint is preserved at
 `/var/tmp/codex-ipc-fast-200/vivado/checkpoints/place.dcp`. The implementation
 was stopped before routing because that profile remained far outside the 200
 MHz timing margin. It was not loaded on the board.
+
+## IPC follow-up (2026-10-19)
+
+The first two-pass board pair also favored the baseline in IPC: 0.49847 versus
+0.49724 (results in `/var/tmp/codex-ipc-{current,area}-board-ab/result.json`).
+Combined with the later four-pass pair above, the six-run means are
+0.49739 for the baseline and 0.49652 for the area image, a 0.17% lower mean
+for the area image. The individual ranges overlap, and the Speedometer CPU
+ratings remain effectively equal, so the board data do not isolate a causal
+RTL regression. Nonetheless, the area image does not meet a strict no-IPC-loss
+handoff criterion. The five flags therefore return to default OFF; their
+implementations remain available for individually measured experiments. This
+restores the executable CPU source to the previously measured `4dd1124d`
+baseline. The board was occupied by SD provisioning during this source change,
+so the restored defaults were not reloaded in this follow-up.
