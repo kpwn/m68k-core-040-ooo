@@ -3,8 +3,9 @@
 CPU commit `6cfecab0` adds five independent, default-off RTL flags:
 `CPU_LS_PARK_NOLINE`, `CPU_TLB_DRAIN_NARROW`, `CPU_DC_FREE_CAPTURE`,
 `CPU_DC_PROBE_MH_LAG`, and `CPU_DBG_APPLY_NOSNAP`. The comparison below uses
-that **same commit** with all five flags off or all five on. The shipping
-defaults remain off because the enabled board build still misses 200 MHz.
+that **same commit** with all five flags off or all five on. At that revision,
+the shipping defaults remained off because the enabled board build still missed
+200 MHz. A later timing-clean result on the recovered board profile is below.
 
 ## Functional and IPC gates
 
@@ -66,3 +67,59 @@ so its resource totals are the relevant numbers for the board result above.
 * Corpus and lockstep named summaries: the `scratchpad/gate/arms/`
   `corpus_codex_fanout_current`, `ls_codex_fanout_current` and
   `ls_codex_fanout_missing` directories in the experiment workspace.
+
+## Recovered board profile: timing-clean area reduction (2026-10-18)
+
+CPU `96f38ad3` enables all five flags by default on top of `4dd1124d`. Both
+board arms use SoC `8284a403`, Vivado 2025.2, the same 200 MHz MMCM,
+`throughput-v2`, reduced debug, nonblocking L1D, the CPU AXI hot door, real
+DDR4 MIG, and no incremental checkpoint. The SD controller in this SoC uses
+the recovered 25 MHz high-speed divider. The only CPU source difference is the
+five defaults. The candidate's build selection records clean CPU and SoC
+source trees.
+
+| Full SoC metric | Recovered baseline | Five flags on | On minus baseline |
+| --- | ---: | ---: | ---: |
+| Routed setup WNS | +0.033 ns | +0.031 ns | -0.002 ns |
+| Routed hold WHS | +0.010 ns | +0.010 ns | 0.000 ns |
+| Pulse-width WPWS | +0.032 ns | +0.040 ns | +0.008 ns |
+| Pulse-width failures | 0 | 0 | 0 |
+| Routed LUTs | 143377 | 141936 | -1441 |
+| Routed flip flops | 96874 | 95604 | -1270 |
+| BRAM36 / BRAM18 / URAM | 170 / 40 / 64 | 170 / 40 / 64 | unchanged |
+
+The candidate wrote a routed checkpoint and bitstream with zero DRC errors.
+Its 200 MHz setup, hold, and pulse-width constraints all pass. The full build
+crashed at Vivado's leaf-clock optimization; `resume_from_place.tcl` completed
+the route from the saved place checkpoint with `AggressiveExplore`, as it did
+for the baseline.
+
+`make SBT=~/sbt/bin/sbt test-fast` passed: 430 succeeded, zero failed, one
+canceled and two ignored. With the same candidate source and five environment
+overrides forced OFF or left ON, all 34 IPC microbenchmark kernels had
+identical window cycles (271573 retired macros in 548523 cycles, 0.495 IPC).
+
+The local board image booted Finder and completed two Speedometer Benchmark
+Mix passes at 199.63–199.64 MHz. A follow-up reload-to-reload four-pass pair
+measured baseline 0.4968 IPC and 10.605 CPU rating versus candidate 0.4962
+IPC and 10.611 CPU rating at 199.62 MHz. The 0.14% IPC difference is smaller
+than the pass-to-pass range, while the CPU rating changes by +0.06%; these
+measurements do not establish an IPC gain or regression on Speedometer. The
+34-kernel simulation gives stronger evidence that the five flags do not change
+that suite's cycles. Other workloads remain unmeasured on the board.
+
+Artifacts: `/var/tmp/codex-sdperf-recovered-200/vivado/` and
+`/var/tmp/codex-ipc-area-200/vivado/` contain the matching build records,
+timing/utilization reports, routed checkpoints, and bitstreams. The candidate
+route log is `/var/tmp/codex-ipc-area-200-resume.log`; its fast gate is
+`/var/tmp/codex-ipc-area-test-fast.log`, IPC A/B logs are
+`/var/tmp/codex-ipc-area-{off,on}-ipc.log`, and the four-pass board results are
+`/var/tmp/codex-ipc-{base,area}-4run/result.json`.
+
+The earlier opt-in four-cycle L1/L2 profile was also regenerated against these
+recovered sources. It increased synthesis use by 2188 LUTs and 1260 flip flops,
+and placed WNS was -1.336 ns; physical optimization improved that estimate to
+about -1.24 ns. Its place checkpoint is preserved at
+`/var/tmp/codex-ipc-fast-200/vivado/checkpoints/place.dcp`. The implementation
+was stopped before routing because that profile remained far outside the 200
+MHz timing margin. It was not loaded on the board.
