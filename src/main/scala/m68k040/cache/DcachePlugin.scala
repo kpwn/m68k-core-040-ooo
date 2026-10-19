@@ -6796,10 +6796,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
       if (oneBuf) GenerationFlags.simulation {
         // The two-buffer form would install/respond `mergeBytes(rbuf, mbuf, mstrb)`: on every
         // UNSTROBED byte of a FILLED/LINGER entry the single buffer must hold the refill beat.
+        // Both shadows replay the ORIGINAL two-buffer assignment chain (same conditions,
+        // same last-wins order); `mbufShadow` is the old store-merge buffer.
         val rbufShadow = Vec.fill(N)(Reg(Bits(128 bits)))
+        val mbufShadow = Vec.fill(N)(Reg(Bits(128 bits)))
         when(rFire) { for (k <- 0 until N) when(rId === U(k, idxW bits)) { rbufShadow(k) := rData } }
+        for (k <- 0 until N) {
+          when(sOH(k)) { mbufShadow(k) := pendingMergeData }
+          when(sDo && sCam(k)) { mbufShadow(k) := mergeBytes(mbufShadow(k), pendingMergeData, pendingMergeStrb) }
+          when(s3WtMiss && s3Cam(k)) { mbufShadow(k) := mergeBytes(mbufShadow(k), stS3MergeData, stS3MergeStrb) }
+        }
         for (k <- 0 until N) when(st(k) === ST(FILLED) || st(k) === ST(LINGER)) {
-          assert(mbuf(k) === mergeBytes(rbufShadow(k), mbuf(k), mstrb(k)),
+          assert(mbuf(k) === mergeBytes(rbufShadow(k), mbufShadow(k), mstrb(k)),
             s"DcachePlugin.nb CPU_DC_NB_ONE_BUF: MSHR $k line buffer diverged from rbuf/mbuf merge", FAILURE)
         }
       }
