@@ -1281,4 +1281,9 @@ object ShippingCoreConfig {
     * about half the queue's LUTRAM replicas. Bit-exact. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val uopqOneRead: Boolean = envFlag("CPU_UOPQ_ONE_READ", true)
+  /** IPC (fable `area5`): the MicroOpQueue accepts a push burst when its ACTUAL µop count
+    * fits in the free slots, instead of always reserving room for a full 4-µop burst. The
+    * queue still never holds more than 16 µops, so every downstream depth bound is unchanged.
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val uopqExactReady: Boolean = envFlag("CPU_UOPQ_EXACT_READY", false)
 }
