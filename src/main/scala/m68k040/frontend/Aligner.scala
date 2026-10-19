@@ -311,7 +311,19 @@ object Aligner {
             // the real max is L0+i <= L0+L1-1 <= WINDOW-1, which fits in 4 bits without
             // truncation; the (i>=L1) high-`i` iterations are don't-care (discarded below).
             val idx = (L0 +^ U(i)).resize(4)
-            if (i == 0) {
+            // CPU_ALIGN_SLOT1_OH (needs CPU_FE_RETIME + CPU_ALIGN_MASK_NORST): word i is read
+            // ONLY when i < L1, and slot1Ok bounds L0 + L1 <= WINDOW with L0 >= 1, so the
+            // reachable starts are k = 1 .. WINDOW-1-i. A one-hot AND-OR over just those
+            // (by the existing `l0Oh`) replaces the 10:1 binary mux; any other start lands
+            // at i >= L1, which DecodeStage masks from `lenWords` before any reader.
+            val slot1Oh = m68k040.top.ShippingCoreConfig.alignSlot1Oh && retime && maskNoRst
+            def ohWord: Bits = {
+              val cands = (1 to (WINDOW - 1 - i)).map(k => words(k + i).andMask(l0Oh(k)))
+              if (cands.isEmpty) B(0, 16 bits) else cands.reduceBalancedTree(_ | _)
+            }
+            if (slot1Oh) {
+              r.slot1.words(i) := ohWord
+            } else if (i == 0) {
               // FMax "Frontend Lever A" -- same tautological-mask deletion as slot 0 above,
               // against L1 instead of L0; see that comment for the full derivation, the
               // exhaustive proof (`PredecodeSimpleLenSpec`) and the netlist measurement.

@@ -830,7 +830,8 @@ object GenSocketTopVerilog {
             s"ratEffRead=${ShippingCoreConfig.ratEffRead} " +
             s"rasCkPend=${ShippingCoreConfig.rasCkPend} " +
             s"iqDstCold=${ShippingCoreConfig.iqDstCold} " +
-            s"iqWaitNoValid=${ShippingCoreConfig.iqWaitNoValid}")
+            s"iqWaitNoValid=${ShippingCoreConfig.iqWaitNoValid} " +
+            s"alignSlot1Oh=${ShippingCoreConfig.alignSlot1Oh}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

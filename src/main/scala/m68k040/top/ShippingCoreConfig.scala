@@ -1312,4 +1312,9 @@ object ShippingCoreConfig {
     * qualifier bits leave the 16-slot compacting array. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val iqWaitNoValid: Boolean = envFlag("CPU_IQ_WAIT_NOVALID", false)
+  /** Area (fable `area5`): the aligner's slot-1 words are a one-hot AND-OR (by the existing
+    * L0 one-hot) over only the start offsets that can reach each word, instead of a 10:1
+    * binary mux; unreachable starts give words DecodeStage already masks by `lenWords`.
+    * Needs CPU_FE_RETIME and CPU_ALIGN_MASK_NORST. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val alignSlot1Oh: Boolean = envFlag("CPU_ALIGN_SLOT1_OH", false)
 }

@@ -1236,8 +1236,17 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
         assert(same(ref.slot0, res.slot0),
           "FetchAlign: CPU_FE_RETIME slot0 packet diverged from the reference", FAILURE)
       }
+      // CPU_ALIGN_SLOT1_OH: slot-1 words at index >= lenWords are don't-care (DecodeStage
+      // masks them before any reader), so compare the masked words there.
+      def masked1(a: DecodePacket): Bits = Vec((0 until a.words.length).map(i =>
+        if (i == 0) a.words(i) else Mux(a.lenWords <= U(i), B(0, 16 bits), a.words(i)))).asBits
+      def same1(a: DecodePacket, b: DecodePacket): Bool =
+        if (!m68k040.top.ShippingCoreConfig.alignSlot1Oh) same(a, b)
+        else a.pc === b.pc && masked1(a) === masked1(b) && a.wordCount === b.wordCount &&
+          a.simple === b.simple && a.lenWords === b.lenWords && a.complex === b.complex &&
+          a.fault === b.fault && a.size === b.size
       when(res.slot1Valid) {
-        assert(same(ref.slot1, res.slot1),
+        assert(same1(ref.slot1, res.slot1),
           "FetchAlign: CPU_FE_RETIME slot1 packet diverged from the reference", FAILURE)
       }
     }
