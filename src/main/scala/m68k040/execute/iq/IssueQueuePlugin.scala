@@ -2202,8 +2202,42 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // older one). `lsSkidHot` is written on EVERY port-3 fire, parked or passed-through,
     // so it is exactly "the payload that fired last cycle" on every `sbClearFire(3)`
     // cycle. Still a plain flop; the sb*_busy cone is unchanged.
+    // CPU_IQ_DST_COLD: decode the clear from the COLD row of the same uop (addressed by the
+    // registered {robId, coldWay} of the issue register / LS skid). The cold row is written
+    // at push from the same record as the hot copy, so the destination fields are identical;
+    // the slot array, compaction and the five select muxes no longer carry them.
+    val dstCold = m68k040.top.ShippingCoreConfig.iqDstCold
+    // Ports other than LS reuse the issue port's own cold read (same address); the LS
+    // clear names the skid's uop, so it takes one more (dst-only, pruned) cold read.
+    val lsSkidCold = if (dstCold) coldRead(lsSkidHot) else null
+    val clrCtxs = scala.collection.mutable.Map[Int, IqHot]()
+    def clrCtx(k: Int): IqHot = clrCtxs.getOrElseUpdate(k, mkClrCtx(k))
+    def mkClrCtx(k: Int): IqHot = {
+      val hot = if (k == 3) lsSkidHot else pipedPorts(k).payload
+      if (!dstCold) hot else {
+        val u = if (k == 3) lsSkidCold else issuePorts(k).payload.uop
+        val c = IqHot()
+        c.assignFromBits(hot.asBits)
+        c.pdst.allowOverride; c.pdstValid.allowOverride; c.pNzvcDst.allowOverride; c.writesNzvc.allowOverride
+        c.pXDst.allowOverride; c.writesX.allowOverride; c.pFpDst.allowOverride; c.pFpDstValid.allowOverride
+        c.pFpccDst.allowOverride; c.writesFpcc.allowOverride
+        c.pdst := u.pdst; c.pdstValid := u.pdstValid; c.pNzvcDst := u.pNzvcDst; c.writesNzvc := u.writesNzvc
+        c.pXDst := u.pXDst; c.writesX := u.writesX; c.pFpDst := u.pFpDst; c.pFpDstValid := u.pFpDstValid
+        c.pFpccDst := u.pFpccDst; c.writesFpcc := u.writesFpcc
+        GenerationFlags.simulation {
+          when(sbClearFire(k)) {
+            assert(c.pdst === hot.pdst && c.pdstValid === hot.pdstValid && c.pNzvcDst === hot.pNzvcDst &&
+              c.writesNzvc === hot.writesNzvc && c.pXDst === hot.pXDst && c.writesX === hot.writesX &&
+              c.pFpDst === hot.pFpDst && c.pFpDstValid === hot.pFpDstValid && c.pFpccDst === hot.pFpccDst &&
+              c.writesFpcc === hot.writesFpcc,
+              "IssueQueuePlugin CPU_IQ_DST_COLD: cold destination fields diverged from the hot record", FAILURE)
+          }
+        }
+        c
+      }
+    }
     for (k <- selPorts.indices) {
-      val ctx = if (k == 3) lsSkidHot else pipedPorts(k).payload
+      val ctx = clrCtx(k)
       when(sbClearFire(k)) {
         when(ctx.pdstValid)   { sbInt.busy(ctx.pdst)      := False; sbIntClr(ctx.pdst)      := True }
         when(ctx.writesNzvc)  { sbNzvc.busy(ctx.pNzvcDst) := False; sbNzvcClr(ctx.pNzvcDst) := True }
@@ -2221,7 +2255,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // (Retimed to C+1 with the loop above -- keeping it on the LIVE select cone would put
     // the branch port's copy of the exact arc back into the netlist.)
     {
-      val bctx = pipedPorts(2).payload
+      val bctx = clrCtx(2)
       when(sbClearFire(2) && bctx.pdstValid) {
         sbInt.busy(bctx.pdst) := False; sbIntClr(bctx.pdst) := True
       }

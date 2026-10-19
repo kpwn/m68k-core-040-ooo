@@ -1301,4 +1301,9 @@ object ShippingCoreConfig {
     * write into all 16x32 checkpoint rows at save time. Same logical stack. Default OFF;
     * echoed in `SHIPPING_CONFIG`. */
   val rasCkPend: Boolean = envFlag("CPU_RAS_CK_PEND", false)
+  /** Area (fable `area5`): the IQ's retimed C+1 scoreboard clear reads the issued uop's
+    * destination fields from its COLD LUTRAM row (same record, same push) instead of the hot
+    * slot copy, so the 29 destination bits leave the 16-slot compacting array and the five
+    * select muxes. Same values, same cycle. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val iqDstCold: Boolean = envFlag("CPU_IQ_DST_COLD", false)
 }
