@@ -1266,19 +1266,19 @@ object ShippingCoreConfig {
     * push-data muxes become one 4:1 rotate per bank. Pointers, count, gating and defaults are
     * unchanged; read-before-write like the flops. Bit-exact. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
-  val ibufLutram: Boolean = envFlag("CPU_IBUF_LUTRAM", false)
+  val ibufLutram: Boolean = envFlag("CPU_IBUF_LUTRAM", true)
   /** Area (fable `area4`): each non-blocking L1D MSHR keeps ONE 128-bit line buffer instead
     * of a refill buffer + a store-merge buffer merged at install/response time. Store bytes
     * land in it as before; the refill beat lands under the strobe mask (store bytes win, also
     * against a same-cycle merge). Every consumer of the merged line (install, waiter
     * response) sees the same bytes: -128 flops and the 128-bit byte merge per MSHR.
     * Bit-exact. Default OFF; echoed in `SHIPPING_CONFIG`. */
-  val dcNbOneBuf: Boolean = envFlag("CPU_DC_NB_ONE_BUF", false)
+  val dcNbOneBuf: Boolean = envFlag("CPU_DC_NB_ONE_BUF", true)
   /** Area (fable `area4`): decode's MicroOpQueue reads each of its four LUTRAM banks at ONE
     * row instead of two. The two popped slots (head, head+1) are consecutive, hence in two
     * different banks; bank b reads head's row if b >= head's bank, else the next row. Same
     * data on both pop slots (also for unwritten rows): half the per-bank read ports, i.e.
     * about half the queue's LUTRAM replicas. Bit-exact. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
-  val uopqOneRead: Boolean = envFlag("CPU_UOPQ_ONE_READ", false)
+  val uopqOneRead: Boolean = envFlag("CPU_UOPQ_ONE_READ", true)
 }
