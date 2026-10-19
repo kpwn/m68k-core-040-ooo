@@ -1274,4 +1274,11 @@ object ShippingCoreConfig {
     * response) sees the same bytes: -128 flops and the 128-bit byte merge per MSHR.
     * Bit-exact. Default OFF; echoed in `SHIPPING_CONFIG`. */
   val dcNbOneBuf: Boolean = envFlag("CPU_DC_NB_ONE_BUF", false)
+  /** Area (fable `area4`): decode's MicroOpQueue reads each of its four LUTRAM banks at ONE
+    * row instead of two. The two popped slots (head, head+1) are consecutive, hence in two
+    * different banks; bank b reads head's row if b >= head's bank, else the next row. Same
+    * data on both pop slots (also for unwritten rows): half the per-bank read ports, i.e.
+    * about half the queue's LUTRAM replicas. Bit-exact. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val uopqOneRead: Boolean = envFlag("CPU_UOPQ_ONE_READ", false)
 }

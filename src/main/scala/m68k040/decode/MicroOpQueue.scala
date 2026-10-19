@@ -28,7 +28,9 @@ import spinal.lib._
   * tail (the v-th valid µop lands at tail+v) using HARDWARE sums (no when-gated
   * Scala vars). Pop reads head and head+1 combinationally (async); on fire head
   * advances by the popped count. */
-class MicroOpQueue(depth: Int = 16) extends Component {
+class MicroOpQueue(depth: Int = 16,
+                   /** `CPU_UOPQ_ONE_READ`: one async read port per bank (see ShippingCoreConfig). */
+                   oneRead: Boolean = m68k040.top.ShippingCoreConfig.uopqOneRead) extends Component {
   require(isPow2(depth), "MicroOpQueue depth must be a power of two")
   val ptrW   = log2Up(depth)
   val countW = log2Up(depth + 1)
@@ -115,8 +117,15 @@ class MicroOpQueue(depth: Int = 16) extends Component {
   val headRow   = rowOf(head)
   val head1Row  = rowOf(head1)
   // Per-bank value at the head row / head+1 row, then select the bank.
-  val atHeadRow  = Vec(bankMems.map(_.readAsync(headRow)))
-  val atHead1Row = Vec(bankMems.map(_.readAsync(head1Row)))
+  // CPU_UOPQ_ONE_READ: head and head+1 are consecutive ring slots, so they are always in
+  // two DIFFERENT banks and each bank needs ONE row: bank b reads `headRow` when it is at or
+  // past head's bank, else the next row (only head+1 can be there, when head's bank is 3).
+  // Bit-identical to reading every bank at both rows and selecting -- half the read ports.
+  val atOne: Vec[DecodedUop] = if (!oneRead) null else Vec((0 until banks).map { b =>
+    bankMems(b).readAsync(Mux(U(b, 2 bits) >= bankOf(head), headRow, (headRow + 1).resize(rowW)))
+  })
+  val atHeadRow  = if (oneRead) atOne else Vec(bankMems.map(_.readAsync(headRow)))
+  val atHead1Row = if (oneRead) atOne else Vec(bankMems.map(_.readAsync(head1Row)))
   io.pop.payload(0) := atHeadRow(bankOf(head))
   io.pop.payload(1) := atHead1Row(bankOf(head1))
   io.pop1Valid      := count > 1
