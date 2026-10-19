@@ -39,7 +39,10 @@ case class IbEntry() extends Bundle {
   * fetch can issue with the live head still at cnt<=8 (cnt+12<=20). HEAD_WORDS (the
   * aligner visibility window) is unchanged at 10, PUSH stays 4 words (NARROW window).
   */
-class InstructionBuffer(retime: Boolean = false) extends Component {
+class InstructionBuffer(retime: Boolean = false,
+                        /** `CPU_IBUF_LUTRAM`: hold the payload ring in four 5-row LUTRAM banks
+                          * (see ShippingCoreConfig.ibufLutram). */
+                        lutram: Boolean = m68k040.top.ShippingCoreConfig.ibufLutram) extends Component {
   val BUF_WORDS  = 20
   val HEAD_WORDS = 10
   val PUSH_WORDS = 4
@@ -78,7 +81,7 @@ class InstructionBuffer(retime: Boolean = false) extends Component {
   // Occupancy owns payload visibility: a push writes word and metadata together.
   // Keep pointer/count reset and the exact zero/BYTE/false output defaults below;
   // unused physical slots themselves need no reset (docs/ibuf-payload-reset.md).
-  val entries = Vec.fill(BUF_WORDS)(Reg(IbEntry()))
+  val entries = if (lutram) null else Vec.fill(BUF_WORDS)(Reg(IbEntry()))
   val count   = Reg(UInt(log2Up(BUF_WORDS + 1) bits)) init 0
   val headPtr = Reg(UInt(IDXW bits)) init 0
   spinal.core.sim.SimPublic(count)
@@ -129,7 +132,7 @@ class InstructionBuffer(retime: Boolean = false) extends Component {
   val tailOneHot = UIntToOh(tailBase, BUF_WORDS)
   val pushLenOk  = Vec(Bool(), PUSH_WORDS)
   for (j <- 0 until PUSH_WORDS) pushLenOk(j) := U(j) < io.push.payload.n
-  for (s <- 0 until BUF_WORDS) {
+  if (!lutram) for (s <- 0 until BUF_WORDS) {
     when(io.push.fire) {
       for (j <- 0 until PUSH_WORDS) {
         when(tailOneHot(((s - j) + BUF_WORDS) % BUF_WORDS) && pushLenOk(j)) {
@@ -188,8 +191,66 @@ class InstructionBuffer(retime: Boolean = false) extends Component {
     }
   }
 
+  // --- CPU_IBUF_LUTRAM: the same ring as FOUR LUTRAM banks, bank = slot mod 4, row = slot / 4
+  // (BUF_WORDS = 20 = 5 rows x 4 banks, so the mod-20 wrap keeps the bank sequence: slot 19
+  // is bank 3, slot 0 bank 0). The four pushed words are consecutive slots, so each bank takes
+  // at most ONE write per cycle; the HEAD_WORDS window is consecutive slots, so each bank is
+  // read at most three consecutive rows (ports k = 0..2). Logical word i = 4k + d sits in bank
+  // (head mod 4 + d) mod 4, port k: a 4:1 rotate per output, no 20:1 mux. Row/bank are bit
+  // slices of `headPtr`/`tailBase` (slot = 4 * row + bank), so no wrap adders on addresses
+  // beyond a 3-bit mod-5 increment. Read-before-write, no reset: identical to the flop ring
+  // (unoccupied rows are masked by `i < count` exactly as before).
+  val lr = if (!lutram) null else new Area {
+    require(BUF_WORDS == 20 && PUSH_WORDS == 4 && HEAD_WORDS <= 12)
+    val ROWS = BUF_WORDS / 4
+    val banks = Seq.fill(4)(Mem(IbEntry(), ROWS))
+    banks.foreach(_.addAttribute("ram_style", "distributed"))
+    def rowInc(r: UInt, k: Int): UInt = {
+      // (r + k) mod ROWS for a 3-bit r in 0..ROWS-1 and a constant k
+      val t = r.resize(4) + U(k, 4 bits)
+      Mux(t >= ROWS, t - ROWS, t).resize(3)
+    }
+    // writes
+    val tb   = tailBase(1 downto 0)
+    val tRow = tailBase(IDXW - 1 downto 2)
+    for (b <- 0 until 4) {
+      val jSel = (U(b, 2 bits) - tb)                      // which pushed word lands in bank b
+      val rowN = Mux(U(b, 2 bits) < tb, rowInc(tRow, 1), tRow)
+      val w    = io.push.payload.words(jSel)
+      val pr   = io.push.payload.preds(jSel)
+      val e    = IbEntry()
+      e.word := w; e.pred := pr
+      banks(b).write(rowN, e, io.push.fire && pushLenOk(jSel))
+    }
+    // reads
+    val hb   = headPtr(1 downto 0)
+    val hRow = headPtr(IDXW - 1 downto 2)
+    val ports = for (b <- 0 until 4) yield {
+      val r0 = Mux(U(b, 2 bits) < hb, rowInc(hRow, 1), hRow)
+      (0 until 3).map(k => banks(b).readAsync(rowInc(r0, k)))
+    }
+    def word(i: Int): IbEntry = {
+      val d = i % 4; val k = i / 4
+      Vec((0 until 4).map(b => ports(b)(k)))(hb + U(d, 2 bits))
+    }
+  }
+
   // --- combinational head outputs: barrel-rotate of HEAD_WORDS slots ---
-  for (i <- 0 until HEAD_WORDS) {
+  if (lutram) for (i <- 0 until HEAD_WORDS) {
+    val e = lr.word(i)
+    when(U(i) < count) {
+      io.head(i)     := e.word
+      io.headPred(i) := e.pred
+    } .otherwise {
+      io.head(i)                     := 0
+      io.headPred(i).lenWords        := 0
+      io.headPred(i).ambiguousLine   := False
+      io.headPred(i).size            := m68k040.isa.Size.BYTE
+      io.headPred(i).ctrlXfer        := False
+    }
+    if (retime) io.headPredRaw(i) := e.pred
+  }
+  if (!lutram) for (i <- 0 until HEAD_WORDS) {
     // physical slot for logical word i = (headPtr + i) mod BUF_WORDS
     val phys = UInt(IDXW bits)
     val hp = (headPtr +^ i)
@@ -219,7 +280,7 @@ class InstructionBuffer(retime: Boolean = false) extends Component {
     }
   }
 
-  if (retime) {
+  if (retime && !lutram) {
     for (i <- 0 until HEAD_WORDS) {
       val hp = headPtr +^ i
       val phys = UInt(IDXW bits)

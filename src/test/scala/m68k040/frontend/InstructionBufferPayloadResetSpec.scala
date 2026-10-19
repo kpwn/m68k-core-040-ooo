@@ -7,7 +7,7 @@ import spinal.core._
 import spinal.core.sim._
 
 class InstructionBufferPayloadResetSpec extends AnyFunSuite {
-  class CheckedBuffer extends InstructionBuffer {
+  class CheckedBuffer extends InstructionBuffer(lutram = false) {
     headPtr.simPublic()
     entries.foreach { e => e.word.simPublic(); e.pred.flatten.foreach(_.simPublic()) }
   }

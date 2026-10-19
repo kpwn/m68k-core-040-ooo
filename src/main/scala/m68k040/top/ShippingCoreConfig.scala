@@ -1252,4 +1252,19 @@ object ShippingCoreConfig {
     * are not held (a busy re-apply is still rejected). Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val dbgApplyNoSnap: Boolean = envFlag("CPU_DBG_APPLY_NOSNAP", false)
+  /** Area (fable `area4`): the store queue's store-to-load forward picks its source with a
+    * one-hot select (youngest older overlapping entry, from `head` and the overlap vector,
+    * no-hit default = entry depth-1 exactly as before) and ONE AND-OR over the entries'
+    * data/full/subword/publishing, instead of a log-depth tournament tree that carries the
+    * 32-bit data and the age distance through every node. Bit-exact. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val sqFwdOneHot: Boolean = envFlag("CPU_SQ_FWD_ONEHOT", false)
+  /** Area (fable `area4`): the instruction buffer's 20-word payload ring lives in four
+    * 5-row LUTRAM banks (bank = slot mod 4) instead of 480 flops. A 4-word push hits each
+    * bank at most once; the 10-word head window reads each bank at <= 3 consecutive rows, so
+    * every head word is a 4:1 bank rotate instead of a 20:1 slot mux, and the per-slot 4:1
+    * push-data muxes become one 4:1 rotate per bank. Pointers, count, gating and defaults are
+    * unchanged; read-before-write like the flops. Bit-exact. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val ibufLutram: Boolean = envFlag("CPU_IBUF_LUTRAM", false)
 }

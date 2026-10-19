@@ -96,6 +96,35 @@ case class SqFwdRsp() extends Bundle {
   *
   * Control state resets; payload is written at allocation before validity owns
   * it. Counts are hardware sums (no when-gated Scala-var counters). */
+/** Store-to-load forward source select, both forms (`CPU_SQ_FWD_ONEHOT`).
+  * `valid(i)` = entry i overlaps the query; `head` = the SQ head pointer; `pay(i)` = the
+  * entry's forwarded payload. Returns (any valid, the selected payload). The selected entry
+  * is the valid one with the LARGEST `i - head` (mod depth); none valid -> entry depth-1. */
+object SqFwdSelect {
+  def tree(valid: Bits, head: UInt, pay: Seq[Bits]): (Bool, Bits) = {
+    val n = pay.length; val w = pay.head.getWidth; val pw = head.getWidth
+    case class C() extends Bundle { val v = Bool(); val d = UInt(pw bits); val p = Bits(w bits) }
+    val cs = (0 until n).map { i => val c = C(); c.v := valid(i); c.d := U(i, pw bits) - head; c.p := pay(i); c }
+    val b = cs.reduceBalancedTree { (a, b) =>
+      val o = C()
+      when(a.v && (!b.v || (a.d >= b.d))) { o := a } otherwise { o := b }
+      o
+    }
+    (b.v, b.p)
+  }
+  def oneHotSel(valid: Bits, head: UInt): Bits = {
+    val n = valid.getWidth; val pw = head.getWidth
+    // Entries below `head` are the farthest from it: the highest valid one there wins,
+    // otherwise the highest valid one at/above `head`; none valid -> entry n-1.
+    val below = Vec((0 until n).map(i => U(i, pw bits) < head)).asBits
+    val lo    = valid & below
+    val pick  = Mux(lo.orR, OHMasking.last(lo), OHMasking.last(valid))
+    Mux(valid.orR, pick, B(BigInt(1) << (n - 1), n bits))
+  }
+  def oneHot(valid: Bits, head: UInt, pay: Seq[Bits]): (Bool, Bits) =
+    (valid.orR, MuxOH(oneHotSel(valid, head), pay))
+}
+
 class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  reserveLateStore: Boolean = false,
                  forwardOnPublish: Boolean = false, retireWidth: Int = 2,
@@ -123,7 +152,9 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  /** `CPU_SQ_VADDR_LUTRAM`: hold the fault-report-only fields (vaddrA,
                    * supervisor; written only at `tail`, read only at `head`) in a LUTRAM
                    * instead of per-entry flops. */
-                 val vaddrLutram: Boolean = m68k040.top.ShippingCoreConfig.sqVaddrLutram) extends Component {
+                 val vaddrLutram: Boolean = m68k040.top.ShippingCoreConfig.sqVaddrLutram,
+                 /** `CPU_SQ_FWD_ONEHOT`: one-hot forward-source select (see ShippingCoreConfig). */
+                 val fwdOneHot: Boolean = m68k040.top.ShippingCoreConfig.sqFwdOneHot) extends Component {
   require(isPow2(depth))
   require(!coalesceLines || depth >= 4, "full-line coalescing needs a ring of at least 4")
   require(Set(2, 4, 8, 16)(retireWidth))
@@ -1152,10 +1183,29 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     c.publishing := perEntry(i).publishing
     c
   }
-  val best = cands.reduceBalancedTree { (a, b) =>
+  def bestTree: Cand = cands.reduceBalancedTree { (a, b) =>
     val o = Cand()
     // Prefer the valid one; if both valid, the larger allocation rank is younger.
     when(a.valid && (!b.valid || (a.dist >= b.dist))) { o := a } otherwise { o := b }
+    o
+  }
+  val best: Cand = if (!fwdOneHot) bestTree else {
+    // CPU_SQ_FWD_ONEHOT: one select vector, then ONE AND-OR over the payloads.
+    val v = Vec(cands.map(_.valid)).asBits
+    val (anyV, p) = SqFwdSelect.oneHot(v, head, cands.map(c => (c.publishing ## c.subword ## c.full ## c.data)))
+    val o = Cand()
+    o.valid      := anyV
+    o.data       := p(31 downto 0)
+    o.full       := p(32)
+    o.subword    := p(33)
+    o.publishing := p(34)
+    o.dist       := 0   // unused by every consumer (the tree's internal ordering key)
+    GenerationFlags.simulation {
+      val ref = bestTree
+      assert(o.valid === ref.valid && o.data === ref.data && o.full === ref.full &&
+        o.subword === ref.subword && o.publishing === ref.publishing,
+        "StoreQueue CPU_SQ_FWD_ONEHOT: one-hot forward select diverged from the tree", FAILURE)
+    }
     o
   }
   val fullValid = best.valid && best.full
