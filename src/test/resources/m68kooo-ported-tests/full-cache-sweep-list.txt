@@ -317,6 +317,8 @@ eori_sr_s_clear_stack_swap
 eor_mem_rmw
 exc_addr_error
 exc_addr_error_odd_branch
+exc_addr_error_odd_rtd
+exc_addr_error_odd_rts_user
 exc_addr_error_odd_rte
 exc_aline
 exc_aline_a7_alu_skip

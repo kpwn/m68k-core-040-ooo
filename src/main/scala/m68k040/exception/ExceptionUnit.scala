@@ -134,6 +134,9 @@ class ExceptionUnit(
     entryFpuUnimp: Bool = False,
     entryFpuCmd:   Bits = B(0, 16 bits),
     entryFpuImmediate: Bool = False,
+    // CPU_RTS_SPLIT_A7: the head is a split RTS's ibranch (RobPayload.retUndo4) -- its
+    // A7 += 4 ADD already retired. Meaningful only with a vector-3 entry.
+    entryRetUndo4: Bool = False,
     // CPU_EXC_FAST_FRAMES (review §4.7): pair adjacent frame words into one aligned
     // LONG on the entry push and the RTE pop. Elaboration-time; False = the old FSM.
     fastFrames: Boolean = m68k040.top.ShippingCoreConfig.excFastFrames,
@@ -598,6 +601,11 @@ class ExceptionUnit(
   // Set only by IDLE's entry capture, consumed and cleared by E_REDIR.
   val oddTargetPrecise = m68k040.top.ShippingCoreConfig.oddTargetPrecise
   val curOddCall   = if (oddTargetPrecise) RegInit(False) else null
+  // CPU_RTS_SPLIT_A7: this vector-3 entry is a split RTS whose A7 += 4 already retired --
+  // give it back (frame at pre-RTS SP - 12, or USP -= 4 from user mode), so A7 and the
+  // odd return address on the stack are exactly as before the RTS (68040 restart).
+  val rtsSplitA7   = m68k040.top.ShippingCoreConfig.rtsSplitA7
+  val curOddRet    = if (rtsSplitA7) RegInit(False) else null
   val frameBase2   = Reg(UInt(32 bits))   // ISP-relative base for the $1 frame (entry only)
   val stFrame2     = RegInit(False)       // E_STORE loop is currently on the 2nd ($1) frame
 
@@ -1851,6 +1859,7 @@ class ExceptionUnit(
           Mux(!entryIsInterrupt && (entryVector === 3), entryFaultAddr | U(1, 32 bits), entryFaultAddr)
           else entryFaultAddr
         if (oddTargetPrecise) curOddCall := oddCallNow
+        if (rtsSplitA7) curOddRet := !entryIsInterrupt && (entryVector === 3) && entryRetUndo4
         val ppcOrTarget = Mux(entryVector === 3, faultAddrFix, ppc.resized)
         curVec    := entryVector
         curPc     := entryPc
@@ -2059,8 +2068,12 @@ class ExceptionUnit(
         // same bank down by its retired return-address push; stack the format-$2 frame
         // at pre-call SP - 12 (= current - 8) instead. Its ADDRESS field (SP+8) lands
         // exactly on the stray return-address longword, so memory ends as on a 68040.
-        val fmt2Size = if (oddTargetPrecise)
+        val fmt2Size0 = if (oddTargetPrecise)
           Mux(curOddCall && ss.srSys(5), U(8, 32 bits), U(12, 32 bits)) else U(12, 32 bits)
+        // CPU_RTS_SPLIT_A7: a supervisor split RTS already moved this bank UP by 4; stack
+        // at pre-RTS SP - 12 (= current - 16), leaving the odd return address in place.
+        val fmt2Size = if (rtsSplitA7)
+          Mux(curOddRet && ss.srSys(5), U(16, 32 bits), fmt2Size0) else fmt2Size0
         frameBase := Mux(curIs7, supSp - 60, Mux(curIs2, supSp - fmt2Size, supSp - 8))
         // Task #132: the throwaway ($1) frame's base — settled ISP minus 8 bytes.
         // ss.m is True here (curThrowaway only set when it was), so ss.isp is
@@ -2280,6 +2293,11 @@ class ExceptionUnit(
       if (oddTargetPrecise) {
         when(curOddCall && !ss.srSys(5)) { ss.setUsp.valid := True; ss.setUsp.payload := ss.usp + 4 }
         curOddCall := False
+      }
+      // CPU_RTS_SPLIT_A7: a USER-mode split RTS popped the USP; restore the pre-RTS USP.
+      if (rtsSplitA7) {
+        when(curOddRet && !ss.srSys(5)) { ss.setUsp.valid := True; ss.setUsp.payload := ss.usp - 4 }
+        curOddRet := False
       }
       // enter supervisor, clear trace: set S (bit5), clear T1/T0 (bits 7,6).
       // For an INTERRUPT entry ALSO raise the SR I-mask (bits 2:0) to the interrupt
