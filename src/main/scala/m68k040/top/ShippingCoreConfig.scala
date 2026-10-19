@@ -1281,4 +1281,10 @@ object ShippingCoreConfig {
     * about half the queue's LUTRAM replicas. Bit-exact. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val uopqOneRead: Boolean = envFlag("CPU_UOPQ_ONE_READ", false)
+  /** IPC (fable `area4`): store-to-load forwarding also serves a load whose bytes are a
+    * subset of the youngest older overlapping store's bytes (both in one line, store data
+    * ready), e.g. a byte load out of a word or unaligned long store, instead of stalling
+    * until the store drains. Needs `CPU_SQ_FWD_ONEHOT`. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val sqFwdCover: Boolean = envFlag("CPU_SQ_FWD_COVER", false)
 }

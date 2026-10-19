@@ -154,7 +154,10 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                    * instead of per-entry flops. */
                  val vaddrLutram: Boolean = m68k040.top.ShippingCoreConfig.sqVaddrLutram,
                  /** `CPU_SQ_FWD_ONEHOT`: one-hot forward-source select (see ShippingCoreConfig). */
-                 val fwdOneHot: Boolean = m68k040.top.ShippingCoreConfig.sqFwdOneHot) extends Component {
+                 val fwdOneHot: Boolean = m68k040.top.ShippingCoreConfig.sqFwdOneHot,
+                 /** `CPU_SQ_FWD_COVER` (IPC): forward from a youngest store that COVERS the load. */
+                 val fwdCover: Boolean = m68k040.top.ShippingCoreConfig.sqFwdCover) extends Component {
+  require(!fwdCover || fwdOneHot, "CPU_SQ_FWD_COVER needs CPU_SQ_FWD_ONEHOT")
   require(isPow2(depth))
   require(!coalesceLines || depth >= 4, "full-line coalescing needs a ring of at least 4")
   require(Set(2, 4, 8, 16)(retireWidth))
@@ -962,7 +965,12 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
       io.publish.slot === U(i, ptrW bits) && io.publish.robId === robIds(i) &&
       valids(i) && !dataReady(i) else False
     val full     = ent && (geomFull || geomSubword) && (hasData(U(i, ptrW bits)) || publishing)
-    val partial  = overlap && !full
+    // CPU_SQ_FWD_COVER: a single-line, data-ready store whose bytes are a SUPERSET of a
+    // single-line query's bytes. (Exact-size matches are `full` already.)
+    val cover    = if (!fwdCover) False else
+      ent && !validBs(i) && !q.splitB && sameLineA && ((maskAs(i) & qMaskThis) === qMaskThis) &&
+      hasData(U(i, ptrW bits))
+    val partial  = overlap && !full && !cover
     val inhibitedStore = ent &&
       ((cacheModes(i) === CacheMode.INHIBITED) ||
        (validBs(i) && (cacheModesB(i) === CacheMode.INHIBITED)))
@@ -1189,10 +1197,19 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     when(a.valid && (!b.valid || (a.dist >= b.dist))) { o := a } otherwise { o := b }
     o
   }
+  val bestCover = Bool(); val bestOff = UInt(4 bits); val bestSize = Size()
+  if (!fwdCover) { bestCover := False; bestOff := 0; bestSize := Size.BYTE }
   val best: Cand = if (!fwdOneHot) bestTree else {
     // CPU_SQ_FWD_ONEHOT: one select vector, then ONE AND-OR over the payloads.
     val v = Vec(cands.map(_.valid)).asBits
-    val (anyV, p) = SqFwdSelect.oneHot(v, head, cands.map(c => (c.publishing ## c.subword ## c.full ## c.data)))
+    val (anyV, p) = SqFwdSelect.oneHot(v, head, (0 until depth).map { i => val c = cands(i)
+      (if (fwdCover) (perEntry(i).cover ## paddrs(i)(3 downto 0) ## sizes(i).asBits) else B(0, 0 bits)) ##
+        c.publishing ## c.subword ## c.full ## c.data })
+    if (fwdCover) {
+      bestCover := p(35 + 2 + 4)
+      bestOff   := p(35 + 2 + 3 downto 35 + 2).asUInt
+      bestSize.assignFromBits(p(35 + 1 downto 35))
+    }
     val o = Cand()
     o.valid      := anyV
     o.data       := p(31 downto 0)
@@ -1208,7 +1225,10 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     }
     o
   }
-  val fullValid = best.valid && best.full
+  // CPU_SQ_FWD_COVER: the youngest overlapping store covers the query but is not an exact
+  // (or LONG-subword) match: forward its bytes, right-aligned and zero-extended.
+  val coverFwd  = best.valid && !best.full && bestCover
+  val fullValid = best.valid && (best.full || coverFwd)
   // One common late-data mux after winner selection, not eight 32-bit muxes
   // ahead of the reduction tree. Geometry/age still select the youngest match.
   val forwardData = if(forwardOnPublish) Mux(best.publishing, io.publish.data, best.data) else best.data
@@ -1244,6 +1264,15 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     when(best.subword) {
       io.fwd.rsp.data := Mux(q.size === Size.BYTE, byteData.resize(32), wordData.resize(32))
     }
+  }
+  if (fwdCover) {
+    def nb(s: Size.C): UInt = s.mux(Size.BYTE -> U(1, 5 bits), Size.WORD -> U(2, 5 bits), default -> U(4, 5 bits))
+    // bytes between the query's end and the store's end = right shift in bytes (0..3)
+    val k = ((bestOff.resize(5) + nb(bestSize)) - (q.paddr(3 downto 0).resize(5) + nb(q.size)))(1 downto 0)
+    val sh = best.data >> (k << 3)
+    val cv = q.size.mux(Size.BYTE -> sh(7 downto 0).resize(32), Size.WORD -> sh(15 downto 0).resize(32),
+                        default -> sh)
+    when(coverFwd) { io.fwd.rsp.data := cv }
   }
   io.fwd.rsp.serial := serialStall
   // DELIBERATELY NOT `|| serialStall`.  Driving the boundary as a forwarding STALL
