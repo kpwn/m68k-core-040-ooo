@@ -1306,4 +1306,10 @@ object ShippingCoreConfig {
     * slot copy, so the 29 destination bits leave the 16-slot compacting array and the five
     * select muxes. Same values, same cycle. Default OFF; echoed in `SHIPPING_CONFIG`. */
   val iqDstCold: Boolean = envFlag("CPU_IQ_DST_COLD", false)
+  /** Area (fable `area5`): the IQ's dynamic-wakeup clears (and the slot spec mask) drop the
+    * per-source read qualifiers: a dynWait bit is only set at push together with its
+    * qualifier, so a clear of an unqualified source clears a bit that is already 0. Six
+    * qualifier bits leave the 16-slot compacting array. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val iqWaitNoValid: Boolean = envFlag("CPU_IQ_WAIT_NOVALID", false)
 }

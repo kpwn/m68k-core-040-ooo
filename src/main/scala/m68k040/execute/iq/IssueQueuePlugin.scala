@@ -1930,6 +1930,27 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
 
     /** Per-slot clear mask: bit b set => that source's producer completed this cycle.
       * Gated on `s.sel` exactly as every old `*WakeMatch` term was. */
+    // CPU_IQ_WAIT_NOVALID: a dynWait bit is only ever SET at push together with its source's
+    // read-qualifier (every *DepInit / *Dep1 term ANDs it), and the qualifier never changes
+    // afterwards, so clearing a bit whose qualifier is low clears a bit that is already 0.
+    // The clears (and the slot spec mask) therefore drop the qualifier, and the six
+    // qualifiers read only there leave the compacting slot array. Sim-asserted below.
+    val waitNoValid = m68k040.top.ShippingCoreConfig.iqWaitNoValid
+    def rq(b: Bool): Bool = if (waitNoValid) True else b
+    if (waitNoValid) GenerationFlags.simulation {
+      for (s <- slots) {
+        val u = s.hot; val w = s.dynWait
+        val q = Seq(DynWait.LS_A -> u.psrcAValid, DynWait.LS_B -> u.srcBRead, DynWait.LS_C -> u.psrcCValid,
+          DynWait.CPLX_A -> u.psrcAValid, DynWait.CPLX_B -> u.srcBRead, DynWait.CPLX_C -> u.psrcCValid,
+          DynWait.SLOW_A -> u.psrcAValid, DynWait.SLOW_B -> u.srcBRead, DynWait.SLOW_C -> u.psrcCValid,
+          DynWait.LS_NZVC -> u.readsNzvc, DynWait.CPLX_NZVC -> u.readsNzvc, DynWait.SLOW_NZVC -> u.readsNzvc,
+          DynWait.SLOW_X -> u.readsX, DynWait.FP_A -> u.psrcAFpValid, DynWait.FP_B -> u.psrcBFpValid,
+          DynWait.FPCC -> u.readsFpcc)
+        for ((b, v) <- q) when(s.sel && w(b)) {
+          assert(v, s"IssueQueuePlugin CPU_IQ_WAIT_NOVALID: dynWait bit $b set without its source qualifier", FAILURE)
+        }
+      }
+    }
     val dynClear = Vec(slots.map { s =>
       val u = s.hot
       val c = Bits(DynWait.width bits)
@@ -1964,26 +1985,26 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       def lsClr(read: Bool, tag: UInt, spec: Boolean): Bool =
         (lsW && read && (tag === lsWakeupPort.payload)) ||
           (if (!spec) False else lsSpecW && read && (tag === lsWakeupSpecPort.payload))
-      c(DynWait.LS_A)      := lsClr(u.psrcAValid, u.psrcA, spec = true)
-      c(DynWait.LS_B)      := lsClr(srcBIsReg(u),  u.psrcB, spec = false)
-      c(DynWait.LS_C)      := lsClr(u.psrcCValid, u.psrcC, spec = true)
-      c(DynWait.CPLX_A)    := cpW && u.psrcAValid && (u.psrcA === cplxWakeupPort.payload)
-      c(DynWait.CPLX_B)    := cpW && srcBIsReg(u) && (u.psrcB === cplxWakeupPort.payload)
-      c(DynWait.CPLX_C)    := cpW && u.psrcCValid && (u.psrcC === cplxWakeupPort.payload)
-      c(DynWait.SLOW_A)    := u.psrcAValid && slowIntWoke(u.psrcA)
-      c(DynWait.SLOW_B)    := srcBIsReg(u) && slowIntWoke(u.psrcB)
-      c(DynWait.SLOW_C)    := u.psrcCValid && slowIntWoke(u.psrcC)
-      c(DynWait.LS_NZVC)   := lsNzvcWakeupPort.valid && u.readsNzvc &&
+      c(DynWait.LS_A)      := lsClr(rq(u.psrcAValid), u.psrcA, spec = true)
+      c(DynWait.LS_B)      := lsClr(rq(srcBIsReg(u)),  u.psrcB, spec = false)
+      c(DynWait.LS_C)      := lsClr(rq(u.psrcCValid), u.psrcC, spec = true)
+      c(DynWait.CPLX_A)    := cpW && rq(u.psrcAValid) && (u.psrcA === cplxWakeupPort.payload)
+      c(DynWait.CPLX_B)    := cpW && rq(srcBIsReg(u)) && (u.psrcB === cplxWakeupPort.payload)
+      c(DynWait.CPLX_C)    := cpW && rq(u.psrcCValid) && (u.psrcC === cplxWakeupPort.payload)
+      c(DynWait.SLOW_A)    := rq(u.psrcAValid) && slowIntWoke(u.psrcA)
+      c(DynWait.SLOW_B)    := rq(srcBIsReg(u)) && slowIntWoke(u.psrcB)
+      c(DynWait.SLOW_C)    := rq(u.psrcCValid) && slowIntWoke(u.psrcC)
+      c(DynWait.LS_NZVC)   := lsNzvcWakeupPort.valid && rq(u.readsNzvc) &&
                               (u.pNzvcSrc === lsNzvcWakeupPort.payload)
-      c(DynWait.CPLX_NZVC) := cplxNzvcWakeupPort.valid && u.readsNzvc &&
+      c(DynWait.CPLX_NZVC) := cplxNzvcWakeupPort.valid && rq(u.readsNzvc) &&
                               (u.pNzvcSrc === cplxNzvcWakeupPort.payload)
-      c(DynWait.SLOW_NZVC) := u.readsNzvc && slowNzvcWoke(u.pNzvcSrc)
-      c(DynWait.SLOW_X)    := u.readsX    && slowXWoke(u.pXSrc)
-      c(DynWait.FP_A)      := cplxFpWakeupPort.valid && u.psrcAFpValid &&
+      c(DynWait.SLOW_NZVC) := rq(u.readsNzvc) && slowNzvcWoke(u.pNzvcSrc)
+      c(DynWait.SLOW_X)    := rq(u.readsX)    && slowXWoke(u.pXSrc)
+      c(DynWait.FP_A)      := cplxFpWakeupPort.valid && rq(u.psrcAFpValid) &&
                               (u.pFpSrcA === cplxFpWakeupPort.payload)
-      c(DynWait.FP_B)      := cplxFpWakeupPort.valid && u.psrcBFpValid &&
+      c(DynWait.FP_B)      := cplxFpWakeupPort.valid && rq(u.psrcBFpValid) &&
                               (u.pFpSrcB === cplxFpWakeupPort.payload)
-      c(DynWait.FPCC)      := cplxFpccWakeupPort.valid && u.readsFpcc &&
+      c(DynWait.FPCC)      := cplxFpccWakeupPort.valid && rq(u.readsFpcc) &&
                               (u.pFpccSrc === cplxFpccWakeupPort.payload)
       c.andMask(s.sel)
     })
@@ -2007,16 +2028,17 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // the announced load is still outstanding". Pushed uops take it from the push record.
     if (specAluOn) {
       val ann = specAluSrc.get._1
-      def specMaskOf(u: IqHot): Bits = {
+      def specMaskOf(u: IqHot, slot: Boolean = false): Bits = {
+        def q(b: Bool): Bool = if (slot) rq(b) else b
         val m = B(0, DynWait.width bits)
         // LS-class slots: LOADS only, ADDRESS operands only (B is store data, never
         // speculated -- see `lsSpecBlocked`). Other classes never read `aluWaitAny`.
-        m(DynWait.LS_A) := ann.valid && u.psrcAValid && (u.psrcA === ann.payload)
-        m(DynWait.LS_B) := ann.valid && !u.isLsClass && srcBIsReg(u) && (u.psrcB === ann.payload)
-        m(DynWait.LS_C) := ann.valid && u.psrcCValid && (u.psrcC === ann.payload)
+        m(DynWait.LS_A) := ann.valid && q(u.psrcAValid) && (u.psrcA === ann.payload)
+        m(DynWait.LS_B) := ann.valid && !u.isLsClass && q(srcBIsReg(u)) && (u.psrcB === ann.payload)
+        m(DynWait.LS_C) := ann.valid && q(u.psrcCValid) && (u.psrcC === ann.payload)
         m
       }
-      val slotMask = slots.map(s => specMaskOf(s.hot))
+      val slotMask = slots.map(s => specMaskOf(s.hot, slot = true))
       val push0Mask = specMaskOf(pushHot0)
       val push1Mask = specMaskOf(pushHot1)
       for (i <- 0 until slotCount) {
