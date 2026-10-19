@@ -748,12 +748,12 @@ object ShippingCoreConfig {
     *     (a same-line load cannot evict the store's line).
     * Measured together: B2B alone regresses the byte-copy `-cb` kernels (+0.5..1.5% sim);
     * the three together do not. */
-  val dcacheStoreSameLine: Boolean = envFlag("CPU_DCACHE_STORE_B2B", false)
+  val dcacheStoreSameLine: Boolean = envFlag("CPU_DCACHE_STORE_B2B", true)
   /** Timing-only companion to CPU_DCACHE_STORE_B2B (default OFF, cycle-identical): the MSHR
     * array-write probe-staleness hint is built compare-then-select (`DcachePlugin`
     * `nbArrayWriteHitVec`), taking the store-S2/S3 -> install/invalidate arbitration off the
     * front of the early-probe -> load-command -> data-RAM address path. */
-  val dcacheStoreB2bRetime: Boolean = envFlag("CPU_DCACHE_STORE_B2B_RETIME", false)
+  val dcacheStoreB2bRetime: Boolean = envFlag("CPU_DCACHE_STORE_B2B_RETIME", true)
   require(!dcacheStoreSameLine || dcacheNonBlocking,
     "CPU_DCACHE_STORE_B2B=1 requires the non-blocking D-cache")
   require(!dcacheNbProbeMissStage || (dcacheNonBlocking && !dcacheSectored),
@@ -848,13 +848,13 @@ object ShippingCoreConfig {
     * next push (12 cycles per call on the copyback call-return kernel). Split, A7 += 4
     * is a 1-cycle ALU op off the push's early A7. Costs one ROB/IQ entry per RTS.
     * Read by `MicroOpAssembler`. Default OFF. */
-  val rtsSplitA7: Boolean = envFlag("CPU_RTS_SPLIT_A7", false)
+  val rtsSplitA7: Boolean = envFlag("CPU_RTS_SPLIT_A7", true)
   /** CPU_RTD_PRECISE_A7: RTD's A7 dealloc is computed into T1 by the (dropped) ADD and
     * committed by the ibranch itself (A7 := T1), so an RTD whose popped return address is
     * odd leaves A7 unchanged (68040 restart semantics). Without it the separate A7 ADD
     * retires before the ibranch raises the address error and A7 has already moved.
     * Read by `MicroOpAssembler`. Default OFF. */
-  val rtdPreciseA7: Boolean = envFlag("CPU_RTD_PRECISE_A7", false)
+  val rtdPreciseA7: Boolean = envFlag("CPU_RTD_PRECISE_A7", true)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
