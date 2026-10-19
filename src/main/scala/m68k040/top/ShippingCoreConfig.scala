@@ -749,6 +749,11 @@ object ShippingCoreConfig {
     * Measured together: B2B alone regresses the byte-copy `-cb` kernels (+0.5..1.5% sim);
     * the three together do not. */
   val dcacheStoreSameLine: Boolean = envFlag("CPU_DCACHE_STORE_B2B", false)
+  /** Timing-only companion to CPU_DCACHE_STORE_B2B (default OFF, cycle-identical): the MSHR
+    * array-write probe-staleness hint is built compare-then-select (`DcachePlugin`
+    * `nbArrayWriteHitVec`), taking the store-S2/S3 -> install/invalidate arbitration off the
+    * front of the early-probe -> load-command -> data-RAM address path. */
+  val dcacheStoreB2bRetime: Boolean = envFlag("CPU_DCACHE_STORE_B2B_RETIME", false)
   require(!dcacheStoreSameLine || dcacheNonBlocking,
     "CPU_DCACHE_STORE_B2B=1 requires the non-blocking D-cache")
   require(!dcacheNbProbeMissStage || (dcacheNonBlocking && !dcacheSectored),
