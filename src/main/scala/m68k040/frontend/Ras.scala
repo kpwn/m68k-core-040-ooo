@@ -280,10 +280,21 @@ class RasPlugin(val branchRepair: Boolean = false,
     // A wrong-path push on the snapshot-apply cycle must not land one cycle LATER on top of
     // the restored top-of-stack (it would if its slot is `snapSp-1`), so it is dropped
     // exactly like a push on a restore cycle. `snapApply` is a bare register Q.
-    val pendValid = if (branchSnapshot) RegNext(pushValid && !checkpointRestore && !snapApply) init False
-                    else RegNext(pushValid && !checkpointRestore) init False
-    val pendIdx   = RegNext(rasSp)
-    val pendData  = RegNext(pushRetPc)
+    val pendValidRef = if (branchSnapshot) RegNext(pushValid && !checkpointRestore && !snapApply) init False
+                       else RegNext(pushValid && !checkpointRestore) init False
+    // CPU_RAS_CK_PEND: the checkpoint stores the RAW `ras` rows plus a copy of the parked
+    // write ({ckPendValid, ckPendIdx, ckPendData}); a restore reloads the parked write from
+    // that copy instead of resolving it into every checkpoint row at save time. The LOGICAL
+    // stack (`ras` overridden by the parked write) after a restore is the same checkpoint,
+    // and every reader already goes through that override. Drops the 16x32 save-side mux.
+    val ckPendOn    = m68k040.top.ShippingCoreConfig.rasCkPend
+    val ckPendValid = if (ckPendOn) (Reg(Bool()) init False) else null
+    val ckPendIdx   = if (ckPendOn) Reg(UInt(spBits bits)) else null
+    val ckPendData  = if (ckPendOn) Reg(UInt(32 bits)) else null
+    val pendValid = if (!ckPendOn) pendValidRef
+                    else RegNext(Mux(checkpointRestore, ckPendValid, pushValid && (if (branchSnapshot) !snapApply else True))) init False
+    val pendIdx   = if (!ckPendOn) RegNext(rasSp) else RegNext(Mux(checkpointRestore, ckPendIdx, rasSp))
+    val pendData  = if (!ckPendOn) RegNext(pushRetPc) else RegNext(Mux(checkpointRestore, ckPendData, pushRetPc))
     pendValid.simPublic(); pendIdx.simPublic(); pendData.simPublic()
     def rasView(i: Int): UInt = Mux(pendValid && pendIdx === U(i, spBits bits), pendData, ras(i))
     when(pendValid) { ras(pendIdx) := pendData }
@@ -380,7 +391,6 @@ class RasPlugin(val branchRepair: Boolean = false,
         when(snapCount =/= U(0, cntBits bits)) { ras(tosIdx) := snapTos }
       }
     } else null
-
     // ---- live post-group state for DecodeStage's per-tag snapshot table ----
     // Register Qs plus the existing push-bypassed top-of-stack read (`predTarget`).
     val snapLive = m68k040.services.RasSnapRec()
@@ -452,7 +462,25 @@ class RasPlugin(val branchRepair: Boolean = false,
       ckRasSp := rasSp
       ckCount := count
       // rasView: the parked push from the ARMING cycle has not reached `ras` Q yet.
-      for (i <- 0 until entries) { ckRas(i) := rasView(i) }
+      if (!ckPendOn) for (i <- 0 until entries) { ckRas(i) := rasView(i) }
+      else {
+        for (i <- 0 until entries) { ckRas(i) := ras(i) }
+        ckPendValid := pendValid; ckPendIdx := pendIdx; ckPendData := pendData
+      }
+    }
+    // Sim-only shadow of the reference checkpoint (rows resolved at save, restore copies
+    // them back with no parked write): after every restore the logical stack must match.
+    if (ckPendOn) GenerationFlags.simulation {
+      val refCk = Vec.fill(entries)(Reg(UInt(32 bits)))
+      val refValid = Reg(Bool()) init False
+      when(ckSaveNow) { for (i <- 0 until entries) refCk(i) := rasView(i); refValid := True }
+      val chk = RegNext(checkpointRestore && refValid) init False
+      val refAtRestore = RegNext(refCk)
+      when(chk) {
+        for (i <- 0 until entries)
+          assert(rasView(i) === refAtRestore(i),
+            "RAS CPU_RAS_CK_PEND: restored logical stack diverged from the reference checkpoint", FAILURE)
+      }
     }
 
     // ---- checkpointRestore: undo any wrong-path push/pop since the last save by

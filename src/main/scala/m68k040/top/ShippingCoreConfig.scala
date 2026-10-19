@@ -1296,4 +1296,9 @@ object ShippingCoreConfig {
     * mapping instead of two muxes plus a location mux. Same function of the same registers.
     * Default OFF; echoed in `SHIPPING_CONFIG`. */
   val ratEffRead: Boolean = envFlag("CPU_RAT_EFF_READ", false)
+  /** Area (fable `area5`): the RAS checkpoint copies the raw stack rows plus the one parked
+    * payload write, and a restore reloads the parked write, instead of resolving the parked
+    * write into all 16x32 checkpoint rows at save time. Same logical stack. Default OFF;
+    * echoed in `SHIPPING_CONFIG`. */
+  val rasCkPend: Boolean = envFlag("CPU_RAS_CK_PEND", false)
 }

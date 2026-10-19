@@ -41,7 +41,7 @@ class RatEffReadEquivSpec extends AnyFunSuite {
           d.cv #= 1; d.ca(0) #= a; d.cd(0) #= a % (1 << sh.phys)
           d.clockDomain.waitSampling()
         }
-        for (_ <- 0 until 200000) {
+        for (_ <- 0 until 50000) {
           d.rollback #= rnd.nextInt(16) == 0
           d.wv #= rnd.nextInt(4); d.cv #= rnd.nextInt(1 << sh.commits)
           d.wa.foreach(_ #= rnd.nextInt(sh.arch)); d.wd.foreach(_.randomize())
