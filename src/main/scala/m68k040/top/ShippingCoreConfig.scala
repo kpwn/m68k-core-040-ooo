@@ -1286,4 +1286,9 @@ object ShippingCoreConfig {
     * queue still never holds more than 16 µops, so every downstream depth bound is unchanged.
     * Default OFF; echoed in `SHIPPING_CONFIG`. */
   val uopqExactReady: Boolean = envFlag("CPU_UOPQ_EXACT_READY", false)
+  /** IPC (fable `area5`): the fetch-issue IBuf reservation counts each outstanding window
+    * by the words it will actually push (`ringKeep - ringDrop`) instead of a flat 4, and the
+    * IBuf's push-ready checks the push's own word count. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val feExactResv: Boolean = envFlag("CPU_FE_EXACT_RESV", false)
 }
