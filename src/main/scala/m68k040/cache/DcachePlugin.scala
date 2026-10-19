@@ -357,6 +357,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    storeB2bFlag: Boolean = m68k040.top.ShippingCoreConfig.dcacheStoreSameLine,
                    storeD1FwdFlag: Boolean = m68k040.top.ShippingCoreConfig.dcacheStoreSameLine,
                    storeLdLineFlag: Boolean = m68k040.top.ShippingCoreConfig.dcacheStoreSameLine,
+                   /** CPU_DCACHE_STORE_B2B_RETIME: flatten the MSHR array-write probe-staleness
+                     * hint (see `nbArrayWriteHitVec`). Logically identical; timing only. */
+                   storeB2bRetimeFlag: Boolean = m68k040.top.ShippingCoreConfig.dcacheStoreB2bRetime,
                    /** Legacy-cache allocate-without-fill for a complete 16-byte COPYBACK store.
                      * Non-blocking mode implements this natively from its merge strobe. */
                    val fullLineNoFill: Boolean = m68k040.top.ShippingCoreConfig.dcacheFullLineNoFill,
@@ -406,6 +409,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
   val storeB2b: Boolean    = storeB2bFlag && nonBlocking
   val storeD1Fwd: Boolean  = storeD1FwdFlag && nonBlocking
   val storeLdLine: Boolean = storeLdLineFlag && nonBlocking
+  val storeB2bRetime: Boolean = storeB2bRetimeFlag && nonBlocking
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
   require(!nonBlocking || (nMshr >= 2 && nMshr <= 4), "DcachePlugin: nMshr must be 2..4 (hot-door ID is 2 bits)")
@@ -1094,6 +1098,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     /** An MSHR array write (install or victim invalidate) this cycle, for probe staleness. */
     val nbArrayWrite: Bool    = if (!nonBlocking) null else Bool()
     val nbArrayWriteSet: UInt = if (!nonBlocking) null else UInt(setBits bits)
+    /** `storeB2bRetime`: per early-probe entry, exactly `nbArrayWrite && nbArrayWriteSet ===
+      * entry set`, built as compare-then-select (MSHR set vs entry set, both flops) instead
+      * of select-then-compare behind the deep invalidate/install arbitration. Driven in `nb`. */
+    val nbArrayWriteHitVec: Vec[Bool] = if (!storeB2bRetime) null else Vec(Bool(), earlyProbeDepth)
     /** MSHR allocation advances this set's victim pointer on this edge. */
     val nbVictimAdvanceForCmd: Bool = if (!nonBlocking) null else Bool()
     /** Registered-input hold on store S1 -> S2 (set/victim/resource interlocks). */
@@ -1649,6 +1657,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
                                      (if (!sectored) missSet === setBitsOf
                                       else lineOf(missSet) === lineOf(setBitsOf)))
       earlyProbeSetWriteVec(i) := (if (!nonBlocking) legacySetWrite
+                                   else if (storeB2bRetime) legacySetWrite || nbArrayWriteHitVec(i)
                                    else legacySetWrite || (nbArrayWrite && (nbArrayWriteSet === setBitsOf)))
     }
     // Task pea-cache-evict-2026-08-19 fix: `earlyProbeSetWriteVec` above is a purely
@@ -6667,6 +6676,27 @@ class DcachePlugin(val socketMerged: Boolean = false,
       }
       GenerationFlags.simulation {
         assert(!instAny || instMayWrite, "DcachePlugin.nb: install not covered by the probe staleness hint", FAILURE)
+      }
+      if (storeB2bRetime) {
+        // Same value as `nbArrayWrite && nbArrayWriteSet === pSet`: the two arms are
+        // exclusive (`instHoldNoS1` carries `anyInv`), the install arm wins the when-chain
+        // above, and `instHeadOH`/`invOH` are one-hot whenever their arm fires, so
+        // `eset(OHToUInt(oh)) === pSet` is `OR_k(oh(k) && eset(k) === pSet)`. The per-MSHR
+        // set compares and the install half are functions of flops only; the deep
+        // `invOH`/`instMayWrite` terms now enter at the last AND/OR instead of steering a
+        // set mux that feeds a comparator.
+        for (i <- 0 until earlyProbeDepth) {
+          val pSet = earlyProbeVaddrs(i)(offBits + setBits - 1 downto offBits)
+          val m = Vec((0 until N).map(k => eset(k) === pSet))
+          val invHit  = (0 until N).map(k => invOH(k) && m(k)).reduce(_ || _)
+          val instHit = (0 until N).map(k => instHeadOH(k) && m(k)).reduce(_ || _)
+          nbArrayWriteHitVec(i) := Mux(instMayWrite, instHit, invHit)
+          GenerationFlags.simulation {
+            assert(nbArrayWriteHitVec(i) === (nbArrayWrite && (nbArrayWriteSet === pSet)),
+              "DcachePlugin(storeB2bRetime): nbArrayWriteHitVec drifted from nbArrayWrite/nbArrayWriteSet",
+              FAILURE)
+          }
+        }
       }
       // 200 MHz timing: the data-array write DATA, write SET and tag DATA no longer sit
       // behind the deep `instAny`/`eway(instIdx)` select. In non-blocking mode the data
