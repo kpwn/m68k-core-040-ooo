@@ -341,7 +341,9 @@ class DcacheStorePortReservationSpec extends AnyFunSuite {
       assert(g.nonEmpty, "the run produced no measurable S2-to-S2 gaps at all")
       assert(t.denials > 0,
         "the store must actually have been denied the port at least once in this regime")
-      assert(!g.contains(2),
+      // CPU_DCACHE_STORE_D1FWD replaces that hold by a forward from the registered last
+      // S3 write, so a two-cycle gap is then LEGAL; the array check above still applies.
+      if (!dut.dcache.storeD1Fwd) assert(!g.contains(2),
         s"a TWO-cycle S2 gap must never be observable -- stS1SameLineAsS3 converts it to 3 " +
         s"(gaps=${g.mkString(",")})")
       info(s"probe-demand run: S2 gaps=${g.mkString(",")} stS2UsesS3Line=${t.gapOneFwd} " +
@@ -362,7 +364,7 @@ class DcacheStorePortReservationSpec extends AnyFunSuite {
         val base = 0x9200L + (gap * 2 + (if (demand) 1 else 0)) * 0x40L
         val t = sameLineByteRun(dut, cd, mem, base, 6, producerGap = gap, probeDemand = demand)
         val g = t.gaps(base & ~0xFL, 0xFL)
-        assert(!g.contains(2),
+        if (!dut.dcache.storeD1Fwd) assert(!g.contains(2),
           s"a TWO-cycle S2 gap must never be observable (gaps=${g.mkString(",")})")
         info(s"gap=$gap demand=$demand S2 gaps=${g.mkString(",")} " +
              s"fwd=${t.gapOneFwd} hold=${t.sameLineHold}")

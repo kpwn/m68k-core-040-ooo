@@ -354,6 +354,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val fpuCmd   = Bits(16 bits)
     val fpuImm = Bool()
     val fpuImmTag = UInt(m68k040.Global.FP_IMM_TAG_W bits)
+    // CPU_RTS_SPLIT_A7: this entry is a split RTS's ibranch, whose crack-mate ADD has
+    // already retired A7 += 4. An address error raised by it must give the 4 bytes back.
+    val retUndo4 = if (m68k040.top.ShippingCoreConfig.rtsSplitA7) Bool() else null
   }
 
   /** COMPLETION-TIME per-entry fault record (ROB-fold Slice C).
@@ -1125,6 +1128,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
         (u.fpSrcKind === FpSrcKind.INTIMM || u.fpSrcKind === FpSrcKind.SINGLEIMM ||
          u.fpSrcKind === FpSrcKind.DOUBLEIMM || u.fpSrcKind === FpSrcKind.EXTIMM)
       p.fpuImmTag := u.imm(m68k040.Global.FP_IMM_TAG_W - 1 downto 0).asUInt
+      if (m68k040.top.ShippingCoreConfig.rtsSplitA7)
+        p.retUndo4 := u.ibranch && u.isReturn && !u.pdstValid && (u.anInc === 4)
       p
     }
 
@@ -3081,7 +3086,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
       // only at vector-11 delivery. ROB-fold task #249: now payload.fpuUnimp/fpuCmd.
       entryFpuUnimp = p0.fpuUnimp,
       entryFpuCmd   = p0.fpuCmd,
-      entryFpuImmediate = p0.fpuImm)
+      entryFpuImmediate = p0.fpuImm,
+      entryRetUndo4 = (if (m68k040.top.ShippingCoreConfig.rtsSplitA7) p0.retUndo4 else False))
     _serializedInstructionActive := exc.serializedInstructionActive
     _serializedInstructionSupervisor := exc.serializedInstructionSupervisor
     _serializedInstructionCacheMode := exc.serializedInstructionCacheMode

@@ -973,6 +973,10 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       // when requested, so every row describes a steady-state dependency hop.
       val traceSteady = sys.env.get("MB_TRACE_STEADY").contains("1")
       val traceLines = ArrayBuffer.empty[String]
+      val robTraceOn = sys.env.get("IPC_ROB_TRACE").exists(p => p.nonEmpty && k.name.startsWith(p))
+      val robTraceFrom = sys.env.get("IPC_ROB_TRACE_FROM").map(_.toInt).getOrElse(0)
+      val robTraceN = sys.env.get("IPC_ROB_TRACE_N").map(_.toInt).getOrElse(120)
+      val robTraceLines = ArrayBuffer.empty[String]
       val lsEventsOn = sys.env.get("IPC_LS_EVENTS").exists(p => p.nonEmpty && k.name.startsWith(p))
       val iqHolOn = sys.env.get("IQ_HOL").contains("1")
       // IPC_STALL_BUDGET=1: collect the per-cycle STALL BUDGET (see `StallBudget`).
@@ -1708,6 +1712,25 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
             !dut.lsEu.logic.compIsFault.toBoolean &&
             (((dut.lsEu.logic.compRobId.toInt - head) & mask) > ((d.ctx.robId.toInt - head) & mask))
         }
+        // IPC_ROB_TRACE=<kernel-prefix>: per-cycle ROB timeline (head pc, occupancy,
+        // completion bitmap from head, LS issue/writeback robIds). IPC_ROB_TRACE_FROM=<macros>
+        // starts it after that many retired macros; IPC_ROB_TRACE_N caps the rows (default 120).
+        if (robTraceOn && robTraceLines.size < robTraceN && countedMacros >= robTraceFrom) {
+          val rob = dut.rob.logic
+          val occ = rob.count.toInt; val h = rob.head.toInt
+          val comp = (0 until scala.math.min(occ, 24)).map(i =>
+            if (rob.completes((h + i) % rob.depth).toBoolean) 'C' else '.').mkString
+          val lsIss = if (dut.lsEu.issuePort.valid.toBoolean && dut.lsEu.issuePort.ready.toBoolean)
+            s"${dut.lsEu.issuePort.payload.robId.toInt}" else "-"
+          val lsWb = if (dut.lsEu.logic.wbObs.valid.toBoolean) s"${dut.lsEu.logic.wbObs.robId.toInt}" else "-"
+          val hpc = if (occ > 0) f"${rob.p0.pc.toLong & 0xffffffffL}%08x" else "--------"
+          val fd = dut.dec.logic.fed
+          val dec = if (fd.valid.toBoolean && fd.ready.toBoolean)
+            f"${fd.payload.packets(0).pc.toLong & 0xfff}%03x" +
+              (if (fd.payload.slot1Valid.toBoolean) f"+${fd.payload.packets(1).pc.toLong & 0xfff}%03x" else "    ")
+            else if (fd.valid.toBoolean) "stall   " else "--      "
+          robTraceLines += f"$telemCycle%5d h=$h%2d n=$occ%2d pc=$hpc ret=${rob.retireLanes.count(_.toBoolean)} m=$macrosThisCycle ls=$lsIss%3s lswb=$lsWb%3s fl=${if (rob.flushing.toBoolean) "F" else "-"} dec=$dec $comp"
+        }
         countedMacros += acceptedMacros
         if (macrosThisCycle > 0) {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
@@ -2341,6 +2364,11 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
         dcLdMissHisto.slice(lo, hi + 1).count(identity),
         t2BranchRedirects,
         stallBudget, firstCommitCycle, lastCommitCycle)
+      if (robTraceOn) {
+        println(s"=== ROB TRACE: ${k.name} (from macro $robTraceFrom) ===")
+        robTraceLines.foreach(println)
+        println(s"=== end ROB trace ===")
+      }
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println(if (dut.dcache.nonBlocking)

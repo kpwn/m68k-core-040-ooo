@@ -736,6 +736,26 @@ object ShippingCoreConfig {
   /** Experimental reuse of a resolved, clean-victim VIPT probe miss in the existing
     * MSHR allocation stage. Dirty or stale probes use the ordinary S1 path. */
   val dcacheNbProbeMissStage: Boolean = envFlag("CPU_DCACHE_NB_PROBE_MISS_STAGE", false)
+
+  /** Non-blocking D-cache store pipe: same-line stores stop waiting for each other.
+    * Default OFF. Three mechanisms, all qualified by flops (see `DcachePlugin`):
+    *   - B2B: a COPYBACK store directly behind an older COPYBACK store to the SAME line
+    *     advances S1->S2 back to back (the older store's S2 is no longer a same-set hold),
+    *     taking the older store's merged line through the existing `stS2UsesS3Line`;
+    *   - D1 forward: the `stS1SameLineAsS3` read-launch HOLD becomes a forward from the
+    *     registered copy of the last S3 write (`stS3WriteLineD1`);
+    *   - same-line load: a load in S1 of the store's OWN line no longer holds the store
+    *     (a same-line load cannot evict the store's line).
+    * Measured together: B2B alone regresses the byte-copy `-cb` kernels (+0.5..1.5% sim);
+    * the three together do not. */
+  val dcacheStoreSameLine: Boolean = envFlag("CPU_DCACHE_STORE_B2B", false)
+  /** Timing-only companion to CPU_DCACHE_STORE_B2B (default OFF, cycle-identical): the MSHR
+    * array-write probe-staleness hint is built compare-then-select (`DcachePlugin`
+    * `nbArrayWriteHitVec`), taking the store-S2/S3 -> install/invalidate arbitration off the
+    * front of the early-probe -> load-command -> data-RAM address path. */
+  val dcacheStoreB2bRetime: Boolean = envFlag("CPU_DCACHE_STORE_B2B_RETIME", false)
+  require(!dcacheStoreSameLine || dcacheNonBlocking,
+    "CPU_DCACHE_STORE_B2B=1 requires the non-blocking D-cache")
   require(!dcacheNbProbeMissStage || (dcacheNonBlocking && !dcacheSectored),
     "CPU_DCACHE_NB_PROBE_MISS_STAGE=1 requires unsectored non-blocking D-cache")
   /** Integer PRF read-port diet, 17 -> 14 (Fable review item 8, §5.4). Default OFF.
@@ -821,6 +841,20 @@ object ShippingCoreConfig {
     * unchanged. Default OFF: with it off the ROM content and every width are as before.
     * Read by `Microcode`, `DecodeContracts`, `DecodeStage`, `OperationDecoder`. */
   val upc10: Boolean = envFlag("CPU_UPC10", true)
+  /** CPU_RTS_SPLIT_A7: crack RTS as [load.l (A7) -> T0] + [A7 := A7 + 4 (drop)] +
+    * [ibranch -> T0] (the RTD shape with a zero displacement) instead of folding A7 += 4
+    * into the ibranch. The folded form makes the new A7 wait for the return-address LOAD,
+    * so a call/return loop's stack pointer recurrence runs push -> pop load -> ibranch ->
+    * next push (12 cycles per call on the copyback call-return kernel). Split, A7 += 4
+    * is a 1-cycle ALU op off the push's early A7. Costs one ROB/IQ entry per RTS.
+    * Read by `MicroOpAssembler`. Default OFF. */
+  val rtsSplitA7: Boolean = envFlag("CPU_RTS_SPLIT_A7", false)
+  /** CPU_RTD_PRECISE_A7: RTD's A7 dealloc is computed into T1 by the (dropped) ADD and
+    * committed by the ibranch itself (A7 := T1), so an RTD whose popped return address is
+    * odd leaves A7 unchanged (68040 restart semantics). Without it the separate A7 ADD
+    * retires before the ibranch raises the address error and A7 has already moved.
+    * Read by `MicroOpAssembler`. Default OFF. */
+  val rtdPreciseA7: Boolean = envFlag("CPU_RTD_PRECISE_A7", false)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
