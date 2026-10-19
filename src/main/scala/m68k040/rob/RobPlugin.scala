@@ -694,6 +694,27 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // cycle the value lands); sysRetire gates on it so the write triggers only AFTER the
     // value is captured. RegInit(False), reset per-alloc (mirrors faultedStore).
     val sysValRdyStore  = Vec.fill(depth)(RegInit(False))
+    // CPU_ROB_SYSRDY_SLOT: every reader of `sysValRdyStore(idx)` is gated to an entry that
+    // owns a capture slot (`sysOp`, or `sysKind === sysAuxCapKind` -- exactly `sysCapNeed`,
+    // reserved at alloc), so "value landed" lives in that slot (cleared at reserve, set by
+    // the same tag-matched completion that fills its data) instead of a 32-entry array
+    // written by every completion port. Sim-asserted against the array at every read.
+    val sysRdySlot   = m68k040.top.ShippingCoreConfig.robSysRdySlot
+    val sysCapLanded = if (sysRdySlot) Vec.fill(sysCapDepth)(RegInit(False)) else null
+    def sysValRdy(idx: UInt): Bool = if (!sysRdySlot) sysValRdyStore(idx) else {
+      val v = (0 until sysCapDepth).map(k => sysCapValid(k) && sysCapLanded(k) && (sysCapTag(k) === idx))
+        .reduceBalancedTree(_ || _)
+      GenerationFlags.simulation { v.simPublic() }
+      v
+    }
+    def sysValRdyChecked(idx: UInt, need: Bool): Bool = {
+      val v = sysValRdy(idx)
+      if (sysRdySlot) GenerationFlags.simulation {
+        when(need) { assert(v === sysValRdyStore(idx),
+          "RobPlugin CPU_ROB_SYSRDY_SLOT: slot-held value-landed bit diverged from the per-entry array", FAILURE) }
+      }
+      v
+    }
     // ── Task 9b: FMOVEM control-register LIST form — commit-time value capture ──────
     // Three 32-bit side registers holding the load direction's transfer values, one per
     // POSITION in the register list. `ExceptionUnit`'s single-value `sysVal` side channel
@@ -1299,7 +1320,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // Gated on sysValRdyStore so a WRITE-direction sysOp triggers only AFTER its source
     // VALUE has been captured (the EU's `completion` precedes its `wbObs` by one cycle).
     // The READ direction also waits one harmless extra cycle (its wbObs sets the flag too).
-    val sysRetire   = headReady && p0.sysOp && sysValRdyStore(h0) &&
+    val sysRetire   = headReady && p0.sysOp && sysValRdyChecked(h0, headReady && p0.sysOp) &&
                       !faultedStore(h0) && !p0.isRte &&
                       excIdle; sysRetire.simPublic()
 
@@ -1392,8 +1413,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // hardware-scope val makes SpinalHDL's reflective auto-naming rename the element
     // itself, which then leaks out through `.toEnum.toString` anywhere in the design.
     def sysAuxCapKind = m68k040.decode.SysKind.FPCTRL_CAP
-    val sysAuxRdy0 = (p0.sysKind =/= sysAuxCapKind) || sysValRdyStore(h0)
-    val sysAuxRdy1 = (p1.sysKind =/= sysAuxCapKind) || sysValRdyStore(h1)
+    val sysAuxRdy0 = (p0.sysKind =/= sysAuxCapKind) || sysValRdyChecked(h0, count > 0 && p0.sysKind === sysAuxCapKind)
+    val sysAuxRdy1 = (p1.sysKind =/= sysAuxCapKind) || sysValRdyChecked(h1, count > 1 && p1.sysKind === sysAuxCapKind)
     debugBreakpointBoundaryHit := (count > 0) && p0.first && p0.debugBreakValid &&
       excIdle && !flushing && !stopped && !coreHalted &&
       ((debugHaltState === DebugHaltState.RUNNING) ||
@@ -1581,7 +1602,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
       }
       val allReady = (0 until retireWidth).map { lane =>
         (target <= lane) || (ordinary(lane) && completes(retireIds(lane)) &&
-          ((retirePayloads(lane).sysKind =/= sysAuxCapKind) || sysValRdyStore(retireIds(lane))))
+          ((retirePayloads(lane).sysKind =/= sysAuxCapKind) || sysValRdy(retireIds(lane))))
       }.reduce(_ && _)
       val fire = active && ready && (base === head) && (target >= 3) && retire1 && contextOk && allReady
       val advance = Mux(retire1, U(2), Mux(retire0, U(1), U(0))).resize(target.getWidth)
@@ -1634,7 +1655,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
       } else retireLanes(lane) := retireLanes(lane - 1) && (count > lane) && completes(id) &&
         !(irqBoundaryHold && retirePayloads.take(lane).map(_.last).reduce(_ || _)) &&
         !faultedStore(id) && !p.retireAlone && !p.isRte && !p.needsSup && !p.sysOp &&
-        !p.debugBreakValid && ((p.sysKind =/= sysAuxCapKind) || sysValRdyStore(id)) &&
+        !p.debugBreakValid && ((p.sysKind =/= sysAuxCapKind) || sysValRdyChecked(id, count > U(lane) && p.sysKind === sysAuxCapKind)) &&
         !p0.retireAlone && !haltAfterArmedIn && !debugStopRequestIn && !a7OddStopReq && !pcRangeStopReq &&
         !haltA7OddEnIn && !haltPcRangeEnIn &&
         (debugHaltState === DebugHaltState.RUNNING) &&
@@ -2416,8 +2437,10 @@ class RobPlugin(val detailedPerf: Boolean = false,
       for (c <- ccrCompletion) {
         when(c.valid && sysCapValid(k) && (sysCapTag(k) === c.payload.robId)) {
           sysCapData(k) := c.payload.result
+          if (sysRdySlot) sysCapLanded(k) := True
         }
       }
+      if (sysRdySlot) when(take0 || take1) { sysCapLanded(k) := False }
     }
     // Consumed by `allocReadySig` below. 0..sysCapDepth, so log2Up(sysCapDepth+1) bits.
     val sysCapFreeNext = CountOne(sysCapValidNext.map(!_))

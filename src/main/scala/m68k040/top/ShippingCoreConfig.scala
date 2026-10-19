@@ -1312,4 +1312,9 @@ object ShippingCoreConfig {
     * qualifier bits leave the 16-slot compacting array. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val iqWaitNoValid: Boolean = envFlag("CPU_IQ_WAIT_NOVALID", false)
+  /** Area (fable `area5`): the ROB's "system-op value landed" bit lives in the op's capture
+    * slot (8 entries, set by the same tag-matched completion that fills the value) instead
+    * of a 32-entry per-ROB-entry array written by every completion port; every reader is
+    * gated to an entry that owns a slot. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val robSysRdySlot: Boolean = envFlag("CPU_ROB_SYSRDY_SLOT", false)
 }
