@@ -31,7 +31,9 @@ case class RatTable(
     writePorts:  Int,
     commitPorts: Int,
     readPorts:   Int,
-    prepared: Boolean = false
+    prepared: Boolean = false,
+    /** `CPU_RAT_EFF_READ` (see ShippingCoreConfig.ratEffRead). */
+    effRead: Boolean = m68k040.top.ShippingCoreConfig.ratEffRead
 ) extends Component {
 
   val io = new Bundle {
@@ -132,10 +134,16 @@ case class RatTable(
   }
 
   // ── Combinational reads ───────────────────────────────────────────────────
+  // CPU_RAT_EFF_READ: resolve `location` ONCE per arch register (registers only), so each
+  // read port is a single archDepth:1 mux instead of two plus a location mux. Same function.
+  val effMap = if (effRead) Vec((0 until archDepth).map(a => Mux(location(a), specReg(a), commReg(a)))) else null
   for (r <- 0 until readPorts) {
-    val written   = specReg(io.reads(r).addr)
-    val committed = commReg(io.reads(r).addr)
-    io.reads(r).data := Mux(location(io.reads(r).addr), written, committed)
+    if (effRead) io.reads(r).data := effMap(io.reads(r).addr)
+    else {
+      val written   = specReg(io.reads(r).addr)
+      val committed = commReg(io.reads(r).addr)
+      io.reads(r).data := Mux(location(io.reads(r).addr), written, committed)
+    }
   }
 
   // Surface the committed phys mappings (commit RAM only) as output ports.

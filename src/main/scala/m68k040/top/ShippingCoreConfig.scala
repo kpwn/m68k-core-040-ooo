@@ -1291,4 +1291,9 @@ object ShippingCoreConfig {
     * IBuf's push-ready checks the push's own word count. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val feExactResv: Boolean = envFlag("CPU_FE_EXACT_RESV", false)
+  /** Area (fable `area5`): each RAT resolves its spec/committed `location` select ONCE per
+    * architectural register, so every read port is one archDepth:1 mux of the effective
+    * mapping instead of two muxes plus a location mux. Same function of the same registers.
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val ratEffRead: Boolean = envFlag("CPU_RAT_EFF_READ", false)
 }
