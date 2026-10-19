@@ -1286,11 +1286,6 @@ object ShippingCoreConfig {
     * queue still never holds more than 16 µops, so every downstream depth bound is unchanged.
     * Default OFF; echoed in `SHIPPING_CONFIG`. */
   val uopqExactReady: Boolean = envFlag("CPU_UOPQ_EXACT_READY", false)
-  /** IPC (fable `area5`): the fetch-issue IBuf reservation counts each outstanding window
-    * by the words it will actually push (`ringKeep - ringDrop`) instead of a flat 4, and the
-    * IBuf's push-ready checks the push's own word count. Default OFF; echoed in
-    * `SHIPPING_CONFIG`. */
-  val feExactResv: Boolean = envFlag("CPU_FE_EXACT_RESV", false)
   /** Area (fable `area5`): each RAT resolves its spec/committed `location` select ONCE per
     * architectural register, so every read port is one archDepth:1 mux of the effective
     * mapping instead of two muxes plus a location mux. Same function of the same registers.

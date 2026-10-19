@@ -90,11 +90,7 @@ class InstructionBuffer(retime: Boolean = false,
   // NB: use a width-extending add (+^) so a near-full `count + PUSH_WORDS` does not
   // overflow the `count` width and spuriously report ready while the buffer is FULL
   // (which then fires a push that wraps `count` back down, corrupting the head).
-  // CPU_FE_EXACT_RESV: FetchAlign reserves landing space per window by its ACTUAL word
-  // count, so a push is only guaranteed to fit its own `n` words (never more than the
-  // fetch-issue reservation, which already bounds every landing push).
-  io.push.ready := (if (m68k040.top.ShippingCoreConfig.feExactResv) (count +^ io.push.payload.n <= BUF_WORDS)
-                    else (count +^ PUSH_WORDS <= BUF_WORDS))
+  io.push.ready := (count +^ PUSH_WORDS <= BUF_WORDS)
 
   // --- next-state pointers/count (combinational) ---
   val afterShift = count - io.shift   // shift <= count by construction

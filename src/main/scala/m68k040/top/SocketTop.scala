@@ -826,7 +826,6 @@ object GenSocketTopVerilog {
             s"dcNbOneBuf=${ShippingCoreConfig.dcNbOneBuf} " +
             s"uopqOneRead=${ShippingCoreConfig.uopqOneRead} " +
             s"uopqExactReady=${ShippingCoreConfig.uopqExactReady} " +
-            s"feExactResv=${ShippingCoreConfig.feExactResv} " +
             s"ratEffRead=${ShippingCoreConfig.ratEffRead} " +
             s"rasCkPend=${ShippingCoreConfig.rasCkPend} " +
             s"iqDstCold=${ShippingCoreConfig.iqDstCold} " +

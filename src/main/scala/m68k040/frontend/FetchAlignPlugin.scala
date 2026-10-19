@@ -784,24 +784,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // into the IBuf at the edge, while the replacement adds a new 4-word reservation.
     // Thus the existing `cnt + (ringCount+1)*4` bound remains both safe and exact for
     // the worst case; only the record-slot capacity needs post-consume credit.
-    val ibufRoomForIssueFull =
+    val ibufRoomForIssue =
       (ibuf.io.cnt +^ ((ringCount +^ U(1)) * U(4))) <= U(ibuf.BUF_WORDS)
-    // CPU_FE_EXACT_RESV: reserve each OUTSTANDING window by the words it can actually push
-    // (`ringKeep - ringDrop`, exactly the response's `nWords`; both only shrink after issue)
-    // instead of a flat 4, plus a full 4 for the window being issued. Registers only.
-    val ibufRoomForIssue = if (!m68k040.top.ShippingCoreConfig.feExactResv) ibufRoomForIssueFull else {
-      val resv = (0 until RING).map { e =>
-        val h    = ringHead.resize(3)
-        val age  = Mux(U(e, 3 bits) >= h, U(e, 3 bits) - h, U(e + RING, 3 bits) - h)
-        val live = age < ringCount.resize(3)
-        Mux(live, (ringKeep(e) - ringDrop(e).resize(3)).resize(5), U(0, 5 bits))
-      }.reduce(_ +^ _)
-      (ibuf.io.cnt +^ resv +^ U(4)) <= U(ibuf.BUF_WORDS)
-    }
-    GenerationFlags.simulation {
-      assert(!(ibuf.io.push.valid && !ibuf.io.push.ready),
-        "FetchAlign: an I-cache response landed with no IBuf room (fetch-issue reservation broken)")
-    }
     // Only a NON-FAULT response earns full-ring turnover credit. On a fault,
     // `faultHold` first latches at this edge; admitting a replacement from the
     // pre-edge `!faultHold` value would widen speculation by one younger request.
