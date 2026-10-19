@@ -803,6 +803,8 @@ object GenSocketTopVerilog {
             s"bfTrim=${ShippingCoreConfig.bfTrim} " +
             s"fmStageRam=${ShippingCoreConfig.fmStageRam} " +
             s"excFsmOneHot=${ShippingCoreConfig.excFsmOneHot} " +
+            s"rtsSplitA7=${ShippingCoreConfig.rtsSplitA7} " +
+            s"rtdPreciseA7=${ShippingCoreConfig.rtdPreciseA7} " +
             // TLB-miss cost chain (constructor DEFAULTS of LsEuPlugin / DtlbPlugin).
             s"walkAgeLimit=${ShippingCoreConfig.walkAgeLimit} " +
             s"dtlbHitUnderWalk=${ShippingCoreConfig.dtlbHitUnderWalk} " +
