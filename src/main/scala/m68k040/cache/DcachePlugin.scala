@@ -6189,9 +6189,24 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val line    = Vec.fill(N)(Reg(UInt(lineW bits)))
       val eset    = Vec.fill(N)(Reg(UInt(setBits bits)))
       val eway    = Vec.fill(N)(Reg(UInt(wayBits bits)))
-      val rbuf    = Vec.fill(N)(Reg(Bits(128 bits)))
+      // CPU_DC_NB_ONE_BUF: ONE line buffer per MSHR. `mbuf` holds the merged image: store
+      // bytes land in it as before, and the refill beat lands in it UNDER the strobe mask
+      // (`mergeBytes(rData, next mbuf, next mstrb)`), so `merged(k)` is `mbuf(k)` itself.
+      // `rbuf` survives only as a simulation shadow proving the two forms agree wherever
+      // `merged` is consumed (FILLED / LINGER). Assignments go to the `mbufW`/`mstrbW` next
+      // wires so the refill merge sees this cycle's store merges (same last-wins order).
+      val oneBuf  = m68k040.top.ShippingCoreConfig.dcNbOneBuf
+      val rbuf    = if (oneBuf) null else Vec.fill(N)(Reg(Bits(128 bits)))
       val mbuf    = Vec.fill(N)(Reg(Bits(128 bits)))
       val mstrb   = Vec.fill(N)(Reg(Bits(16 bits)))
+      val mbufN   = if (oneBuf) Vec.fill(N)(Bits(128 bits)) else null
+      val mstrbN  = if (oneBuf) Vec.fill(N)(Bits(16 bits)) else null
+      if (oneBuf) for (k <- 0 until N) {
+        mbufN(k) := mbuf(k); mstrbN(k) := mstrb(k)
+        mbuf(k) := mbufN(k); mstrb(k) := mstrbN(k)
+      }
+      def mbufW(k: Int): Bits  = if (oneBuf) mbufN(k) else mbuf(k)
+      def mstrbW(k: Int): Bits = if (oneBuf) mstrbN(k) else mstrb(k)
       val mdirty  = Vec.fill(N)(Reg(Bool()))
       val fault   = Vec.fill(N)(Reg(Bool()))
       val invPend = Vec.fill(N)(RegInit(False))
@@ -6207,7 +6222,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val freeBits = (~validVec.asBits)
       val freeCnt  = CountOne(freeBits)
       val anyInv   = invPend.asBits.orR
-      def merged(k: Int): Bits = mergeBytes(rbuf(k), mbuf(k), mstrb(k))
+      def merged(k: Int): Bits = if (oneBuf) mbuf(k) else mergeBytes(rbuf(k), mbuf(k), mstrb(k))
 
       // ── Waiters (§4.3): one per LS ring slot (rid) + one SERIAL slot ────────────────
       val NW  = (1 << DLoadRid.Width) + 1
@@ -6402,8 +6417,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           line(k)   := sLine
           eset(k)   := sSet
           eway(k)   := pendingVictimWay
-          mbuf(k)   := pendingMergeData
-          mstrb(k)  := pendingMergeStrb
+          mbufW(k)  := pendingMergeData
+          mstrbW(k) := pendingMergeStrb
           mdirty(k) := True
           fault(k)  := False
           invPend(k) := True
@@ -6416,7 +6431,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           line(k)   := lLine
           eset(k)   := stgSet
           eway(k)   := stgVWay
-          mstrb(k)  := B(0, 16 bits)
+          mstrbW(k) := B(0, 16 bits)
           mdirty(k) := False
           fault(k)  := False
           invPend(k) := True
@@ -6426,8 +6441,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
         }
         // COPYBACK store merge into an in-flight line (§4.2): bytes + dirty, ack now.
         when(sDo && sCam(k)) {
-          mbuf(k)   := mergeBytes(mbuf(k), pendingMergeData, pendingMergeStrb)
-          mstrb(k)  := mstrb(k) | pendingMergeStrb
+          mbufW(k)  := mergeBytes(mbuf(k), pendingMergeData, pendingMergeStrb)
+          mstrbW(k) := mstrb(k) | pendingMergeStrb
           mdirty(k) := True
         }
       }
@@ -6461,8 +6476,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val s3WtMiss = stS3Valid && (stS3Payload.cacheMode === CacheMode.WRITETHROUGH) && !stS3Hit
       val s3Cam = Vec((0 until N).map(k => validVec(k) && line(k) === s3Line))
       for (k <- 0 until N) when(s3WtMiss && s3Cam(k)) {
-        mbuf(k)  := mergeBytes(mbuf(k), stS3MergeData, stS3MergeStrb)
-        mstrb(k) := mstrb(k) | stS3MergeStrb
+        mbufW(k)  := mergeBytes(mbuf(k), stS3MergeData, stS3MergeStrb)
+        mstrbW(k) := mstrb(k) | stS3MergeStrb
       }
       // Waiter add
       when(lAddW) {
@@ -6773,9 +6788,19 @@ class DcachePlugin(val socketMerged: Boolean = false,
       }
       when(rFire) {
         for (k <- 0 until N) when(rId === U(k, idxW bits)) {
-          rbuf(k)  := rData
+          if (oneBuf) mbuf(k) := mergeBytes(rData, mbufN(k), mstrbN(k)) else rbuf(k) := rData
           fault(k) := rErr
           st(k)    := ST(FILLED)
+        }
+      }
+      if (oneBuf) GenerationFlags.simulation {
+        // The two-buffer form would install/respond `mergeBytes(rbuf, mbuf, mstrb)`: on every
+        // UNSTROBED byte of a FILLED/LINGER entry the single buffer must hold the refill beat.
+        val rbufShadow = Vec.fill(N)(Reg(Bits(128 bits)))
+        when(rFire) { for (k <- 0 until N) when(rId === U(k, idxW bits)) { rbufShadow(k) := rData } }
+        for (k <- 0 until N) when(st(k) === ST(FILLED) || st(k) === ST(LINGER)) {
+          assert(mbuf(k) === mergeBytes(rbufShadow(k), mbuf(k), mstrb(k)),
+            s"DcachePlugin.nb CPU_DC_NB_ONE_BUF: MSHR $k line buffer diverged from rbuf/mbuf merge", FAILURE)
         }
       }
 

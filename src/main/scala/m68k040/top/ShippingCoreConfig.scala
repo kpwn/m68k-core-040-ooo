@@ -1267,4 +1267,11 @@ object ShippingCoreConfig {
     * unchanged; read-before-write like the flops. Bit-exact. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val ibufLutram: Boolean = envFlag("CPU_IBUF_LUTRAM", false)
+  /** Area (fable `area4`): each non-blocking L1D MSHR keeps ONE 128-bit line buffer instead
+    * of a refill buffer + a store-merge buffer merged at install/response time. Store bytes
+    * land in it as before; the refill beat lands under the strobe mask (store bytes win, also
+    * against a same-cycle merge). Every consumer of the merged line (install, waiter
+    * response) sees the same bytes: -128 flops and the 128-bit byte merge per MSHR.
+    * Bit-exact. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val dcNbOneBuf: Boolean = envFlag("CPU_DC_NB_ONE_BUF", false)
 }
