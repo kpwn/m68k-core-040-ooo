@@ -243,6 +243,12 @@ class FpCheapPipe extends Component {
       is(FpOp.FINT)    { val80 := intVal; inexF := intInex }
       is(FpOp.FINTRZ)  { val80 := intVal; inexF := intInex }
     }
+    // CPU_FP_SUBNORM_FIX: an SNaN source of FMOVE/FABS/FNEG is delivered QUIETED (bit 62
+    // set), as on the MC68040 with the SNAN trap disabled; FINT/FINTRZ already quiet it via
+    // propagateNan, FTST writes nothing.
+    if (m68k040.top.ShippingCoreConfig.fpSubnormFix) {
+      when(moveLike && c1.sn) { val80(62) := True }
+    }
 
     // A NaN or an infinity is exact at every precision and must pass through untouched
     // (rounding one would corrupt the payload and could raise a bogus OVFL), so those

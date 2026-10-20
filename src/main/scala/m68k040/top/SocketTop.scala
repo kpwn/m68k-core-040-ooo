@@ -800,6 +800,7 @@ object GenSocketTopVerilog {
             s"upc10=${ShippingCoreConfig.upc10} " +
             s"shiftFunnel=${ShippingCoreConfig.shiftFunnel} " +
             s"fpSrcNorm1=${ShippingCoreConfig.fpSrcNorm1} " +
+            s"fpSubnormFix=${ShippingCoreConfig.fpSubnormFix} " +
             s"lsSplitTail=${ShippingCoreConfig.lsSplitTail} " +
             s"bfTrim=${ShippingCoreConfig.bfTrim} " +
             s"fmStageRam=${ShippingCoreConfig.fmStageRam} " +

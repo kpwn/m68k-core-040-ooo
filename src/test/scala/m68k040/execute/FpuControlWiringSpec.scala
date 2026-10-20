@@ -286,12 +286,12 @@ class FpuControlWiringSpec extends AnyFunSuite {
   private val SNanSingle = 0x7FA00000
 
   test("FPCR.SNAN enable escalates an SNaN operand to a real vector-54 trap", VerilatorTest) {
-    // FPCR is written AFTER `fmove.s %d0,%fp0` on purpose: the FMOVE itself raises SNAN
-    // (FpCheapPipe does, and D7 records that it does NOT quiet the value), so setting the
-    // enable first would vector on the setup move instead of on the FADD under test.
-    val r = run(prog(Seq(f"move.l #0x$SNanSingle%08X,%%d0", "fmove.s %d0,%fp0") ++
+    // The SNaN is the FADD's own SOURCE operand (`fadd.s %d1,%fp1`; d0 is setFpcr's), not staged through an
+    // FPn first: on an MC68040 `fmove.s SNaN,%fp0` with SNAN disabled stores the QUIETED
+    // NaN (CPU_FP_SUBNORM_FIX), so a later `fadd.x %fp0,...` would see a QNaN and never trap.
+    val r = run(prog(Seq(f"move.l #0x$SNanSingle%08X,%%d1") ++
                      setFpcr(ExcSnan) ++
-                     Seq("fmove.l #1,%fp1", "fadd.x %fp0,%fp1")),
+                     Seq("fmove.l #1,%fp1", "fadd.s %d1,%fp1")),
                 name = "snan-enabled")
     assert(r.fpcr.toInt == ExcSnan,
       f"the architectural FMOVE.L %%d0,%%fpcr must have landed; FPCR=0x${r.fpcr.toString(16)}")
