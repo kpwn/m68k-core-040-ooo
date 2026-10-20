@@ -5775,7 +5775,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // CPU_DSTORE_COMPACT: the strobe run of every store shape is closed-form. Slot A
       // (split or not), exception and U/M-drain BYTE stores: [off, min(off+n,16)). Slot B
       // (`tailB`): [0, tailOff + n - 16).
-      val stEndTail = (stS3Payload.tailOff.resize(5 bits) + stNBytes.resize(5 bits) - U(16, 5 bits))
+      val stEndTail = if (!dstoreCompact) null else
+        (stS3Payload.tailOff.resize(5 bits) + stNBytes.resize(5 bits) - U(16, 5 bits))
       val newStSubP   = if (dstoreCompact) Mux(stS3Payload.tailB, U(0, offBits bits), stStartSz)
                         else Mux(stS3Payload.useStrb, stStartSt, stStartSz)
       val newStSubEnd = if (dstoreCompact) Mux(stS3Payload.tailB, stEndTail, stEndSz)
