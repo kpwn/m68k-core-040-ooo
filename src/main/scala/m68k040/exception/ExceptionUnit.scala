@@ -142,6 +142,8 @@ class ExceptionUnit(
     fastFrames: Boolean = m68k040.top.ShippingCoreConfig.excFastFrames,
     /** `CPU_EXC_RTE_ONE_ADDR`: one shared RTE frame-word address/split/translate cone. */
     rteOneAddr: Boolean = m68k040.top.ShippingCoreConfig.excRteOneAddr,
+    /** `CPU_EXC_FB_LEAN`: no preliminary frameBase write at entry; one E_DRAIN subtractor. */
+    fbLean: Boolean = m68k040.top.ShippingCoreConfig.excFbLean,
     // CPU_EXC_FRAMES_COPYBACK: the entry frame push honours a COPYBACK page (the push
     // acks from the L1D array instead of waiting a write-through AXI round trip).
     framesCopyback: Boolean = m68k040.top.ShippingCoreConfig.excFramesCopyback) extends Area {
@@ -1960,9 +1962,13 @@ class ExceptionUnit(
         // new SP = current supervisor stack (M ? MSP : ISP) - frame size. M is PRESERVED
         // across fault/trap entry (the &0x3f mask in E_REDIR keeps bit4), so the
         // post-stack SP is written back to this SAME bank.
-        val supSp = Mux(ss.m, ss.msp, ss.isp)
-        val nb = Mux(is7, supSp - 60, Mux(is2, supSp - 12, supSp - 8))
-        frameBase := nb
+        // CPU_EXC_FB_LEAN: this PRELIMINARY write is dead -- the only exit of E_DRAIN
+        // (the only path from here to any frameBase reader) recomputes it.
+        if (!fbLean) {
+          val supSp = Mux(ss.m, ss.msp, ss.isp)
+          val nb = Mux(is7, supSp - 60, Mux(is2, supSp - 12, supSp - 8))
+          frameBase := nb
+        }
         // Task #132: an INTERRUPT taken while M=1 needs the format-$1 throwaway
         // frame. ss.m itself has no readback lag (it's a plain srSys bit, unlike
         // ss.msp/ss.isp which mirror the committed-A7 PRF readback with settle
@@ -2081,7 +2087,10 @@ class ExceptionUnit(
         // at pre-RTS SP - 12 (= current - 16), leaving the odd return address in place.
         val fmt2Size = if (rtsSplitA7)
           Mux(curOddRet && ss.srSys(5), U(16, 32 bits), fmt2Size0) else fmt2Size0
-        frameBase := Mux(curIs7, supSp - 60, Mux(curIs2, supSp - fmt2Size, supSp - 8))
+        if (fbLean)   // CPU_EXC_FB_LEAN: one subtractor, the frame size muxed (all registers)
+          frameBase := supSp - Mux(curIs7, U(60, 32 bits), Mux(curIs2, fmt2Size, U(8, 32 bits)))
+        else
+          frameBase := Mux(curIs7, supSp - 60, Mux(curIs2, supSp - fmt2Size, supSp - 8))
         // Task #132: the throwaway ($1) frame's base — settled ISP minus 8 bytes.
         // ss.m is True here (curThrowaway only set when it was), so ss.isp is
         // exactly the bank that will become active once M clears — same settle

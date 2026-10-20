@@ -1386,4 +1386,10 @@ object ShippingCoreConfig {
     * xVa / ldoVaddr / ldoPaddr / curFault muxes. Same value in every state. Default OFF;
     * echoed in `SHIPPING_CONFIG`. */
   val excRteOneAddr: Boolean = envFlag("CPU_EXC_RTE_ONE_ADDR", false)
+  /** Area/timing (fable `area6`): the exception entry no longer writes a PRELIMINARY
+    * `frameBase` (three subtractors on the IDLE trigger cone, the i348a worst setup path
+    * `exc_activeReg -> frameBase`): its only path to a reader is through E_DRAIN, whose
+    * exit recomputes it, now as ONE subtractor with the frame size muxed. Default OFF;
+    * echoed in `SHIPPING_CONFIG`. */
+  val excFbLean: Boolean = envFlag("CPU_EXC_FB_LEAN", false)
 }
