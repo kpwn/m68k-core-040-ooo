@@ -1392,4 +1392,10 @@ object ShippingCoreConfig {
     * exit recomputes it, now as ONE subtractor with the frame size muxed. Default OFF;
     * echoed in `SHIPPING_CONFIG`. */
   val excFbLean: Boolean = envFlag("CPU_EXC_FB_LEAN", false)
+  /** Area (fable `area6`): debug CSR reads select the words of each dense 256-byte page
+    * through one binary-indexed mux (address bits captured on the AR edge, holes read 0)
+    * gated by one registered page hit, instead of one captured equality select and one
+    * AND-mask per word. Same latency, same values, zero for unlisted/unaligned offsets.
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val dbgReadBinSel: Boolean = envFlag("CPU_DBG_READ_BINSEL", false)
 }
