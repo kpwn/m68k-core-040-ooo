@@ -201,6 +201,8 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       val fpccWakeV = out Bool (); fpccWakeV := eu.fpccWakeup.valid
       val fpccWakeP = out UInt (4 bits); fpccWakeP := eu.fpccWakeup.payload
       val fpFaultV = out Bool (); fpFaultV := eu.fpFault.valid
+      val fpFaultVec = out UInt (8 bits); fpFaultVec := eu.fpFault.payload.vector
+      val fpFaultRob = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits); fpFaultRob := eu.fpFault.payload.robId
       val fpData   = out Bits (80 bits); fpData := divEu.logic.fpCompData
       val fpCc     = out Bits (4 bits);  fpCc   := divEu.logic.fpCompFpcc
       val fpSrcObs = out Bits (80 bits); fpSrcObs := divEu.logic.fpSrcVal
@@ -252,6 +254,10 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
     val fpSeen = ArrayBuffer[FpSeen]()
     val intSeen = ArrayBuffer[(Int, Int)]()   // (cycle, robId)
     var sawCollision = false
+    /** When set, a vector-55 (unsupported data type) fault is EXPECTED and is recorded in
+      * `faults` as (cycle, robId, vector) instead of failing the sample. */
+    var allowUnsupp = false
+    val faults = ArrayBuffer[(Int, Int, Int)]()
 
     def idle(): Unit = {
       s.iValid #= false
@@ -269,6 +275,13 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
     }
 
     def sample(): Unit = {
+      if (allowUnsupp && s.fpFaultV.toBoolean && s.fpFaultVec.toInt == 55) {
+        // A vector-55 fault completes the uop but writes neither FPn nor FPCC.
+        faults += ((cycle, s.fpFaultRob.toInt, s.fpFaultVec.toInt))
+        assert(s.fpCValid.toBoolean && !s.fpWakeV.toBoolean && !s.fpccWakeV.toBoolean,
+          s"vector-55 fault at cycle $cycle must complete without FP/FPCC writes")
+        return
+      }
       assert(!s.fpFaultV.toBoolean,
         s"unexpected FP enabled-trap escalation at cycle $cycle (FPCR enables are all clear)")
       if (s.fpCValid.toBoolean && s.intCValid.toBoolean) sawCollision = true
@@ -569,33 +582,50 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
   }
 
   test("FP lane: subnormal single/double conversion and SNaN preservation", VerilatorTest) {
+    // Reference: MC68040 / MC68881 semantics.
+    //  * A DENORMALIZED single/double source is an "unsupported data type" on the MC68040
+    //    (M68040UM sec. 9.5.3 / FPSP040 x_unsupp): the hardware takes vector 55 before the
+    //    instruction and the FPSP normalises and completes it. So with CPU_FP_UNSUPP_TRAP
+    //    (default ON since 5a8385fd) the three subnormal rows below must complete as a
+    //    vector-55 fault with NO FPn/FPCC write; the gateway conversion is still exact
+    //    (ExceptionUnit's capture of ETEMP is separate). With the trap OFF the core computes
+    //    them in hardware and the exact extended value is the result.
+    //  * A SIGNALLING NaN source stays signalling through the format conversion (so SNAN
+    //    can be raised), and with the SNAN trap disabled the 040 delivers it QUIETED --
+    //    fraction MSB (bit 62) set -- to the destination (M68000PRM sec. 1.6.5). The
+    //    quieting is CPU_FP_SUBNORM_FIX; OFF, FMOVE still copies the SNaN unchanged.
+    val unsuppTrap = m68k040.top.ShippingCoreConfig.fpUnsuppTrap
+    val snanFix    = m68k040.top.ShippingCoreConfig.fpSubnormFix
     dut.doSim { d =>
       val h = new Harness(d); import h._
       boot()
       preloadFp(1, One)
 
-      // FMOVE passes its (converted) source through verbatim, so the completed 80-bit
-      // result IS the gateway output -- an end-to-end check of the converters.
+      // FMOVE passes its (converted) source through, so the completed 80-bit result is the
+      // gateway output for every non-NaN row -- an end-to-end check of the converters.
       case class Conv(label: String, kind: SpinalEnumElement[FpSrcKind.type], fmt: Int,
-                      imm: BigInt, expect: BigInt)
+                      imm: BigInt, gateway: BigInt, denormal: Boolean = false,
+                      result: Option[BigInt] = None)
+      val snanSgl = ext(false, 0x7FFF, Msb | (BigInt(1) << 40))
       val convs = Seq(
         // Smallest single subnormal 2^-149: frac=1 -> clz23=22 -> exp 0x3F80-22, sig 1<<63.
-        Conv("single 2^-149", FpSrcKind.SINGLEIMM, 1, BigInt(1), ext(false, 0x3F80 - 22, Msb)),
+        Conv("single 2^-149", FpSrcKind.SINGLEIMM, 1, BigInt(1), ext(false, 0x3F80 - 22, Msb),
+          denormal = true),
         // Smallest double subnormal 2^-1074: frac=1 -> clz52=51 -> exp 0x3C00-51, sig 1<<63.
-        Conv("double 2^-1074", FpSrcKind.DOUBLEIMM, 5, BigInt(1), ext(false, 0x3C00 - 51, Msb)),
+        Conv("double 2^-1074", FpSrcKind.DOUBLEIMM, 5, BigInt(1), ext(false, 0x3C00 - 51, Msb),
+          denormal = true),
         // Largest double subnormal (frac all ones) -> clz52=0 -> exp 0x3C00, sig frac<<12.
         Conv("double max subnormal", FpSrcKind.DOUBLEIMM, 5, (BigInt(1) << 52) - 1,
-          ext(false, 0x3C00, ((BigInt(1) << 52) - 1) << 12)),
+          ext(false, 0x3C00, ((BigInt(1) << 52) - 1) << 12), denormal = true),
         // Single infinity.
         Conv("single +Inf", FpSrcKind.SINGLEIMM, 1, BigInt("7F800000", 16), ext(false, 0x7FFF, Msb)),
-        // Single QUIET NaN: payload MSB set -> bit62 set -> identical to SoftFloat's
-        // commonNaNToFloatx80 (which force-ORs 0xC000000000000000).
+        // Single QUIET NaN: payload MSB set -> bit62 set (already quiet).
         Conv("single QNaN", FpSrcKind.SINGLEIMM, 1, BigInt("7FC00001", 16),
           ext(false, 0x7FFF, Msb | (BigInt(3) << 62) | (BigInt(1) << 40))),
-        // Single SIGNALLING NaN: stays signalling (bit62 clear) so FpuCore can raise SNAN,
-        // instead of being pre-quieted by the conversion.
-        Conv("single SNaN", FpSrcKind.SINGLEIMM, 1, BigInt("7F800001", 16),
-          ext(false, 0x7FFF, Msb | (BigInt(1) << 40))),
+        // Single SIGNALLING NaN: the gateway keeps it signalling (bit62 clear) so FpuCore can
+        // raise SNAN; the FMOVE result is the quiet NaN on a real 040.
+        Conv("single SNaN", FpSrcKind.SINGLEIMM, 1, BigInt("7F800001", 16), snanSgl,
+          result = Some(if (snanFix) snanSgl | (BigInt(1) << 62) else snanSgl)),
         // Negative zero survives with its sign.
         Conv("double -0.0", FpSrcKind.DOUBLEIMM, 5, BigInt(1) << 63, ext(true, 0, BigInt(0))),
         // INTIMM 0 -> +0 (SoftFloat forces sign 0 for a==0).
@@ -604,7 +634,10 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         Conv("int -2^31", FpSrcKind.INTIMM, 0, BigInt("80000000", 16), ext(true, 0x401E, Msb)))
 
       for ((c, i) <- convs.zipWithIndex) {
+        val trap = unsuppTrap && c.denormal
+        allowUnsupp = trap
         val before = fpSeen.size
+        val fBefore = faults.size
         val pdst = 4 + i
         s.iOp #= DecOp.FPU
         s.iRob #= 20 + i; s.iFpuOp #= OpFMOVE; s.iFpSrcKind #= c.kind; s.iFpSrcFmt #= c.fmt
@@ -618,15 +651,25 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         assert(s.iFire.toBoolean, s"${c.label} was not accepted")
         tick(); s.iValid #= false
         // Two edges past acceptance: `fpSrcVal` is the FP issue register's output since
-        // task #218, behind DivEu's operand-read register since 2026-10-06 (see the first
-        // fpSrcKind test for the full note).
+        // task #218, behind DivEu's operand-read register since 2026-10-06.
         tick()
         sleep(1)
-        assert(s.fpSrcObs.toBigInt == c.expect,
-          f"${c.label}: gateway 0x${s.fpSrcObs.toBigInt}%020X, expected 0x${c.expect}%020X")
-        drainTo(before + 1, FpuCore.FixedLatency + 12, c.label)
-        assert(fpSeen.last.data == c.expect,
-          f"${c.label}: FMOVE result 0x${fpSeen.last.data}%020X, expected 0x${c.expect}%020X")
+        assert(s.fpSrcObs.toBigInt == c.gateway,
+          f"${c.label}: gateway 0x${s.fpSrcObs.toBigInt}%020X, expected 0x${c.gateway}%020X")
+        if (trap) {
+          var guard = 0
+          while (faults.size == fBefore && guard < FpuCore.FixedLatency + 12) { tick(); guard += 1 }
+          assert(faults.size == fBefore + 1, s"${c.label}: denormal source did not take vector 55")
+          assert(faults.last._2 == 20 + i, s"${c.label}: vector 55 on rob=${faults.last._2}")
+          assert(fpSeen.size == before, s"${c.label}: a vector-55 op must not write FPn")
+          tick(4)
+          allowUnsupp = false
+        } else {
+          drainTo(before + 1, FpuCore.FixedLatency + 12, c.label)
+          val want = c.result.getOrElse(c.gateway)
+          assert(fpSeen.last.data == want,
+            f"${c.label}: FMOVE result 0x${fpSeen.last.data}%020X, expected 0x${want}%020X")
+        }
       }
     }
   }

@@ -778,10 +778,14 @@ class FpuCoreSpec extends AnyFunSuite {
           val gz = runFixed(d0, cd, FpOp.FINTRZ, 0, v, rm)
           assert(gz.value == FpRefModel.roundToInt(v, 1),
             f"FINTRZ rm=$rm $v%020x -> ${gz.value}%020x (must ignore FPCR)")
-          assert(runFixed(d0, cd, FpOp.FABS,  0, v, rm).value == (v & ((BigInt(1) << 79) - 1)))
-          assert(runFixed(d0, cd, FpOp.FNEG,  0, v, rm).value == (v ^ (BigInt(1) << 79)))
+          // MC68040 with the SNAN trap disabled: an SNaN source of FMOVE/FABS/FNEG is
+          // delivered QUIETED (bit 62 set) -- CPU_FP_SUBNORM_FIX; OFF they copy it raw.
+          val q = if (m68k040.top.ShippingCoreConfig.fpSubnormFix && FpRefModel.isSNan(v))
+                    BigInt(1) << 62 else BigInt(0)
+          assert(runFixed(d0, cd, FpOp.FABS,  0, v, rm).value == ((v | q) & ((BigInt(1) << 79) - 1)))
+          assert(runFixed(d0, cd, FpOp.FNEG,  0, v, rm).value == ((v | q) ^ (BigInt(1) << 79)))
           val gm = runFixed(d0, cd, FpOp.FMOVE, 0, v, rm)
-          assert(gm.value == v && gm.fpcc == FpRefModel.fpcc(v), f"FMOVE $v%020x")
+          assert(gm.value == (v | q) && gm.fpcc == FpRefModel.fpcc(v), f"FMOVE $v%020x")
           val gt = runFixed(d0, cd, FpOp.FTST, 0, v, rm)
           assert(gt.fpcc == FpRefModel.fpcc(v) && !gt.writeFp, f"FTST $v%020x")
           cheapChecked += 1
