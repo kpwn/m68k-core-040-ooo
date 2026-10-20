@@ -1196,7 +1196,7 @@ object ShippingCoreConfig {
     * SNAN trap disabled (M68000PRM sec. 1.6.5 / per-instruction "SNaN" result rows). OFF, those
     * three ops copy the SNaN into FPn unchanged (FPSR.SNAN was and is raised either way).
     * One OR on bit 62 of FpCheapPipe's result mux. Default OFF; echoed in `SHIPPING_CONFIG`. */
-  val fpSubnormFix: Boolean = envFlag("CPU_FP_SUBNORM_FIX", false)
+  val fpSubnormFix: Boolean = envFlag("CPU_FP_SUBNORM_FIX", true)
   /** CPU_LS_SPLIT_TAIL (redundancy hunt 2026-10-15): a line-crossing load's merge reads
     * only slot A's line bytes 13..15 and slot B's bytes 0..2, so the parked-response lines
     * (`alignedRLine`, 128 b/slot) keep 48 bits and `splitMergeLine` keeps 24.
