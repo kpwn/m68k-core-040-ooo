@@ -140,6 +140,10 @@ class ExceptionUnit(
     // CPU_EXC_FAST_FRAMES (review §4.7): pair adjacent frame words into one aligned
     // LONG on the entry push and the RTE pop. Elaboration-time; False = the old FSM.
     fastFrames: Boolean = m68k040.top.ShippingCoreConfig.excFastFrames,
+    /** `CPU_EXC_RTE_ONE_ADDR`: one shared RTE frame-word address/split/translate cone. */
+    rteOneAddr: Boolean = m68k040.top.ShippingCoreConfig.excRteOneAddr,
+    /** `CPU_EXC_FB_LEAN`: no preliminary frameBase write at entry; one E_DRAIN subtractor. */
+    fbLean: Boolean = m68k040.top.ShippingCoreConfig.excFbLean,
     // CPU_EXC_FRAMES_COPYBACK: the entry frame push honours a COPYBACK page (the push
     // acks from the L1D array instead of waiting a write-through AXI round trip).
     framesCopyback: Boolean = m68k040.top.ShippingCoreConfig.excFramesCopyback) extends Area {
@@ -965,8 +969,13 @@ class ExceptionUnit(
   dcStore.payload.data    := stoDataReg
   dcStore.payload.size    := stoSizeReg
   dcStore.payload.useStrb := False
-  dcStore.payload.strb    := B(0, 16 bits)
-  dcStore.payload.lineData:= B(0, 128 bits)
+  if (m68k040.top.ShippingCoreConfig.dstoreCompact) {
+    dcStore.payload.tailB   := False
+    dcStore.payload.tailOff := U(0, 4 bits)
+  } else {
+    dcStore.payload.strb    := B(0, 16 bits)
+    dcStore.payload.lineData:= B(0, 128 bits)
+  }
   // ── Exception-sequencer D-cache access cacheability (Task P5.7 root-cause fix) ──
   // The exception sequencer's frame/vector accesses are now DTLB-translated
   // (2026-09-09), so a page attribute does exist -- but this unit still does not consult
@@ -1953,9 +1962,13 @@ class ExceptionUnit(
         // new SP = current supervisor stack (M ? MSP : ISP) - frame size. M is PRESERVED
         // across fault/trap entry (the &0x3f mask in E_REDIR keeps bit4), so the
         // post-stack SP is written back to this SAME bank.
-        val supSp = Mux(ss.m, ss.msp, ss.isp)
-        val nb = Mux(is7, supSp - 60, Mux(is2, supSp - 12, supSp - 8))
-        frameBase := nb
+        // CPU_EXC_FB_LEAN: this PRELIMINARY write is dead -- the only exit of E_DRAIN
+        // (the only path from here to any frameBase reader) recomputes it.
+        if (!fbLean) {
+          val supSp = Mux(ss.m, ss.msp, ss.isp)
+          val nb = Mux(is7, supSp - 60, Mux(is2, supSp - 12, supSp - 8))
+          frameBase := nb
+        }
         // Task #132: an INTERRUPT taken while M=1 needs the format-$1 throwaway
         // frame. ss.m itself has no readback lag (it's a plain srSys bit, unlike
         // ss.msp/ss.isp which mirror the committed-A7 PRF readback with settle
@@ -2074,7 +2087,10 @@ class ExceptionUnit(
         // at pre-RTS SP - 12 (= current - 16), leaving the odd return address in place.
         val fmt2Size = if (rtsSplitA7)
           Mux(curOddRet && ss.srSys(5), U(16, 32 bits), fmt2Size0) else fmt2Size0
-        frameBase := Mux(curIs7, supSp - 60, Mux(curIs2, supSp - fmt2Size, supSp - 8))
+        if (fbLean)   // CPU_EXC_FB_LEAN: one subtractor, the frame size muxed (all registers)
+          frameBase := supSp - Mux(curIs7, U(60, 32 bits), Mux(curIs2, fmt2Size, U(8, 32 bits)))
+        else
+          frameBase := Mux(curIs7, supSp - 60, Mux(curIs2, supSp - fmt2Size, supSp - 8))
         // Task #132: the throwaway ($1) frame's base — settled ISP minus 8 bytes.
         // ss.m is True here (curThrowaway only set when it was), so ss.isp is
         // exactly the bank that will become active once M clears — same settle
@@ -2382,8 +2398,23 @@ class ExceptionUnit(
     // word straddling a 16-byte line into two BYTE reads (see rdSplitLow above).
     /** Issue one frame-word read at `addr` (WORD, or the BYTE half selected by
       * `rdSplitLow` when the word straddles a line). */
+    // CPU_EXC_RTE_ONE_ADDR: the four RTE frame words are read at frameBase + 0/2/4/6, one
+    // per state pair, so ONE adder (offset from the state) and ONE split/translate/PA cone
+    // serve all of them instead of four copies feeding the xVa/ldo*/curFault muxes.
+    val rteAddr: UInt = if (!rteOneAddr) null else {
+      val idx = UInt(2 bits); idx := 0
+      when(isActive(R_PCREQ)  || isActive(R_PCWAIT))  { idx := 1 }
+      when(isActive(R_PCREQ2) || isActive(R_PCWAIT2)) { idx := 2 }
+      when(isActive(R_FMTREQ) || isActive(R_FMTWAIT)) { idx := 3 }
+      frameBase + (idx << 1).resize(32 bits)
+    }
+    val rteCross: Bool = if (!rteOneAddr) null else rdCrosses(rteAddr)
+    val rteVa: UInt = if (!rteOneAddr) null else
+      Mux(rteCross && rdSplitLow, rteAddr + U(1, 32 bits), rteAddr)
+    /** The RTE frame-word address of the state that calls it: `frameBase + off`. */
+    def rteWordAddr(off: Int): UInt = if (rteOneAddr) rteAddr else frameBase + off
     def frameWordReq(addr: UInt, ret: Int, long: Bool = False): Unit = {
-      val va = Mux(rdCrosses(addr) && rdSplitLow, addr + U(1, 32 bits), addr)
+      val va = if (rteOneAddr) rteVa else Mux(rdCrosses(addr) && rdSplitLow, addr + U(1, 32 bits), addr)
       // 2026-09-09: the RTE frame lives on the supervisor stack, a LOGICAL address --
       // so the pop translates, exactly like the push. `va` is already the split-aware
       // address, so a frame word whose low byte falls in the next page re-translates
@@ -2393,7 +2424,7 @@ class ExceptionUnit(
         excGoXlate(va, write = false, ret)
       } otherwise {
         ldoVld := True; ldoVaddr := va; ldoPaddr := excPaOf(va)
-        ldoSize := Mux(rdCrosses(addr), Size.BYTE, Size.WORD)
+        ldoSize := Mux(if (rteOneAddr) rteCross else rdCrosses(addr), Size.BYTE, Size.WORD)
         if (fastFrames) when(long) { ldoSize := Size.LONG }   // aligned: never crosses
       }
     }
@@ -2463,12 +2494,12 @@ class ExceptionUnit(
           // `addr` -- not the split-aware `va` -- is the ARCHITECTURAL access address the
           // format-$7 frame must report.
           busErrorEntry(addr)
-        } elsewhen(rdCrosses(addr) && !rdSplitLow) {
+        } elsewhen((if (rteOneAddr) rteCross else rdCrosses(addr)) && !rdSplitLow) {
           rdHiByte := dcLoadRsp.payload.data(7 downto 0)
           rdSplitLow := True
           goto(reqState)
         } otherwise {
-          val word = Mux(rdCrosses(addr), rdHiByte ## dcLoadRsp.payload.data(7 downto 0), dcLoadRsp.payload.data(15 downto 0))
+          val word = Mux(if (rteOneAddr) rteCross else rdCrosses(addr), rdHiByte ## dcLoadRsp.payload.data(7 downto 0), dcLoadRsp.payload.data(15 downto 0))
           rdSplitLow := False
           onWord(word.asUInt)
         }
@@ -2538,7 +2569,7 @@ class ExceptionUnit(
       }
     }
     R_SRREQ.whenIsActive {
-      frameWordReq(frameBase + 0, XRET_R_SR, rtePair)
+      frameWordReq(rteWordAddr(0), XRET_R_SR, rtePair)
       when(dcLoadCmd.fire) { goto(R_SRWAIT) }
     }
     R_SRWAIT.whenIsActive {
@@ -2546,7 +2577,7 @@ class ExceptionUnit(
         when(rtePair) {
           when(dcLoadRsp.valid) {
             when(dcLoadRsp.payload.fault) {
-              busErrorEntry(frameBase + 0)
+              busErrorEntry(rteWordAddr(0))
             } otherwise {
               popSr := dcLoadRsp.payload.data(31 downto 16).asUInt
               popPc(31 downto 16) := dcLoadRsp.payload.data(15 downto 0).asUInt
@@ -2554,21 +2585,21 @@ class ExceptionUnit(
             }
           }
         } otherwise {
-          frameWordWait(frameBase + 0, R_SRREQ, w => { popSr := w; goto(R_PCREQ) })
+          frameWordWait(rteWordAddr(0), R_SRREQ, w => { popSr := w; goto(R_PCREQ) })
         }
       } else {
-        frameWordWait(frameBase + 0, R_SRREQ, w => { popSr := w; goto(R_PCREQ) })
+        frameWordWait(rteWordAddr(0), R_SRREQ, w => { popSr := w; goto(R_PCREQ) })
       }
     }
     R_PCREQ.whenIsActive {
-      frameWordReq(frameBase + 2, XRET_R_PC)
+      frameWordReq(rteWordAddr(2), XRET_R_PC)
       when(dcLoadCmd.fire) { goto(R_PCWAIT) }
     }
     R_PCWAIT.whenIsActive {
-      frameWordWait(frameBase + 2, R_PCREQ, w => { popPc(31 downto 16) := w; goto(R_PCREQ2) })
+      frameWordWait(rteWordAddr(2), R_PCREQ, w => { popPc(31 downto 16) := w; goto(R_PCREQ2) })
     }
     R_PCREQ2.whenIsActive {
-      frameWordReq(frameBase + 4, XRET_R_PC2, rtePair)
+      frameWordReq(rteWordAddr(4), XRET_R_PC2, rtePair)
       when(dcLoadCmd.fire) { goto(R_PCWAIT2) }
     }
     R_PCWAIT2.whenIsActive {
@@ -2576,7 +2607,7 @@ class ExceptionUnit(
         when(rtePair) {
           when(dcLoadRsp.valid) {
             when(dcLoadRsp.payload.fault) {
-              busErrorEntry(frameBase + 4)
+              busErrorEntry(rteWordAddr(4))
             } otherwise {
               popPc(15 downto 0) := dcLoadRsp.payload.data(31 downto 16).asUInt
               rtePreFmt      := dcLoadRsp.payload.data(15 downto 0).asUInt
@@ -2585,15 +2616,15 @@ class ExceptionUnit(
             }
           }
         } otherwise {
-          frameWordWait(frameBase + 4, R_PCREQ2, w => { popPc(15 downto 0) := w; goto(R_FMTREQ) })
+          frameWordWait(rteWordAddr(4), R_PCREQ2, w => { popPc(15 downto 0) := w; goto(R_FMTREQ) })
         }
       } else {
-        frameWordWait(frameBase + 4, R_PCREQ2, w => { popPc(15 downto 0) := w; goto(R_FMTREQ) })
+        frameWordWait(rteWordAddr(4), R_PCREQ2, w => { popPc(15 downto 0) := w; goto(R_FMTREQ) })
       }
     }
     // Read the format word @base+6 to select the pop size ($0 = 8 bytes, $7 = 60).
     R_FMTREQ.whenIsActive {
-      frameWordReq(frameBase + 6, XRET_R_FMT)
+      frameWordReq(rteWordAddr(6), XRET_R_FMT)
       when(dcLoadCmd.fire) { goto(R_FMTWAIT) }
     }
     R_FMTWAIT.whenIsActive {
@@ -2710,11 +2741,11 @@ class ExceptionUnit(
           rtePreFmtValid := False
           fmtValid := True
         } otherwise {
-          frameWordWait(frameBase + 6, R_FMTREQ, w => { fmtValid := True; fmtWordIn := w })
+          frameWordWait(rteWordAddr(6), R_FMTREQ, w => { fmtValid := True; fmtWordIn := w })
         }
         when(fmtValid) { onFmt(fmtWordIn) }
       } else {
-        frameWordWait(frameBase + 6, R_FMTREQ, onFmt)
+        frameWordWait(rteWordAddr(6), R_FMTREQ, onFmt)
       }
     }
     R_REDIR.whenIsActive {

@@ -6133,8 +6133,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       dcache.store.payload.data     := walkStSel.data
       dcache.store.payload.size     := walkStSel.size
       dcache.store.payload.useStrb  := walkStSel.useStrb
-      dcache.store.payload.strb     := walkStSel.strb
-      dcache.store.payload.lineData := walkStSel.lineData
+      if (m68k040.top.ShippingCoreConfig.dstoreCompact) {
+        dcache.store.payload.tailB    := walkStSel.tailB
+        dcache.store.payload.tailOff  := walkStSel.tailOff
+      } else {
+        dcache.store.payload.strb     := walkStSel.strb
+        dcache.store.payload.lineData := walkStSel.lineData
+      }
       dcache.store.payload.precise  := walkStSel.precise
       // W3: the client latched this at drain-arm time so it is the SAME value its own
       // re-read used -- the guarantee the old "same expression, same signal" wording

@@ -198,9 +198,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.storeIn.payload.paddr #= b
         pl.storeIn.payload.data #= value
         pl.storeIn.payload.size #= Size.LONG
-        pl.storeIn.payload.useStrb #= false
-        pl.storeIn.payload.strb #= 0
-        pl.storeIn.payload.lineData #= 0
+        m68k040.sim.DStoreSim.drivePlain(pl.storeIn.payload)
         pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
         pl.storeIn.payload.precise #= false
         cd.waitSamplingWhere(pl.storeIn.valid.toBoolean && pl.storeIn.ready.toBoolean)
@@ -251,9 +249,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       pl.storeIn.payload.paddr #= i
       pl.storeIn.payload.data #= 0
       pl.storeIn.payload.size #= Size.LONG
-      pl.storeIn.payload.useStrb #= true
-      pl.storeIn.payload.strb #= 0xffff
-      pl.storeIn.payload.lineData #= BigInt("cc" * 16, 16)
+      m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0xffff, BigInt("cc" * 16, 16))
       pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
       pl.storeIn.payload.precise #= false
       pl.loadCmdIn.valid #= true
@@ -449,7 +445,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       while (avoid(a & ~0xFL) && tries < 20) { a = inLine(randLine(), sz); tries += 1 }
       if (tries >= 20) return
       val v = BigInt(32, rnd) & ((BigInt(1) << (8 * n)) - 1)
-      val fullLine = rnd.nextInt(12) == 0
+      val fullLine = rnd.nextInt(12) == 0 && !m68k040.sim.DStoreSim.compact
       val strobeStore = fullLine || rnd.nextInt(8) == 0
       val sBase = a & ~0xFL
       var strb = 0; var line = BigInt(0)
@@ -465,9 +461,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       pl.storeIn.payload.paddr #= a
       pl.storeIn.payload.data #= v
       pl.storeIn.payload.size #= sizeEl(sz)
-      pl.storeIn.payload.useStrb #= strobeStore
-      pl.storeIn.payload.strb #= (if (strobeStore) strb else 0)
-      pl.storeIn.payload.lineData #= (if (strobeStore) line else BigInt(0))
+      if (strobeStore && !m68k040.sim.DStoreSim.compact) m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, strb, line)
+      else m68k040.sim.DStoreSim.drivePlain(pl.storeIn.payload)
       pl.storeIn.payload.cacheMode #= storeMode
       pl.storeIn.payload.precise #= (rnd.nextInt(6) == 0)
       var w = 0
@@ -661,8 +656,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         val v = BigInt(32, rnd) & ((BigInt(1) << (8 * n)) - 1)
         pl.storeIn.valid #= true
         pl.storeIn.payload.paddr #= a; pl.storeIn.payload.data #= v
-        pl.storeIn.payload.size #= sizeEl(sz); pl.storeIn.payload.useStrb #= false
-        pl.storeIn.payload.strb #= 0; pl.storeIn.payload.lineData #= 0
+        pl.storeIn.payload.size #= sizeEl(sz); m68k040.sim.DStoreSim.drivePlain(pl.storeIn.payload)
         pl.storeIn.payload.cacheMode #= CacheMode.INHIBITED
         pl.storeIn.payload.precise #= rnd.nextBoolean()
         cd.waitSampling()
@@ -744,8 +738,10 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       println(s"[nbStress $tag TOTAL over ${seeds.size} seeds] " +
         nbTot.toSeq.sortBy(_._1).map { case (k, x) => s"$k=$x" }.mkString(" "))
       // A pass is worthless unless every mechanism fired.
+      // CPU_DSTORE_COMPACT: no full-line store exists, so a no-fill allocation cannot either.
       for (k <- Seq("primaryAllocs", "loadSecondaries", "storeAllocs", "noFillAllocs", "storeMerges",
-                    "allocFail", "replays", "wbPushes", "occ2plus"))
+                    "allocFail", "replays", "wbPushes", "occ2plus")
+           if !(k == "noFillAllocs" && m68k040.sim.DStoreSim.compact))
         assert(nbTot(k) > 0, s"$tag: mechanism '$k' never fired: $nbTot")
     }
   }
@@ -905,9 +901,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       pl.storeIn.payload.paddr #= x
       pl.storeIn.payload.data #= 0
       pl.storeIn.payload.size #= Size.LONG
-      pl.storeIn.payload.useStrb #= true
-      pl.storeIn.payload.strb #= 0xffff
-      pl.storeIn.payload.lineData #= BigInt("66" * 16, 16)
+      m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0xffff, BigInt("66" * 16, 16))
       pl.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
       pl.storeIn.payload.precise #= false
       pl.loadCmdIn.payload.vaddr #= x
@@ -1013,9 +1007,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.storeIn.payload.paddr #= a
         pl.storeIn.payload.data #= 0
         pl.storeIn.payload.size #= Size.LONG
-        pl.storeIn.payload.useStrb #= true
-        pl.storeIn.payload.strb #= 0xffff
-        pl.storeIn.payload.lineData #= BigInt(f"$byte%02x" * 16, 16)
+        m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0xffff, BigInt(f"$byte%02x" * 16, 16))
         pl.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
         pl.storeIn.payload.precise #= false
         assert(pl.storeIn.ready.toBoolean, s"WT $a was not accepted at scheduled edge")
@@ -1132,9 +1124,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.storeIn.payload.paddr #= a
         pl.storeIn.payload.data #= 0
         pl.storeIn.payload.size #= Size.LONG
-        pl.storeIn.payload.useStrb #= true
-        pl.storeIn.payload.strb #= 0xffff
-        pl.storeIn.payload.lineData #= BigInt(f"$byte%02x" * 16, 16)
+        m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0xffff, BigInt(f"$byte%02x" * 16, 16))
         pl.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
         pl.storeIn.payload.precise #= false
         assert(pl.storeIn.ready.toBoolean, s"WT $a input was not ready")
@@ -1231,9 +1221,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.storeIn.payload.paddr #= a
         pl.storeIn.payload.data #= 0
         pl.storeIn.payload.size #= Size.LONG
-        pl.storeIn.payload.useStrb #= true
-        pl.storeIn.payload.strb #= strb
-        pl.storeIn.payload.lineData #= (if (strb == 0xffff) BigInt("66" * 16, 16) else BigInt(byte))
+        m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, strb, (if (strb == 0xffff) BigInt("66" * 16, 16) else BigInt(byte)))
         pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
         pl.storeIn.payload.precise #= false
         until("store accept") { pl.storeIn.ready.toBoolean }
@@ -1339,9 +1327,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.storeIn.payload.paddr #= a
         pl.storeIn.payload.data #= 0
         pl.storeIn.payload.size #= Size.LONG
-        pl.storeIn.payload.useStrb #= true
-        pl.storeIn.payload.strb #= 0xffff
-        pl.storeIn.payload.lineData #= BigInt(f"$byte%02x" * 16, 16)
+        m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0xffff, BigInt(f"$byte%02x" * 16, 16))
         pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
         pl.storeIn.payload.precise #= false
         cd.waitSamplingWhere(pl.storeIn.ready.toBoolean)
@@ -1558,9 +1544,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       pl.storeIn.payload.paddr #= x
       pl.storeIn.payload.data #= BigInt("77777777", 16)
       pl.storeIn.payload.size #= Size.LONG
-      pl.storeIn.payload.useStrb #= true
-      pl.storeIn.payload.strb #= 0x000f
-      pl.storeIn.payload.lineData #= BigInt("77777777", 16)
+      m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0x000f, BigInt("77777777", 16))
       pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
       pl.storeIn.payload.precise #= false
       until("same-line COPYBACK store accept") { pl.storeIn.ready.toBoolean }
@@ -1634,9 +1618,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.storeIn.payload.paddr #= a
         pl.storeIn.payload.data #= 0
         pl.storeIn.payload.size #= Size.LONG
-        pl.storeIn.payload.useStrb #= true
-        pl.storeIn.payload.strb #= 0xffff
-        pl.storeIn.payload.lineData #= line
+        m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0xffff, line)
         pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
         pl.storeIn.payload.precise #= false
         until("full-line store accept") { pl.storeIn.ready.toBoolean }
@@ -1841,9 +1823,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       pl.storeIn.payload.paddr #= x
       pl.storeIn.payload.data #= 0
       pl.storeIn.payload.size #= Size.LONG
-      pl.storeIn.payload.useStrb #= true
-      pl.storeIn.payload.strb #= 0xffff
-      pl.storeIn.payload.lineData #= BigInt("55" * 16, 16)
+      m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0xffff, BigInt("55" * 16, 16))
       pl.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
       pl.storeIn.payload.precise #= false
       n = 0
@@ -1938,9 +1918,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.storeIn.payload.paddr #= addr
         pl.storeIn.payload.data #= 0
         pl.storeIn.payload.size #= Size.LONG
-        pl.storeIn.payload.useStrb #= true
-        pl.storeIn.payload.strb #= 0xffff
-        pl.storeIn.payload.lineData #= line
+        m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0xffff, line)
         pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
         pl.storeIn.payload.precise #= false
         until("full-line store accept") { pl.storeIn.ready.toBoolean }
@@ -2158,9 +2136,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.storeIn.payload.paddr #= addr
         pl.storeIn.payload.data #= BigInt("77777777", 16)
         pl.storeIn.payload.size #= Size.LONG
-        pl.storeIn.payload.useStrb #= true
-        pl.storeIn.payload.strb #= 0x000f
-        pl.storeIn.payload.lineData #= BigInt("77777777", 16)
+        m68k040.sim.DStoreSim.driveLanes(pl.storeIn.payload, 0x000f, BigInt("77777777", 16))
         pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
         pl.storeIn.payload.precise #= false
         waitFor("dirty merge store ready") { pl.storeIn.ready.toBoolean }

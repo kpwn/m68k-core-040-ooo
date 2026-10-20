@@ -1838,17 +1838,59 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // latency, reset domain and backpressure behavior. Unlisted/unaligned
       // addresses select no word and therefore return zero.
       private val readOffsets = scala.collection.mutable.Set.empty[Int]
+      // CPU_DBG_READ_BINSEL: words that share a 256-byte page (>= 3 of them) are read
+      // through ONE binary-indexed mux (araddr[7:2] captured on the AR edge, holes read 0)
+      // gated by ONE registered page-hit bit, instead of one captured equality select and
+      // one AND-mask per word. Same capture edge, same sample point, same zero for an
+      // unlisted or unaligned address.
+      private val readBinSel = m68k040.top.ShippingCoreConfig.dbgReadBinSel
       class ReadRegion extends Area {
         private val words = scala.collection.mutable.ArrayBuffer.empty[Bits]
-        def at(offset: Int)(word: => Bits): Unit = {
-          require(readOffsets.add(offset), f"Duplicate debug read offset 0x$offset%05x")
+        private val entries = scala.collection.mutable.ArrayBuffer.empty[(Int, Bits)]
+        private def selectedWord(offset: Int, word: Bits): Bits = {
           val selected = RegInit(False)
           when(dbgAxi.arvalid && dbgAxi.arready) {
             selected := dbgAxi.araddr === offset
           }
-          words += word.andMask(selected)
+          word.andMask(selected)
         }
-        def value: Bits = words.toSeq.reduceBalancedTree(_ | _)
+        def at(offset: Int)(word: => Bits): Unit = {
+          require(readOffsets.add(offset), f"Duplicate debug read offset 0x$offset%05x")
+          if (readBinSel) entries += ((offset, word))
+          else words += selectedWord(offset, word)
+        }
+        def value: Bits = if (!readBinSel) words.toSeq.reduceBalancedTree(_ | _) else {
+          val parts = entries.groupBy(_._1 >> 8).toSeq.sortBy(_._1).map { case (page, es) =>
+            if (es.size < 3) es.map { case (o, w) => selectedWord(o, w) }.reduce(_ | _)
+            else {
+              val byIdx = es.map { case (o, w) => (((o >> 2) & 63), (o, w)) }.toMap
+              val k = log2Up(byIdx.keys.max + 1)
+              val idxQ = Reg(UInt(k bits))
+              val hitQ = RegInit(False)
+              when(dbgAxi.arvalid && dbgAxi.arready) {
+                idxQ := dbgAxi.araddr(k + 1 downto 2)
+                hitQ := (dbgAxi.araddr(DebugRegMap.DBG_AW - 1 downto 8) === page) &&
+                        (dbgAxi.araddr(1 downto 0) === 0) &&
+                        (if (k < 6) dbgAxi.araddr(7 downto k + 2) === 0 else True)
+              }
+              val vec = Vec((0 until (1 << k)).map(i => byIdx.get(i) match {
+                case Some((o, w)) => w.resize(DebugRegMap.DBG_DW bits)
+                case None         => B(0, DebugRegMap.DBG_DW bits)
+              }))
+              vec(idxQ).andMask(hitQ)
+            }
+          }
+          val result = parts.reduceBalancedTree(_ | _)
+          GenerationFlags.simulation {
+            // Executable equivalence: the per-word select form, sampled at the same point.
+            val ref = entries.map { case (o, w) => selectedWord(o, w) }.reduce(_ | _)
+            when(doRead) {
+              assert(result === ref,
+                "DebugCtrlPlugin CPU_DBG_READ_BINSEL: binary-indexed read != per-word select", FAILURE)
+            }
+          }
+          result
+        }
       }
 
       // ── Region 0: 0x00000-0x000FF, identity / control / halt / SoC config ───────

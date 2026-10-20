@@ -1357,4 +1357,45 @@ object ShippingCoreConfig {
     * 80-bit `bypassValue`, which then disappears from every FPU pipe stage and FpRoundPack.
     * Sim-asserted equal at FpRoundPack. Default OFF; echoed in `SHIPPING_CONFIG`. */
   val fpBypassInline: Boolean = envFlag("CPU_FP_BYPASS_INLINE", true)
+  /** Area (fable `area6`): the D-cache store command (`DStoreCmd`) drops its explicit
+    * 16-bit `strb` + 128-bit `lineData` lanes. Every producer's lanes were a pure function
+    * of {paddr offset, size, data}: SQ slot A (`storeDataA/StrbA` = the size-derived merge),
+    * SQ slot B (the tail of slot A's access, now `tailB` + `tailOff` = slot A's offset),
+    * and the ITLB/DTLB U/M drain (a one-hot byte, now a BYTE store at the byte address).
+    * The D-cache derives the merge lanes at S2/S3 from a 5-bit lane origin, which it
+    * already did for the non-strobe case, so ~139 payload bits leave s0/s0Bak/S1/S2/S3.
+    * Requires `!CPU_SQ_COALESCE_LINES` and `!SQ_NARROW_MERGE`. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val dstoreCompact: Boolean = envFlag("CPU_DSTORE_COMPACT", false)
+  /** Area (fable `area6`): the non-blocking L1D keeps ONE victim tag/line capture for
+    * both allocation sources (store S2 miss, load S1 miss). The array has one read port,
+    * so the two never capture in the same cycle, and each allocation reads the capture
+    * exactly one cycle later (sim-asserted). The write-back buffer then takes one push
+    * per cycle from one register. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val dcVictimShared: Boolean = envFlag("CPU_DC_VICTIM_SHARED", false)
+  /** Area (fable `area6`): the L1D's S3 store-merge lanes are a free-running register of
+    * S2's (every S3 reader is qualified by `stS3Valid`, which implies S2 handed the same
+    * payload over on the previous edge) instead of a second byte-lane shifter; in the
+    * non-blocking cache the same register stands in for `pendingMergeData/Strb` (a store
+    * miss allocates one cycle after its S2). Sim-asserted equal. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val dcS3MergeReg: Boolean = envFlag("CPU_DC_S3_MERGE_REG", false)
+  /** Area (fable `area6`): the exception unit's four RTE frame-word reads (frameBase +
+    * 0/2/4/6, one per state pair) share ONE address adder (offset decoded from the state)
+    * and ONE split/translate/physical-address cone instead of four copies feeding the
+    * xVa / ldoVaddr / ldoPaddr / curFault muxes. Same value in every state. Default OFF;
+    * echoed in `SHIPPING_CONFIG`. */
+  val excRteOneAddr: Boolean = envFlag("CPU_EXC_RTE_ONE_ADDR", false)
+  /** Area/timing (fable `area6`): the exception entry no longer writes a PRELIMINARY
+    * `frameBase` (three subtractors on the IDLE trigger cone, the i348a worst setup path
+    * `exc_activeReg -> frameBase`): its only path to a reader is through E_DRAIN, whose
+    * exit recomputes it, now as ONE subtractor with the frame size muxed. Default OFF;
+    * echoed in `SHIPPING_CONFIG`. */
+  val excFbLean: Boolean = envFlag("CPU_EXC_FB_LEAN", false)
+  /** Area (fable `area6`): debug CSR reads select the words of each dense 256-byte page
+    * through one binary-indexed mux (address bits captured on the AR edge, holes read 0)
+    * gated by one registered page hit, instead of one captured equality select and one
+    * AND-mask per word. Same latency, same values, zero for unlisted/unaligned offsets.
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val dbgReadBinSel: Boolean = envFlag("CPU_DBG_READ_BINSEL", false)
 }

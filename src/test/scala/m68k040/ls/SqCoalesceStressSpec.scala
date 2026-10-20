@@ -479,6 +479,7 @@ class SqCoalesceStressSpec extends AnyFunSuite {
   }
 
   test("coalescing + full-line no-fill: clean, and BOTH mechanisms fire", VerilatorTest) {
+    assume(!m68k040.sim.DStoreSim.compact, "CPU_DSTORE_COMPACT: line coalescing needs explicit store lanes")
     val r = runSeeds("on", coalesce = true, noFill = true, (1L to SEEDS.toLong), OPS)
     assert(r.map(_.coalesced).sum > 0, "the coalescer never fired -- the ON arm is vacuous")
     assert(r.map(_.noFills).sum > 0, "no full-line no-fill allocation ever happened -- vacuous")
@@ -486,12 +487,14 @@ class SqCoalesceStressSpec extends AnyFunSuite {
   }
 
   test("coalescing alone (no-fill OFF): clean", VerilatorTest) {
+    assume(!m68k040.sim.DStoreSim.compact, "CPU_DSTORE_COMPACT: line coalescing needs explicit store lanes")
     val r = runSeeds("coal", coalesce = true, noFill = false, (1L to (SEEDS / 2).max(2).toLong), OPS)
     assert(r.map(_.coalesced).sum > 0)
   }
 
   // ── MUTANTS: each MUST fail. A mutant that survives means the stress is blind. ──
   private def mustFail(tag: String, sqMut: Int = 0, dcMut: Int = 0, dropAckAt: Int = -1): Unit = {
+    assume(!m68k040.sim.DStoreSim.compact, "CPU_DSTORE_COMPACT: line coalescing needs explicit store lanes")
     // `noFillMutation` lives in the legacy no-fill hook only: a D-cache mutant pins that L1D.
     val c = dut(tag, coalesce = true, noFill = true, sqMut, dcMut, dropAckAt, legacy = dcMut != 0)
     val caught = (1L to 4L).exists { s =>
