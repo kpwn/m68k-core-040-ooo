@@ -738,8 +738,10 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       println(s"[nbStress $tag TOTAL over ${seeds.size} seeds] " +
         nbTot.toSeq.sortBy(_._1).map { case (k, x) => s"$k=$x" }.mkString(" "))
       // A pass is worthless unless every mechanism fired.
+      // CPU_DSTORE_COMPACT: no full-line store exists, so a no-fill allocation cannot either.
       for (k <- Seq("primaryAllocs", "loadSecondaries", "storeAllocs", "noFillAllocs", "storeMerges",
-                    "allocFail", "replays", "wbPushes", "occ2plus"))
+                    "allocFail", "replays", "wbPushes", "occ2plus")
+           if !(k == "noFillAllocs" && m68k040.sim.DStoreSim.compact))
         assert(nbTot(k) > 0, s"$tag: mechanism '$k' never fired: $nbTot")
     }
   }

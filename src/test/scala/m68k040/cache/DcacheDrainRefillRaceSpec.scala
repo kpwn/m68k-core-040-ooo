@@ -116,6 +116,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     compiled.doSim("runtimeResetInvalidatesDcache", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
+      // The maintenance port is an undriven sim input otherwise (random start value).
+      dut.probe.logic.maintCmdIn.valid #= false
       DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
       val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
@@ -148,6 +150,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
        VerilatorTest) {
     compiled.doSim("sameSetDrainRefillRace", 1) { dut =>
       dut.clockDomain.forkStimulus(10)
+      // The maintenance port is an undriven sim input otherwise (random start value).
+      dut.probe.logic.maintCmdIn.valid #= false
       DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
       val mem = m68k040.sim.HotDoorAttach(dut.dcache, dut.clockDomain, new BehavioralMemAgent(dut.dcache.logic.axi, dut.clockDomain))
       dut.probe.logic.loadCmdIn.valid #= false
@@ -337,6 +341,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       bc().doSim(s"sameWayWt_$storeCycle", 1) { dut =>
         val cd = dut.clockDomain
         cd.forkStimulus(10)
+        // The maintenance port is an undriven sim input otherwise (random start value).
+        dut.probe.logic.maintCmdIn.valid #= false
         DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
         val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
         dut.probe.logic.loadCmdIn.valid #= false
@@ -384,6 +390,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       bc().doSim(s"sameWayCb_$storeCycle", 1) { dut =>
         val cd = dut.clockDomain
         cd.forkStimulus(10)
+        // The maintenance port is an undriven sim input otherwise (random start value).
+        dut.probe.logic.maintCmdIn.valid #= false
         DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
         val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
         dut.probe.logic.loadCmdIn.valid #= false
@@ -431,6 +439,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     legacyCompiled.doSim("sameSetMissBarrier", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
+      // The maintenance port is an undriven sim input otherwise (random start value).
+      dut.probe.logic.maintCmdIn.valid #= false
       DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
       val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
@@ -494,6 +504,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     legacyCompiled.doSim("loadVictimStoreS1", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
+      // The maintenance port is an undriven sim input otherwise (random start value).
+      dut.probe.logic.maintCmdIn.valid #= false
       DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
       val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
@@ -593,6 +605,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     legacyCompiled.doSim("loadVictimFromS3", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
+      // The maintenance port is an undriven sim input otherwise (random start value).
+      dut.probe.logic.maintCmdIn.valid #= false
       DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
       val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
@@ -675,6 +689,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     legacyCompiled.doSim("loadVictimFromS3Launch", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
+      // The maintenance port is an undriven sim input otherwise (random start value).
+      dut.probe.logic.maintCmdIn.valid #= false
       DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
       val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
@@ -752,6 +768,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     legacyCompiled.doSim("storeVictimFromS3", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
+      // The maintenance port is an undriven sim input otherwise (random start value).
+      dut.probe.logic.maintCmdIn.valid #= false
       DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
       val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
@@ -812,6 +830,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     legacyCompiled.doSim("storeVictimFromS3Launch", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
+      // The maintenance port is an undriven sim input otherwise (random start value).
+      dut.probe.logic.maintCmdIn.valid #= false
       DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
       val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
