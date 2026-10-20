@@ -1367,4 +1367,10 @@ object ShippingCoreConfig {
     * Requires `!CPU_SQ_COALESCE_LINES` and `!SQ_NARROW_MERGE`. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val dstoreCompact: Boolean = envFlag("CPU_DSTORE_COMPACT", false)
+  /** Area (fable `area6`): the non-blocking L1D keeps ONE victim tag/line capture for
+    * both allocation sources (store S2 miss, load S1 miss). The array has one read port,
+    * so the two never capture in the same cycle, and each allocation reads the capture
+    * exactly one cycle later (sim-asserted). The write-back buffer then takes one push
+    * per cycle from one register. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val dcVictimShared: Boolean = envFlag("CPU_DC_VICTIM_SHARED", false)
 }

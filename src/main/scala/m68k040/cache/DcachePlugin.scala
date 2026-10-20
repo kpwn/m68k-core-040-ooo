@@ -412,6 +412,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
   val storeB2bRetime: Boolean = storeB2bRetimeFlag && nonBlocking
   /** `CPU_DSTORE_COMPACT` (fixed by `DStoreCmd`'s shape, so not a per-instance knob). */
   val dstoreCompact: Boolean = m68k040.top.ShippingCoreConfig.dstoreCompact
+  /** `CPU_DC_VICTIM_SHARED`: see `vShared` in the non-blocking area. */
+  val victimShared: Boolean = m68k040.top.ShippingCoreConfig.dcVictimShared &&
+    nonBlocking && !nbProbeMissStage && !sectored
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
   require(!nonBlocking || (nMshr >= 2 && nMshr <= 4), "DcachePlugin: nMshr must be 2..4 (hot-door ID is 2 bits)")
@@ -6403,8 +6406,36 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val stgVWay  = RegNext(s1Vw)
       val stgVDirty = RegNext(((rdDirty(s1Vw) && rdValid(s1Vw)) || (s1VFromS3 && stS3Copyback) ||
                                (s1VFromS3D1 && stS3WriteCopybackD1)))
-      val stgVTag  = RegNext(Mux(s1VFromS3, stS3Tag, Mux(s1VFromS3D1, stS3WriteTagD1, rdTag(s1Vw))))
-      val stgVLine = RegNext(Mux(s1VFromS3, stS3MergedLine, Mux(s1VFromS3D1, stS3WriteLineD1, rdData(s1Vw))))
+      // CPU_DC_VICTIM_SHARED: ONE victim tag/line capture for both allocation sources.
+      // The array has one read port: a load in S1 (`ldS1Valid`) and a store in S2
+      // (`stS2Valid`) never read it in the same cycle (asserted below). A store miss is
+      // allocated exactly one cycle after its S2 (`pendingStoreMiss` lasts one cycle in
+      // non-blocking mode), and a load miss exactly one cycle after its S1 (`stgValid`),
+      // so each consumer reads the capture of its own owner's cycle. The capture loads
+      // every cycle (no clock enable) with the read-port owner's victim.
+      val vSh = if (!victimShared) null else new Area {
+        val own   = stS2Valid
+        val set   = Mux(own, stS2Set, ldS1Set)
+        val way   = Mux(own, victim(stS2Set), s1Vw)
+        val fromS3   = stS3ArrayWrite && (stS3Set === set) && (stS3Way === way)
+        val fromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === set) && (stS3WriteWayD1 === way)
+        val tagQ  = RegNext(Mux(fromS3, stS3Tag, Mux(fromS3D1, stS3WriteTagD1, rdTag(way))))
+        val lineQ = RegNext(Mux(fromS3, stS3MergedLine, Mux(fromS3D1, stS3WriteLineD1, rdData(way))))
+        GenerationFlags.simulation {
+          assert(!(stS2Valid && ldS1Valid),
+            "DcachePlugin CPU_DC_VICTIM_SHARED: a store S2 and a load S1 own the read port together", FAILURE)
+          assert(!(pendingStoreMiss && stgValid),
+            "DcachePlugin CPU_DC_VICTIM_SHARED: a store and a load allocation staged together", FAILURE)
+          assert(!(pendingStoreMiss && !RegNext(stS2Valid, init = False)),
+            "DcachePlugin CPU_DC_VICTIM_SHARED: a pending store miss outlived its S2 capture", FAILURE)
+        }
+      }
+      val stgVTag  = if (victimShared) vSh.tagQ else
+        RegNext(Mux(s1VFromS3, stS3Tag, Mux(s1VFromS3D1, stS3WriteTagD1, rdTag(s1Vw))))
+      val stgVLine = if (victimShared) vSh.lineQ else
+        RegNext(Mux(s1VFromS3, stS3MergedLine, Mux(s1VFromS3D1, stS3WriteLineD1, rdData(s1Vw))))
+      val sVTag  = if (victimShared) vSh.tagQ else pendingVictimTag
+      val sVLine = if (victimShared) vSh.lineQ else pendingVictimLine
       if (nbProbeMissStage) when(nbProbeFastFire) {
         stgValid := True
         stgPaddr := cmdPaddr
@@ -6455,13 +6486,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
       lLine.simPublic() // simulation-only trace address for accepted MSHR allocation
       val lCam  = Vec((0 until N).map(k => validVec(k) && line(k) === lLine))
       val lCamAny = lCam.asBits.orR
+      // CPU_DC_VICTIM_SHARED: `sAlloc` (needs `pendingStoreMiss`) and `lAlloc` (needs
+      // `stgValid`) are exclusive (asserted in `vSh`), so the store terms drop out.
       val lSetBusy = (0 until N).map(k => validVec(k) && eset(k) === stgSet).reduce(_ || _) ||
-                     (sAlloc && sSet === stgSet)
-      val freeAfterS = freeBits & ~sOH
+                     (if (victimShared) False else (sAlloc && sSet === stgSet))
+      val freeAfterS = if (victimShared) freeBits else freeBits & ~sOH
       val lFreeOk = CountOne(freeAfterS).resize(3) >= (U(1, 3 bits) + s2CbRes)
       lFreeOk.simPublic()
       val lWbOk   = !stgVDirty ||
-                    ((wbFree - sWbPush.asUInt.resize(3)) >= (U(1, 3 bits) + s2CbRes))
+                    ((if (victimShared) wbFree else wbFree - sWbPush.asUInt.resize(3)) >=
+                     (U(1, 3 bits) + s2CbRes))
       val lSecondary = stgValid && !stgMultiHot && lCamAny
       lSecondary.simPublic()
       val lAlloc  = stgValid && !stgMultiHot && !lCamAny && !lSetBusy && lFreeOk && lWbOk &&
@@ -6549,7 +6583,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       }
 
       // ── Allocation / merge writes ────────────────────────────────────────────────────
-      val sVictimLineAddr = (pendingVictimTag ## sSet).asUInt
+      val sVictimLineAddr = (sVTag ## sSet).asUInt
       val lVictimLineAddr = (stgVTag ## stgSet).asUInt
       for (k <- 0 until N) {
         settled(k) := True
@@ -6635,11 +6669,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
       }
 
       // WB pushes (store victim first, then load victim).
-      when(sWbPush || lWbPush) {
+      if (victimShared) when(sWbPush || lWbPush) {
+        // One push per cycle (the two sources are exclusive), one data source.
+        wbV(wbTail)    := True
+        wbLine(wbTail) := (sVTag ## Mux(sWbPush, sSet, stgSet)).asUInt
+        wbData(wbTail) := sVLine
+        wbTail := wbTail + 1
+      } else when(sWbPush || lWbPush) {
         val t0 = wbTail
         val t1 = wbTail + 1
         when(sWbPush) {
-          wbV(t0) := True; wbLine(t0) := sVictimLineAddr; wbData(t0) := pendingVictimLine
+          wbV(t0) := True; wbLine(t0) := sVictimLineAddr; wbData(t0) := sVLine
           when(lWbPush) { wbV(t1) := True; wbLine(t1) := lVictimLineAddr; wbData(t1) := stgVLine }
         } otherwise {
           wbV(t0) := True; wbLine(t0) := lVictimLineAddr; wbData(t0) := stgVLine
