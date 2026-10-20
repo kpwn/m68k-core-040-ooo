@@ -1373,4 +1373,11 @@ object ShippingCoreConfig {
     * exactly one cycle later (sim-asserted). The write-back buffer then takes one push
     * per cycle from one register. Default OFF; echoed in `SHIPPING_CONFIG`. */
   val dcVictimShared: Boolean = envFlag("CPU_DC_VICTIM_SHARED", false)
+  /** Area (fable `area6`): the L1D's S3 store-merge lanes are a free-running register of
+    * S2's (every S3 reader is qualified by `stS3Valid`, which implies S2 handed the same
+    * payload over on the previous edge) instead of a second byte-lane shifter; in the
+    * non-blocking cache the same register stands in for `pendingMergeData/Strb` (a store
+    * miss allocates one cycle after its S2). Sim-asserted equal. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val dcS3MergeReg: Boolean = envFlag("CPU_DC_S3_MERGE_REG", false)
 }

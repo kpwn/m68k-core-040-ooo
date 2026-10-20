@@ -415,6 +415,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
   /** `CPU_DC_VICTIM_SHARED`: see `vShared` in the non-blocking area. */
   val victimShared: Boolean = m68k040.top.ShippingCoreConfig.dcVictimShared &&
     nonBlocking && !nbProbeMissStage && !sectored
+  /** `CPU_DC_S3_MERGE_REG`: S3 merge lanes registered from S2; in non-blocking mode they
+    * also stand in for `pendingMergeData/Strb` (a store miss allocates one cycle after S2). */
+  val s3MergeReg: Boolean = m68k040.top.ShippingCoreConfig.dcS3MergeReg
+  val s3MergeForPending: Boolean = s3MergeReg && nonBlocking && !nbProbeMissStage
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
   require(!nonBlocking || (nMshr >= 2 && nMshr <= 4), "DcachePlugin: nMshr must be 2..4 (hot-door ID is 2 bits)")
@@ -2393,18 +2397,26 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val stS3Copyback  = stS3Payload.cacheMode === CacheMode.COPYBACK
     stS3Valid := False
 
+    // CPU_DC_S3_MERGE_REG: S3's merge lanes are S2's, one cycle later. Every reader of
+    // `stS3MergeData/Strb` is qualified by `stS3Valid`, which implies S2 handed this exact
+    // payload over on the previous edge, so a free-running register of S2's merge lanes is
+    // equal to the recompute (sim-asserted below the S2 merge).
+    val s3MergeQ = if (!s3MergeReg) null else Reg(Bits(128 bits))
+    val s3StrbQ  = if (!s3MergeReg) null else Reg(Bits(16 bits))
     val stS3O5 = if (!dstoreCompact) null else
       DcacheByteLane.storeOrigin(stS3Off, stS3Payload.tailB, stS3Payload.tailOff)
-    val stS3MergeData = if (dstoreCompact)
+    def stS3MergeDataRe(): Bits = if (dstoreCompact)
       DcacheByteLane.storeDataX(stS3O5, stS3Payload.size, stS3Payload.data)
     else Mux(stS3Payload.useStrb,
       stS3Payload.lineData,
       DcacheByteLane.storeData(stS3Off, stS3Payload.size, stS3Payload.data))
-    val stS3MergeStrb = if (dstoreCompact)
+    def stS3MergeStrbRe(): Bits = if (dstoreCompact)
       DcacheByteLane.storeStrbX(stS3O5, stS3Payload.size)
     else Mux(stS3Payload.useStrb,
       stS3Payload.strb,
       DcacheByteLane.storeStrb(stS3Off, stS3Payload.size))
+    val stS3MergeData = if (s3MergeReg) s3MergeQ else stS3MergeDataRe()
+    val stS3MergeStrb = if (s3MergeReg) s3StrbQ else stS3MergeStrbRe()
     val stS3OldBytes = stS3OldLine.subdivideIn(8 bits)
     val stS3MrgBytes = stS3MergeData.subdivideIn(8 bits)
     val stS3NewBytes = Vec(Bits(8 bits), 16)
@@ -2496,6 +2508,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
     else Mux(stS2Payload.useStrb,
       stS2Payload.strb,
       DcacheByteLane.storeStrb(stS2Off, stS2Payload.size))
+    if (s3MergeReg) {
+      s3MergeQ := stS2MergeData
+      s3StrbQ  := stS2MergeStrb
+      GenerationFlags.simulation {
+        when(stS3Valid) {
+          assert(s3MergeQ === stS3MergeDataRe() && s3StrbQ === stS3MergeStrbRe(),
+            "DcachePlugin CPU_DC_S3_MERGE_REG: registered S3 merge lanes != recompute", FAILURE)
+        }
+      }
+    }
     val stS2RawHitLine = MuxOH(stS2HitVec, rdData)
     // If the preceding store writes this physical line in S3 while this lookup's
     // synchronous read returns, capture the preceding store's final line.  FPGA
@@ -6476,7 +6498,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val sAlloc = sDo && !sCamAny
       val sOH    = OHMasking.first(freeBits) & B(N bits, default -> sAlloc)
       sOH.simPublic() // simulation-only free-slot reservation diagnostic
-      val sNoFill = pendingMergeStrb.andR
+      // CPU_DC_S3_MERGE_REG: the store miss allocates exactly one cycle after its S2, so
+      // the free-running S3 merge register holds its lanes (sim-asserted equal).
+      val pMData = if (s3MergeForPending) s3MergeQ else pendingMergeData
+      val pMStrb = if (s3MergeForPending) s3StrbQ else pendingMergeStrb
+      if (s3MergeForPending) GenerationFlags.simulation {
+        when(sDo) {
+          assert(pMData === pendingMergeData && pMStrb === pendingMergeStrb,
+            "DcachePlugin CPU_DC_S3_MERGE_REG: S3 merge register != pending store-miss lanes", FAILURE)
+        }
+      }
+      val sNoFill = pMStrb.andR
       val sWbPush = sAlloc && pendingVictimDirty
       sWbPush.simPublic()
       val s2CbRes = (stS2Valid && stS2Copyback).asUInt.resize(3)
@@ -6593,8 +6625,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           line(k)   := sLine
           eset(k)   := sSet
           eway(k)   := pendingVictimWay
-          mbufW(k)  := pendingMergeData
-          mstrbW(k) := pendingMergeStrb
+          mbufW(k)  := pMData
+          mstrbW(k) := pMStrb
           mdirty(k) := True
           fault(k)  := False
           invPend(k) := True
@@ -6617,8 +6649,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
         }
         // COPYBACK store merge into an in-flight line (§4.2): bytes + dirty, ack now.
         when(sDo && sCam(k)) {
-          mbufW(k)  := mergeBytes(mbuf(k), pendingMergeData, pendingMergeStrb)
-          mstrbW(k) := mstrb(k) | pendingMergeStrb
+          mbufW(k)  := mergeBytes(mbuf(k), pMData, pMStrb)
+          mstrbW(k) := mstrb(k) | pMStrb
           mdirty(k) := True
         }
       }

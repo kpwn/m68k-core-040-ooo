@@ -838,7 +838,8 @@ object GenSocketTopVerilog {
             s"robSysRdySlot=${ShippingCoreConfig.robSysRdySlot} " +
             s"fpBypassInline=${ShippingCoreConfig.fpBypassInline} " +
             s"dstoreCompact=${ShippingCoreConfig.dstoreCompact} " +
-            s"dcVictimShared=${ShippingCoreConfig.dcVictimShared}")
+            s"dcVictimShared=${ShippingCoreConfig.dcVictimShared} " +
+            s"dcS3MergeReg=${ShippingCoreConfig.dcS3MergeReg}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,
