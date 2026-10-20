@@ -30,7 +30,9 @@ import spinal.lib._
   * advances by the popped count. */
 class MicroOpQueue(depth: Int = 16,
                    /** `CPU_UOPQ_ONE_READ`: one async read port per bank (see ShippingCoreConfig). */
-                   oneRead: Boolean = m68k040.top.ShippingCoreConfig.uopqOneRead) extends Component {
+                   oneRead: Boolean = m68k040.top.ShippingCoreConfig.uopqOneRead,
+                   /** `CPU_UOPQ_EXACT_READY`: accept a burst when it fits (see ShippingCoreConfig). */
+                   exactReady: Boolean = m68k040.top.ShippingCoreConfig.uopqExactReady) extends Component {
   require(isPow2(depth), "MicroOpQueue depth must be a power of two")
   val ptrW   = log2Up(depth)
   val countW = log2Up(depth + 1)
@@ -106,7 +108,11 @@ class MicroOpQueue(depth: Int = 16,
 
   // ── Accept only when ≥4 free slots (a full burst never overflows) ────────────
   val freeSlots = (U(depth, countW bits) - count)
-  io.push.ready := freeSlots >= U(4, countW bits)
+  // CPU_UOPQ_EXACT_READY: accept when the burst's ACTUAL count fits. Writes land at
+  // tail..tail+count-1 and never reach `head` (it would need count > freeSlots), and the
+  // RAW argument above still holds: a push that fires while full has count 0 (no write).
+  io.push.ready := (if (exactReady) freeSlots >= io.push.count.resize(countW)
+                    else freeSlots >= U(4, countW bits))
   val pushFire  = io.push.valid && io.push.ready
   // HARDWARE-clamped push count (gate by fire; do NOT use a when-gated Scala var).
   val pushN = Mux(pushFire, io.push.count.resize(countW), U(0, countW bits))

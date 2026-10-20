@@ -131,6 +131,7 @@ class FpMulPipe(exportNorm: Boolean = false) extends Component {
       req.bypass := True; req.bypassValue := Fp80.packZero(zSign)
     }
 
+    FpBypassInline.fold(req)
     val vld  = RegNext(m0.vld) init False
     val rReq = RegNext(req); val rA = RegNext(dSig); val rB = RegNext(sSig)
   }
@@ -165,10 +166,10 @@ class FpMulPipe(exportNorm: Boolean = false) extends Component {
     val expAd = Mux(prd3(127), S(0, 18 bits), S(-1, 18 bits))
     val req   = FpRoundReq().overridable()
     req := ctxReq(6)
-    req.sig    := norm(127 downto 64)
+    req.sig    := (if (FpBypassInline.on) Mux(ctxReq(6).bypass, ctxReq(6).sig, norm(127 downto 64)) else norm(127 downto 64))
     req.round  := norm(63)
     req.sticky := norm(62 downto 0) =/= 0
-    req.exp    := ctxReq(6).exp + expAd
+    req.exp    := (if (FpBypassInline.on) Mux(ctxReq(6).bypass, ctxReq(6).exp, ctxReq(6).exp + expAd) else ctxReq(6).exp + expAd)
     val vld  = RegNext(ctxValid(6)) init False
     val rReq = RegNext(req)
   }

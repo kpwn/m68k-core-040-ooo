@@ -160,6 +160,22 @@ case class FpResult() extends Bundle {
   * classified from the bypassed value, which is what makes FTST fall out for free.
   * `exc` is still carried through verbatim, so a bypassing front-end (FINT) can still
   * declare its own INEX2. */
+/** CPU_FP_BYPASS_INLINE: a bypassed request carries its final 80-bit value in its own
+  * {sign, exp, sig} lanes (exp = the 15-bit field, zero-extended) instead of a separate
+  * `bypassValue`, which then has no synthesis reader and is pruned in every pipe. The
+  * producers that later overwrite sig/exp keep them on a bypassed request. `bypassValue`
+  * is still driven exactly as before, so simulation asserts the two agree at FpRoundPack. */
+object FpBypassInline {
+  def on: Boolean = m68k040.top.ShippingCoreConfig.fpBypassInline
+  def fold(req: FpRoundReq): Unit = if (on) when(req.bypass) {
+    req.sign := req.bypassValue(79)
+    req.exp  := req.bypassValue(78 downto 64).asUInt.resize(18).asSInt
+    req.sig  := req.bypassValue(63 downto 0).asUInt
+  }
+  def value(req: FpRoundReq): Bits =
+    if (on) Fp80.pack(req.sign, req.exp.asUInt.resize(15), req.sig) else req.bypassValue
+}
+
 case class FpRoundReq() extends Bundle {
   val sign         = Bool()
   val exp          = SInt(18 bits)   // biased, signed & widened (FMUL can reach 49150, and

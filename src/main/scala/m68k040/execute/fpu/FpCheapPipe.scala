@@ -259,7 +259,7 @@ class FpCheapPipe extends Component {
     // encoding), which is the convention FpRoundReq.exp already uses -- so a denormal
     // source arrives at FpRoundPack as an un-normalised significand with exp 1, and the
     // single/double UNFL arm re-shifts it to that precision's own denormal boundary.
-    req.exp  := Mux(vExp === 0, S(1, 18 bits), vExp.resize(18).asSInt)
+    req.exp  := Mux(vExp === 0 && (if (FpBypassInline.on) reRound else True), S(1, 18 bits), vExp.resize(18).asSInt)
     req.sig  := val80(63 downto 0).asUInt
     req.round := False; req.sticky := False
     req.bypass := !reRound

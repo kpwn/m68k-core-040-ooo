@@ -17,6 +17,7 @@ class RasPayloadResetSpec extends AnyFunSuite {
       logic.invalidateAll := invalidate
       logic.checkpointSave := save; logic.checkpointRestore := restore
       logic.ras.foreach(_.simPublic()); logic.ckRas.foreach(_.simPublic())
+      if (logic.ckPendOn) { logic.ckPendValid.simPublic(); logic.ckPendIdx.simPublic(); logic.ckPendData.simPublic() }
     }
   }
   class Dut(depth: Int) extends Component {
@@ -49,6 +50,10 @@ class RasPayloadResetSpec extends AnyFunSuite {
         // reaches `ras` (RasPlugin's 200 MHz write buffer); the LOGICAL row is that view.
         def liveRow(row: Int): Long =
           if (d.pendValid.toBoolean && d.pendIdx.toInt == row) d.pendData.toLong else d.ras(row).toLong
+        // CPU_RAS_CK_PEND: the checkpoint's LOGICAL row is ckRas overridden by its parked write.
+        def ckRow(row: Int): Long =
+          if (d.ckPendOn && d.ckPendValid.toBoolean && d.ckPendIdx.toInt == row) d.ckPendData.toLong
+          else d.ckRas(row).toLong
         def checkState(): Unit = {
           assert(d.rasSp.toInt == model.sp && d.count.toInt == model.count,
             s"RAS ownership live control mismatch cycle=$cycles")
@@ -65,7 +70,7 @@ class RasPayloadResetSpec extends AnyFunSuite {
           for (i <- 1 to model.ckCount) {
             val row = (model.ckSp - i) & (depth - 1)
             val expected = model.checkpoint(row).getOrElse(fail(s"reference exposed unwritten checkpoint row=$row"))
-            assert(d.ckRas(row).toLong == expected,
+            assert(ckRow(row) == expected,
               s"RAS poisoned checkpoint payload became owned: cycle=$cycles row=$row")
           }
           val target = if (model.count == 0) 0L else {

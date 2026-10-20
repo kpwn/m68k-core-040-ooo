@@ -1315,4 +1315,40 @@ object ShippingCoreConfig {
     * about half the queue's LUTRAM replicas. Bit-exact. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val uopqOneRead: Boolean = envFlag("CPU_UOPQ_ONE_READ", true)
+  /** IPC (fable `area5`): the MicroOpQueue accepts a push burst when its ACTUAL µop count
+    * fits in the free slots, instead of always reserving room for a full 4-µop burst. The
+    * queue still never holds more than 16 µops, so every downstream depth bound is unchanged.
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val uopqExactReady: Boolean = envFlag("CPU_UOPQ_EXACT_READY", false)
+  /** Area (fable `area5`): each RAT resolves its spec/committed `location` select ONCE per
+    * architectural register, so every read port is one archDepth:1 mux of the effective
+    * mapping instead of two muxes plus a location mux. Same function of the same registers.
+    * Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val ratEffRead: Boolean = envFlag("CPU_RAT_EFF_READ", false)
+  /** Area (fable `area5`): the RAS checkpoint copies the raw stack rows plus the one parked
+    * payload write, and a restore reloads the parked write, instead of resolving the parked
+    * write into all 16x32 checkpoint rows at save time. Same logical stack. Default OFF;
+    * echoed in `SHIPPING_CONFIG`. */
+  val rasCkPend: Boolean = envFlag("CPU_RAS_CK_PEND", false)
+  /** Area (fable `area5`): the IQ's retimed C+1 scoreboard clear reads the issued uop's
+    * destination fields from its COLD LUTRAM row (same record, same push) instead of the hot
+    * slot copy, so the 29 destination bits leave the 16-slot compacting array and the five
+    * select muxes. Same values, same cycle. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val iqDstCold: Boolean = envFlag("CPU_IQ_DST_COLD", false)
+  /** Area (fable `area5`): the IQ's dynamic-wakeup clears (and the slot spec mask) drop the
+    * per-source read qualifiers: a dynWait bit is only set at push together with its
+    * qualifier, so a clear of an unqualified source clears a bit that is already 0. Six
+    * qualifier bits leave the 16-slot compacting array. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val iqWaitNoValid: Boolean = envFlag("CPU_IQ_WAIT_NOVALID", false)
+  /** Area (fable `area5`): the ROB's "system-op value landed" bit lives in the op's capture
+    * slot (8 entries, set by the same tag-matched completion that fills the value) instead
+    * of a 32-entry per-ROB-entry array written by every completion port; every reader is
+    * gated to an entry that owns a slot. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val robSysRdySlot: Boolean = envFlag("CPU_ROB_SYSRDY_SLOT", false)
+  /** Area (fable `area5`): a bypassed FPU round request (NaN/infinity/zero/FMOVE-class
+    * results) carries its final value in its own sign/exp/sig lanes instead of a separate
+    * 80-bit `bypassValue`, which then disappears from every FPU pipe stage and FpRoundPack.
+    * Sim-asserted equal at FpRoundPack. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val fpBypassInline: Boolean = envFlag("CPU_FP_BYPASS_INLINE", false)
 }
