@@ -122,8 +122,8 @@ final class StoreAddrTripwire(lsEu: LsEuPlugin, dc: DcachePlugin, rfInt: RegFile
       storesDrained += 1
       val p     = sp.payload
       val paddr = p.paddr.toLong & 0xffffffffL
-      val useStrb = p.useStrb.toBoolean
-      val strb  = if (useStrb) p.strb.toInt & 0xffff else 0
+      val useStrb = m68k040.sim.DStoreSim.strobed(p)
+      val strb  = if (useStrb) m68k040.sim.DStoreSim.lanes(p)._1 else 0
       val lowest =
         if (useStrb) (paddr & ~0xfL) + (0 until 16).find(k => ((strb >> k) & 1) == 1).getOrElse(0)
         else paddr
@@ -140,7 +140,7 @@ final class StoreAddrTripwire(lsEu: LsEuPlugin, dc: DcachePlugin, rfInt: RegFile
           case _         => 4
         }
         hits += Hit(cycle, paddr, lowest, p.data.toLong & 0xffffffffL, size, useStrb, strb,
-                    if (useStrb) p.lineData.toBigInt else BigInt(0), p.precise.toBoolean, src, rec)
+                    if (useStrb) m68k040.sim.DStoreSim.lanes(p)._2 else BigInt(0), p.precise.toBoolean, src, rec)
       }
     }
   }

@@ -145,9 +145,7 @@ class DcacheSectorSpec extends AnyFunSuite {
     dut.probe.logic.storeIn.payload.paddr #= paddr
     dut.probe.logic.storeIn.payload.data #= data
     dut.probe.logic.storeIn.payload.size #= Size.LONG
-    dut.probe.logic.storeIn.payload.useStrb #= false
-    dut.probe.logic.storeIn.payload.strb #= 0
-    dut.probe.logic.storeIn.payload.lineData #= 0
+    m68k040.sim.DStoreSim.drivePlain(dut.probe.logic.storeIn.payload)
     dut.probe.logic.storeIn.payload.cacheMode #= cacheMode
     dut.probe.logic.storeIn.payload.precise #= false
     cd.waitSamplingWhere(dut.probe.logic.storeIn.valid.toBoolean &&

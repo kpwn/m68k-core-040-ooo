@@ -1357,4 +1357,14 @@ object ShippingCoreConfig {
     * 80-bit `bypassValue`, which then disappears from every FPU pipe stage and FpRoundPack.
     * Sim-asserted equal at FpRoundPack. Default OFF; echoed in `SHIPPING_CONFIG`. */
   val fpBypassInline: Boolean = envFlag("CPU_FP_BYPASS_INLINE", true)
+  /** Area (fable `area6`): the D-cache store command (`DStoreCmd`) drops its explicit
+    * 16-bit `strb` + 128-bit `lineData` lanes. Every producer's lanes were a pure function
+    * of {paddr offset, size, data}: SQ slot A (`storeDataA/StrbA` = the size-derived merge),
+    * SQ slot B (the tail of slot A's access, now `tailB` + `tailOff` = slot A's offset),
+    * and the ITLB/DTLB U/M drain (a one-hot byte, now a BYTE store at the byte address).
+    * The D-cache derives the merge lanes at S2/S3 from a 5-bit lane origin, which it
+    * already did for the non-strobe case, so ~139 payload bits leave s0/s0Bak/S1/S2/S3.
+    * Requires `!CPU_SQ_COALESCE_LINES` and `!SQ_NARROW_MERGE`. Default OFF; echoed in
+    * `SHIPPING_CONFIG`. */
+  val dstoreCompact: Boolean = envFlag("CPU_DSTORE_COMPACT", false)
 }

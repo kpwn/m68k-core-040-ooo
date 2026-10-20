@@ -98,15 +98,23 @@ class MmioStoreSizingSpec extends AnyFunSuite {
   }
 
   private def store(dut: Dut, paddr: Long, data: BigInt, size: SpinalEnumElement[Size.type],
-                    useStrb: Boolean = false, strb: BigInt = 0, lineData: BigInt = 0): Unit = {
+                    useStrb: Boolean = false, strb: BigInt = 0, lineData: BigInt = 0,
+                    tailOff: Int = -1): Unit = {
     val p = dut.probe.logic
     p.storeIn.valid #= true
     p.storeIn.payload.paddr #= paddr
     p.storeIn.payload.data  #= data
     p.storeIn.payload.size  #= size
     p.storeIn.payload.useStrb #= useStrb
-    p.storeIn.payload.strb    #= strb
-    p.storeIn.payload.lineData #= lineData
+    if (m68k040.sim.DStoreSim.compact) {
+      // CPU_DSTORE_COMPACT: a split slot B is `tailB` + slot A's offset, never explicit lanes.
+      require(!useStrb || tailOff >= 0, "compact store: explicit lanes do not exist")
+      p.storeIn.payload.tailB   #= tailOff >= 0
+      p.storeIn.payload.tailOff #= (if (tailOff >= 0) tailOff else 0)
+    } else {
+      p.storeIn.payload.strb    #= strb
+      p.storeIn.payload.lineData #= lineData
+    }
     p.storeIn.payload.cacheMode #= CacheMode.INHIBITED
     p.storeIn.payload.precise #= false
     dut.clockDomain.waitSamplingWhere(p.storeIn.ready.toBoolean && p.storeIn.valid.toBoolean)
@@ -177,8 +185,12 @@ class MmioStoreSizingSpec extends AnyFunSuite {
         val lineBase = BASE + 0x2000L + 0x100L * spill
         val strb = (0 until spill).foldLeft(BigInt(0))((a, i) => a | (BigInt(1) << i))
         log.clear(); writes.clear()
-        store(dut, lineBase, 0, Size.LONG, useStrb = true, strb = strb,
-              lineData = BigInt("A5A5A5A5", 16))
+        // CPU_DSTORE_COMPACT: the same slot is a LONG at slot-A offset 12+spill (`tailB`).
+        if (m68k040.sim.DStoreSim.compact)
+          store(dut, lineBase, BigInt("A5A5A5A5", 16), Size.LONG, useStrb = true, tailOff = 12 + spill)
+        else
+          store(dut, lineBase, 0, Size.LONG, useStrb = true, strb = strb,
+                lineData = BigInt("A5A5A5A5", 16))
         val want = MmioCover.model(0, spill)
         assert(log.length == want.length,
           s"spill=$spill: ${log.length} sub-transactions ${log.toList}, cover says $want")
@@ -231,9 +243,7 @@ class MmioStoreSizingSpec extends AnyFunSuite {
         p.storeIn.payload.paddr #= BASE + 0x4000L + off
         p.storeIn.payload.data  #= BigInt("CAFE", 16)
         p.storeIn.payload.size  #= Size.WORD
-        p.storeIn.payload.useStrb #= false
-        p.storeIn.payload.strb #= 0
-        p.storeIn.payload.lineData #= 0
+        m68k040.sim.DStoreSim.drivePlain(p.storeIn.payload)
         p.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
         p.storeIn.payload.precise #= false
         dut.clockDomain.waitSamplingWhere(p.storeIn.ready.toBoolean && p.storeIn.valid.toBoolean)

@@ -733,7 +733,7 @@ object PortedTestRunner {
             val p = dut.rob.logic.exc.dcStore.payload
             println(f"[exctrace] DCSTORE cyc=$trCyc%6d paddr=0x${p.paddr.toLong & 0xffffffffL}%08x " +
               f"size=${p.size.toEnum} data=0x${p.data.toLong & 0xffffffffL}%08x useStrb=${p.useStrb.toBoolean} " +
-              f"strb=0x${p.strb.toLong & 0xffffL}%04x")
+              f"strb=0x${m68k040.sim.DStoreSim.lanes(p)._1 & 0xffff}%04x")
           }
           if (dut.dcache.logic.loadCmdPort.valid.toBoolean && dut.dcache.logic.loadCmdPort.ready.toBoolean) {
             val c = dut.dcache.logic.loadCmdPort.payload

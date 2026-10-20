@@ -1281,8 +1281,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // strobed lane is written -- `useStrb`), so one 8-bit register replaces 128 flops and
     // the per-lane placement decode. See `ShippingCoreConfig.tlbDrainNarrow`.
     val drainNarrow = m68k040.top.ShippingCoreConfig.tlbDrainNarrow
-    val drainBeatReg = if (drainNarrow) null else Reg(Bits(128 bits))
-    val drainByteReg = if (drainNarrow) Reg(Bits(8 bits)) else null
+    // `CPU_DSTORE_COMPACT`: the U/M drain is a plain BYTE store at the descriptor's byte
+    // address; only the merged byte is kept (like `drainNarrow`).
+    val dstCompact   = m68k040.top.ShippingCoreConfig.dstoreCompact
+    val drainBeatReg = if (drainNarrow || dstCompact) null else Reg(Bits(128 bits))
+    val drainByteReg = if (drainNarrow || dstCompact) Reg(Bits(8 bits)) else null
     val drainStrbReg = Reg(Bits(16 bits))
 
     // ── MERGE, DO NOT OVERWRITE (2026-09-10) ────────────────────────────────────
@@ -1417,7 +1420,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       drainReadPend := False
       val curByte = _walkLoadRsp.payload.data(7 downto 0)
       val merged  = curByte | drainSetBits
-      drainAddrReg := (drainRdAddr(31 downto 4) ## U(0, 4 bits)).asUInt
+      drainAddrReg := (if (dstCompact) (drainRdAddr(31 downto 4) ## drainOffReg).asUInt
+                       else (drainRdAddr(31 downto 4) ## U(0, 4 bits)).asUInt)
       val mBeat = Bits(128 bits); mBeat := B(0, 128 bits)
       val mStrb = Bits(16 bits);  mStrb := B(0, 16 bits)
       for (i <- 0 until 16) {
@@ -1426,7 +1430,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
           mStrb(i) := True
         }
       }
-      if (drainNarrow) drainByteReg := merged else drainBeatReg := mBeat
+      if (drainNarrow || dstCompact) drainByteReg := merged else drainBeatReg := mBeat
       drainStrbReg := mStrb
       drainArmed   := True
     }
@@ -1479,11 +1483,19 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     }
     _walkStore.valid              := (if (umAtomic) drainArmed && !umYield else drainArmed)
     _walkStore.payload.paddr      := drainAddrReg
-    _walkStore.payload.data       := B(0, 32 bits)   // don't-care under useStrb
-    _walkStore.payload.size       := m68k040.isa.Size.LONG   // ditto
-    _walkStore.payload.useStrb    := True
-    _walkStore.payload.strb       := drainStrbReg
-    _walkStore.payload.lineData   := (if (drainNarrow) Cat(Seq.fill(16)(drainByteReg)) else drainBeatReg)
+    if (dstCompact) {
+      _walkStore.payload.data     := drainByteReg.resize(32 bits)
+      _walkStore.payload.size     := m68k040.isa.Size.BYTE
+      _walkStore.payload.useStrb  := True
+      _walkStore.payload.tailB    := False
+      _walkStore.payload.tailOff  := U(0, 4 bits)
+    } else {
+      _walkStore.payload.data       := B(0, 32 bits)   // don't-care under useStrb
+      _walkStore.payload.size       := m68k040.isa.Size.LONG   // ditto
+      _walkStore.payload.useStrb    := True
+      _walkStore.payload.strb       := drainStrbReg
+      _walkStore.payload.lineData   := (if (drainNarrow) Cat(Seq.fill(16)(drainByteReg)) else drainBeatReg)
+    }
     // Overwritten by the arbiter with the SAME fixed policy expression the walker's
     // reads use (`CACR.DE ? WRITETHROUGH : INHIBITED`). A per-half cache mode is
     // forbidden: the read and the write halves of one table search must agree, or the

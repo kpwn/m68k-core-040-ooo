@@ -38,24 +38,7 @@ object MemWriteCapture {
       if (!(sp.valid.toBoolean && sp.ready.toBoolean)) return
       val p     = sp.payload
       val paddr = p.paddr.toLong & 0xffffffffL
-      if (p.useStrb.toBoolean) {
-        // Line-relative byte strobe: lane i covers byte (paddr & ~0xF) + i, and
-        // `lineData` is `Vec(Bits(8),16).asBits`, so lane i sits at bits [8i+7 : 8i].
-        val strb = sp.payload.strb.toBigInt
-        val line = sp.payload.lineData.toBigInt
-        val base = paddr & ~0xfL
-        for (i <- 0 until 16 if strb.testBit(i))
-          events += ByteWrite(base + i, ((line >> (8 * i)) & 0xff).toInt, cycle)
-      } else {
-        val n = p.size.toEnum match {
-          case m68k040.isa.Size.BYTE => 1
-          case m68k040.isa.Size.WORD => 2
-          case _                     => 4
-        }
-        val data = p.data.toLong & 0xffffffffL
-        for (k <- 0 until n)
-          events += ByteWrite(paddr + k, ((data >> (8 * (n - 1 - k))) & 0xff).toInt, cycle)
-      }
+      for ((a, v) <- m68k040.sim.DStoreSim.byteWrites(p)) events += ByteWrite(a, v, cycle)
     }
   }
 

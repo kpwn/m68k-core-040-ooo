@@ -965,8 +965,13 @@ class ExceptionUnit(
   dcStore.payload.data    := stoDataReg
   dcStore.payload.size    := stoSizeReg
   dcStore.payload.useStrb := False
-  dcStore.payload.strb    := B(0, 16 bits)
-  dcStore.payload.lineData:= B(0, 128 bits)
+  if (m68k040.top.ShippingCoreConfig.dstoreCompact) {
+    dcStore.payload.tailB   := False
+    dcStore.payload.tailOff := U(0, 4 bits)
+  } else {
+    dcStore.payload.strb    := B(0, 16 bits)
+    dcStore.payload.lineData:= B(0, 128 bits)
+  }
   // ── Exception-sequencer D-cache access cacheability (Task P5.7 root-cause fix) ──
   // The exception sequencer's frame/vector accesses are now DTLB-translated
   // (2026-09-09), so a page attribute does exist -- but this unit still does not consult

@@ -410,6 +410,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
   val storeD1Fwd: Boolean  = storeD1FwdFlag && nonBlocking
   val storeLdLine: Boolean = storeLdLineFlag && nonBlocking
   val storeB2bRetime: Boolean = storeB2bRetimeFlag && nonBlocking
+  /** `CPU_DSTORE_COMPACT` (fixed by `DStoreCmd`'s shape, so not a per-instance knob). */
+  val dstoreCompact: Boolean = m68k040.top.ShippingCoreConfig.dstoreCompact
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
   require(!nonBlocking || (nMshr >= 2 && nMshr <= 4), "DcachePlugin: nMshr must be 2..4 (hot-door ID is 2 bits)")
@@ -2388,10 +2390,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val stS3Copyback  = stS3Payload.cacheMode === CacheMode.COPYBACK
     stS3Valid := False
 
-    val stS3MergeData = Mux(stS3Payload.useStrb,
+    val stS3O5 = if (!dstoreCompact) null else
+      DcacheByteLane.storeOrigin(stS3Off, stS3Payload.tailB, stS3Payload.tailOff)
+    val stS3MergeData = if (dstoreCompact)
+      DcacheByteLane.storeDataX(stS3O5, stS3Payload.size, stS3Payload.data)
+    else Mux(stS3Payload.useStrb,
       stS3Payload.lineData,
       DcacheByteLane.storeData(stS3Off, stS3Payload.size, stS3Payload.data))
-    val stS3MergeStrb = Mux(stS3Payload.useStrb,
+    val stS3MergeStrb = if (dstoreCompact)
+      DcacheByteLane.storeStrbX(stS3O5, stS3Payload.size)
+    else Mux(stS3Payload.useStrb,
       stS3Payload.strb,
       DcacheByteLane.storeStrb(stS3Off, stS3Payload.size))
     val stS3OldBytes = stS3OldLine.subdivideIn(8 bits)
@@ -2473,10 +2481,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val stS2HitAny    = OneHotSafe.exactlyOne(stS2HitVec)
     val stS2HitWay    = OHToUInt(stS2HitVec)
     stS2MultiHot.simPublic()
-    val stS2MergeData = Mux(stS2Payload.useStrb,
+    val stS2O5 = if (!dstoreCompact) null else
+      DcacheByteLane.storeOrigin(stS2Off, stS2Payload.tailB, stS2Payload.tailOff)
+    val stS2MergeData = if (dstoreCompact)
+      DcacheByteLane.storeDataX(stS2O5, stS2Payload.size, stS2Payload.data)
+    else Mux(stS2Payload.useStrb,
       stS2Payload.lineData,
       DcacheByteLane.storeData(stS2Off, stS2Payload.size, stS2Payload.data))
-    val stS2MergeStrb = Mux(stS2Payload.useStrb,
+    val stS2MergeStrb = if (dstoreCompact)
+      DcacheByteLane.storeStrbX(stS2O5, stS2Payload.size)
+    else Mux(stS2Payload.useStrb,
       stS2Payload.strb,
       DcacheByteLane.storeStrb(stS2Off, stS2Payload.size))
     val stS2RawHitLine = MuxOH(stS2HitVec, rdData)
@@ -5755,8 +5769,21 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // Task #236 fix: compute the new stSubP/stSubEnd into locals ONCE, use them both for
       // the register writes AND to register stSubLog2Reg from the same new values -- never
       // from stSubP/stSubEnd read directly here, which would see the pre-edge (stale) value.
-      val newStSubP   = Mux(stS3Payload.useStrb, stStartSt, stStartSz)
-      val newStSubEnd = Mux(stS3Payload.useStrb, stEndSt,   stEndSz)
+      // CPU_DSTORE_COMPACT: the strobe run of every store shape is closed-form. Slot A
+      // (split or not), exception and U/M-drain BYTE stores: [off, min(off+n,16)). Slot B
+      // (`tailB`): [0, tailOff + n - 16).
+      val stEndTail = (stS3Payload.tailOff.resize(5 bits) + stNBytes.resize(5 bits) - U(16, 5 bits))
+      val newStSubP   = if (dstoreCompact) Mux(stS3Payload.tailB, U(0, offBits bits), stStartSz)
+                        else Mux(stS3Payload.useStrb, stStartSt, stStartSz)
+      val newStSubEnd = if (dstoreCompact) Mux(stS3Payload.tailB, stEndTail, stEndSz)
+                        else Mux(stS3Payload.useStrb, stEndSt,   stEndSz)
+      if (dstoreCompact) GenerationFlags.simulation {
+        when(stS3Valid) {
+          assert(newStSubP === stStartSt && newStSubEnd === stEndSt,
+            "DcachePlugin CPU_DSTORE_COMPACT: closed-form store range disagrees with the strobe run",
+            FAILURE)
+        }
+      }
       val newStSubLog2 = m68k040.socket.MmioCover.stepLog2(newStSubP, newStSubEnd)
       stSubP       := newStSubP
       stSubEnd     := newStSubEnd
@@ -5774,7 +5801,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // construction (DcacheTypes.scala:312-320's storeStrbA sets exactly bytes
         // off .. min(off+n,16)-1). Assert it rather than assume it, so a future change to
         // the merge-strobe derivation is loud instead of silently re-widening the range.
-        when(stS3Valid && stS3Inhibited && !stS3Payload.useStrb) {
+        if (!dstoreCompact) when(stS3Valid && stS3Inhibited && !stS3Payload.useStrb) {
           assert(stStartSt === stStartSz && stEndSt === stEndSz,
             "DcachePlugin: the strobe-derived and size-derived store ranges disagree on a " +
             "useStrb=false INHIBITED store", FAILURE)

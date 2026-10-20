@@ -234,13 +234,17 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
 
   private def descB(s: StoreReq): Desc = {
     val (strb, lineData) = splitStrbLine((s.paddr & 0xF).toInt, s.size, s.data, highHalf = true)
-    Desc(s.paddrB, BigInt(0), Size.LONG.toString, useStrb = true,
+    // CPU_DSTORE_COMPACT: slot B presents the access's own {data, size} (+ tailB).
+    val cmp = m68k040.sim.DStoreSim.compact
+    Desc(s.paddrB, if (cmp) s.data else BigInt(0), if (cmp) s.size.toString else Size.LONG.toString, useStrb = true,
          strb, lineData, modeName(s.modeB), s.precise)
   }
 
   private def payloadDesc(p: DStoreCmd): Desc = {
     Desc(p.paddr.toLong & 0xffffffffL, p.data.toBigInt, p.size.toEnum.toString,
-         p.useStrb.toBoolean, p.strb.toInt, p.lineData.toBigInt,
+         p.useStrb.toBoolean,
+         if (m68k040.sim.DStoreSim.compact) m68k040.sim.DStoreSim.lanes(p)._1 else p.strb.toInt,
+         if (m68k040.sim.DStoreSim.compact) m68k040.sim.DStoreSim.lanes(p)._2 else p.lineData.toBigInt,
          p.cacheMode.toEnum.toString, p.precise.toBoolean)
   }
 

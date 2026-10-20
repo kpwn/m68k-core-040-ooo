@@ -254,8 +254,13 @@ case class DStoreCmd() extends Bundle {
   val data      = Bits(32 bits)
   val size      = Size()
   val useStrb   = Bool()
-  val strb      = Bits(16 bits)
-  val lineData  = Bits(128 bits)
+  // `CPU_DSTORE_COMPACT`: the explicit lanes are gone; `tailB`/`tailOff` describe the one
+  // store shape that is not {paddr offset, size, data}: SQ slot B, the bytes of an access
+  // at line offset `tailOff` that spill past the end of the previous line.
+  val strb      = if (m68k040.top.ShippingCoreConfig.dstoreCompact) null else Bits(16 bits)
+  val lineData  = if (m68k040.top.ShippingCoreConfig.dstoreCompact) null else Bits(128 bits)
+  val tailB     = if (m68k040.top.ShippingCoreConfig.dstoreCompact) Bool() else null
+  val tailOff   = if (m68k040.top.ShippingCoreConfig.dstoreCompact) UInt(4 bits) else null
   val cacheMode = CacheMode()
   val precise   = Bool()   // this drain is on the SQ's at-head precise path (Task P2) --
                             // gates whether a bus error here goes to the SQ's
@@ -623,6 +628,35 @@ object DcacheByteLane {
       when(kActive(size, k) && (pos >= U(16))) { out((pos - U(16)).resize(4 bits)) := valueByte(size, data, k) }
     }
     out.asBits
+  }
+
+  /** `CPU_DSTORE_COMPACT`: lane origin of a store. Slot B of a split (`tailB`) is the
+    * access at offset `tailOff` of the previous line, i.e. origin `tailOff - 16` (mod 32). */
+  def storeOrigin(off: UInt, tailB: Bool, tailOff: UInt): UInt =
+    Mux(tailB, U(1, 1 bits) ## tailOff, U(0, 1 bits) ## off).asUInt
+
+  /** `CPU_DSTORE_COMPACT`: merge data of a store whose byte `k` lands at lane
+    * `(o5 + k) mod 32` when that is < 16. With `o5 = off` (0..15) this is `storeDataA`
+    * (= `storeData` for a non-crossing store); with `o5 = 16 + off` it is `storeDataB`. */
+  def storeDataX(o5: UInt, size: Size.C, data: Bits): Bits = {
+    val out = Vec(Bits(8 bits), 16)
+    for (i <- 0 until 16) out(i) := B(0, 8 bits)
+    for (k <- 0 until 4) {
+      val pos = (o5 + U(k, 5 bits)).resize(5 bits)
+      when(kActive(size, k) && !pos.msb) { out(pos.resize(4 bits)) := valueByte(size, data, k) }
+    }
+    out.asBits
+  }
+
+  /** `CPU_DSTORE_COMPACT`: byte strobe matching `storeDataX`. */
+  def storeStrbX(o5: UInt, size: Size.C): Bits = {
+    val bits = Vec(Bool(), 16)
+    for (i <- 0 until 16) bits(i) := False
+    for (k <- 0 until 4) {
+      val pos = (o5 + U(k, 5 bits)).resize(5 bits)
+      when(kActive(size, k) && !pos.msb) { bits(pos.resize(4 bits)) := True }
+    }
+    bits.asBits
   }
 
   /** Store split — slot B byte strobe. Zero when the access does not cross. */

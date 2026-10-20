@@ -253,7 +253,7 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       val drained = scala.collection.mutable.ListBuffer[(Long, Long)]()
       fork { while (true) { cd.waitSampling()
         if (dut.io.drain.valid.toBoolean && dut.io.drain.ready.toBoolean)
-          drained += ((dut.io.drain.payload.paddr.toLong, dut.io.drain.payload.strb.toLong)) } }
+          drained += ((dut.io.drain.payload.paddr.toLong, m68k040.sim.DStoreSim.lanes(dut.io.drain.payload)._1.toLong)) } }
       forkDrainAck(dut, cd)
       allocSplit(dut, cd, robId = 4,
         paddrA = 0x10E, nbytesA = 2,
@@ -556,8 +556,9 @@ class StoreQueueSplitSpec extends AnyFunSuite {
           t += 1
           if (dut.io.drain.valid.toBoolean && dut.io.drain.ready.toBoolean) {
             val p = dut.io.drain.payload
-            drainedA += ((p.paddr.toLong, p.useStrb.toBoolean, p.strb.toLong,
-              if (p.useStrb.toBoolean) p.lineData.toBigInt else BigInt(p.data.toLong)))
+            drainedA += ((p.paddr.toLong, p.useStrb.toBoolean,
+              (if (p.useStrb.toBoolean) m68k040.sim.DStoreSim.lanes(p)._1.toLong else 0L),
+              if (p.useStrb.toBoolean) m68k040.sim.DStoreSim.lanes(p)._2 else BigInt(p.data.toLong)))
             due.enqueue(t + ackLatency)
           }
           if (due.nonEmpty && due.front <= t) { due.dequeue(); dut.io.drainAck #= true }

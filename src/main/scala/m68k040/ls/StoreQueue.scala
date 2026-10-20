@@ -734,6 +734,21 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
       "-- a split store's second half would write the wrong values",
       FAILURE)
   }
+  val dstoreCompact = m68k040.top.ShippingCoreConfig.dstoreCompact
+  require(!dstoreCompact || (!coalesceLines && !narrowDrainMerge),
+    "CPU_DSTORE_COMPACT carries no explicit store lanes (coalescing / narrow merge need them)")
+  if (dstoreCompact) {
+    // Both halves present {data, size} of the architectural access; slot B is marked
+    // `tailB` with slot A's line offset, and the D-cache derives the lanes.
+    io.drain.payload.paddr     := Mux(sendPhaseB, paddrBs(sendPtr), paddrs(sendPtr))
+    io.drain.payload.data      := datas(sendPtr)
+    io.drain.payload.size      := sizes(sendPtr)
+    io.drain.payload.useStrb   := sendPhaseB || useStrbAs(sendPtr)
+    io.drain.payload.tailB     := sendPhaseB
+    io.drain.payload.tailOff   := sendStOff
+    io.drain.payload.cacheMode := Mux(sendPhaseB, cacheModesB(sendPtr), cacheModes(sendPtr))
+    io.drain.payload.precise   := precises(sendPtr)
+  } else
   when(!sendPhaseB) {
     io.drain.payload.paddr    := paddrs(sendPtr)
     io.drain.payload.data     := datas(sendPtr)

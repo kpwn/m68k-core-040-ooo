@@ -168,14 +168,14 @@ class StoreQueuePayloadResetSpec extends AnyFunSuite {
             assert(e.ready && (!second || e.split))
             val p = d.io.drain.payload
             assert(p.paddr.toLong == (if (second) e.pb else e.pa))
-            assert(p.data.toLong == (if (second) 0L else e.data))
+            assert(p.data.toLong == (if (second && !m68k040.sim.DStoreSim.compact) 0L else e.data))
             val strobe = if (second) e.mb else e.ma
             var line = BigInt(0)
             for (k <- 0 until e.bytes if (e.off + k >= 16) == second) {
               val lane = (e.off + k) & 15
               line |= BigInt((e.data >>> (8 * (e.bytes - k - 1))) & 255) << (8 * lane)
             }
-            assert(p.strb.toInt == strobe && p.lineData.toBigInt == line)
+            assert(m68k040.sim.DStoreSim.lanes(p) == ((strobe, line)))
             if (ready) accepted += 1
           }
           if (d.io.sqFaultCompletion.valid.toBoolean) {
@@ -195,7 +195,7 @@ class StoreQueuePayloadResetSpec extends AnyFunSuite {
             if (hit) d.io.fwd.rsp.data.toLong else 0L,
             d.io.drain.valid.toBoolean,
             if (d.io.drain.valid.toBoolean) d.io.drain.payload.paddr.toLong else 0L,
-            if (d.io.drain.valid.toBoolean) d.io.drain.payload.lineData.toBigInt else BigInt(0),
+            if (d.io.drain.valid.toBoolean) m68k040.sim.DStoreSim.lanes(d.io.drain.payload)._2 else BigInt(0),
             d.io.sqCompletion.valid.toBoolean, d.io.sqFaultCompletion.valid.toBoolean,
             d.io.preciseDrainBusy.toBoolean, d.io.flushKeptPrecise.toBoolean,
             d.io.barrier.olderStore.toBoolean, d.io.barrier.olderInhibitedStore.toBoolean)

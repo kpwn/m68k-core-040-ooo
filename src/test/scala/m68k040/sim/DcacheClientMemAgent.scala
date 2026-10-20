@@ -198,28 +198,7 @@ class DcacheClientMemAgent(cmdP: Stream[DLoadCmd], rspP: Flow[DLoadRsp],
     // ---- accept a new store command ----
     if (hasStore && io.st.valid.toBoolean && io.st.ready.toBoolean) {
       val paddr = io.st.payload.paddr.toLong
-      if (io.st.payload.useStrb.toBoolean) {
-        val strb = io.st.payload.strb.toLong
-        val data = io.st.payload.lineData.toBigInt
-        val base = paddr & ~0xfL
-        for (i <- 0 until 16) {
-          if (((strb >> i) & 1) != 0) {
-            mem.write(base + i, ((data >> (8 * i)) & 0xff).toInt.toByte)
-          }
-        }
-      } else {
-        // A walker never emits this shape; support it anyway so the agent is a
-        // general-purpose client responder rather than a walker-only special case.
-        val nbytes = io.st.payload.size.toEnum match {
-          case m68k040.isa.Size.BYTE => 1
-          case m68k040.isa.Size.WORD => 2
-          case _                     => 4
-        }
-        val d = io.st.payload.data.toLong
-        for (i <- 0 until nbytes) {
-          mem.write(paddr + i, ((d >> (8 * (nbytes - 1 - i))) & 0xff).toInt.toByte)
-        }
-      }
+      for ((a, v) <- DStoreSim.byteWrites(io.st.payload)) mem.write(a, v.toByte)
       storeCount += 1
       stAckPending = latency
     }
