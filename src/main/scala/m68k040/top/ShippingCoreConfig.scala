@@ -1380,4 +1380,10 @@ object ShippingCoreConfig {
     * miss allocates one cycle after its S2). Sim-asserted equal. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
   val dcS3MergeReg: Boolean = envFlag("CPU_DC_S3_MERGE_REG", false)
+  /** Area (fable `area6`): the exception unit's four RTE frame-word reads (frameBase +
+    * 0/2/4/6, one per state pair) share ONE address adder (offset decoded from the state)
+    * and ONE split/translate/physical-address cone instead of four copies feeding the
+    * xVa / ldoVaddr / ldoPaddr / curFault muxes. Same value in every state. Default OFF;
+    * echoed in `SHIPPING_CONFIG`. */
+  val excRteOneAddr: Boolean = envFlag("CPU_EXC_RTE_ONE_ADDR", false)
 }
