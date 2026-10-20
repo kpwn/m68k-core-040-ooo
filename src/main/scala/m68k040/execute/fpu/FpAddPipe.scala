@@ -201,6 +201,7 @@ class FpAddPipe(oneAdder: Boolean = false) extends Component {
       req.bypass := True; req.bypassValue := Fp80.packZero(a0.rmRM)
     }
     when(cmpSpecial) { req.bypass := True }        // value irrelevant, FPCC comes from table
+    FpBypassInline.fold(req)
 
     val vld    = RegNext(a0.vld) init False
     val rReq   = RegNext(req)
@@ -268,6 +269,7 @@ class FpAddPipe(oneAdder: Boolean = false) extends Component {
     val isZero = a6.rClz === 67
     val req  = FpRoundReq().overridable()
     req := a6.rReq
+    def lanes(): Unit = {
     req.sig    := w(66 downto 3)
     req.round  := w(2)
     req.sticky := w(1) | w(0)
@@ -276,6 +278,8 @@ class FpAddPipe(oneAdder: Boolean = false) extends Component {
     // than letting bigExp+adj leak into FpRoundPack's overflow compare.
     req.exp    := a6.rReq.exp + a6.rExpAdj - a6.rClz.resize(18).asSInt
     when(isZero) { req.sig := 0; req.round := False; req.sticky := False; req.exp := 0 }
+    }
+    if (FpBypassInline.on) when(!a6.rReq.bypass) { lanes() } else lanes()
     val vld  = RegNext(a6.vld) init False
     val rReq = RegNext(req)
   }

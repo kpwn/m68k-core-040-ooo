@@ -210,6 +210,7 @@ class FpDivSqrtCore(sharedNorm: Boolean = false, sharedSub: Boolean = false) ext
         .otherwise                 { takeBypass := False }
       }
 
+      FpBypassInline.fold(r)
       bypReq := r; bypass := takeBypass; zSign := sgn
       if (!sharedNorm) {
         aSig := Fp80.sig(a); bSig := Fp80.sig(b)

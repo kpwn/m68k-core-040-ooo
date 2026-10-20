@@ -286,7 +286,13 @@ class FpRoundPack extends Component {
                       Fp80.pack(s1.req.sign, pc.expMax.asUInt.resize(15), pc.keep),
                       Fp80.packInf(s1.req.sign))
 
-    val value = Mux(s1.req.bypass, s1.req.bypassValue,
+    if (FpBypassInline.on) GenerationFlags.simulation {
+      when(s1.vld && s1.req.bypass) {
+        assert(FpBypassInline.value(s1.req) === s1.req.bypassValue,
+          "FpRoundPack CPU_FP_BYPASS_INLINE: inline bypass lanes diverged from bypassValue", FAILURE)
+      }
+    }
+    val value = Mux(s1.req.bypass, FpBypassInline.value(s1.req),
                 Mux(s1.rOvfl, ovflVal, packed))
 
     val exc = FpExcFlags()

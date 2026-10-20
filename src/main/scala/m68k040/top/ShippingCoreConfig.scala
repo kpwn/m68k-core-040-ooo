@@ -1312,4 +1312,9 @@ object ShippingCoreConfig {
     * of a 32-entry per-ROB-entry array written by every completion port; every reader is
     * gated to an entry that owns a slot. Default OFF; echoed in `SHIPPING_CONFIG`. */
   val robSysRdySlot: Boolean = envFlag("CPU_ROB_SYSRDY_SLOT", false)
+  /** Area (fable `area5`): a bypassed FPU round request (NaN/infinity/zero/FMOVE-class
+    * results) carries its final value in its own sign/exp/sig lanes instead of a separate
+    * 80-bit `bypassValue`, which then disappears from every FPU pipe stage and FpRoundPack.
+    * Sim-asserted equal at FpRoundPack. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val fpBypassInline: Boolean = envFlag("CPU_FP_BYPASS_INLINE", false)
 }
