@@ -1173,7 +1173,7 @@ object ShippingCoreConfig {
     * LUTRAMs written by the two push ways, instead of flop arrays with a depth:1 read mux
     * per push source. A row is read only under its `busy` bit, which is set only together
     * with an insert of that row, so every observed value is identical. Default OFF; echoed. */
-  val iqPositionLutram: Boolean = envFlag("CPU_IQ_POS_LUTRAM", false)
+  val iqPositionLutram: Boolean = envFlag("CPU_IQ_POS_LUTRAM", true)
   /** Fmax tail (i20 census, 2026-10-15): cycle-identical restructures of the routed
     * tail families -- IQ log-depth first-one select + `valid` from the candidate OR,
     * exception-store payload captured without a data reset, the merged AXI write
@@ -1260,7 +1260,7 @@ object ShippingCoreConfig {
     * 32-bit `alignedRData`. The merge keeps ONE `extractCross`, now always fed by the live
     * line. Exact: no control path reads line data. Read by `LsEuPlugin` (default arg).
     * Default OFF; echoed in `SHIPPING_CONFIG`. */
-  val lsParkNoLine: Boolean = envFlag("CPU_LS_PARK_NOLINE", false)
+  val lsParkNoLine: Boolean = envFlag("CPU_LS_PARK_NOLINE", true)
   /** Fanout/area (fable `fanout`): the ITLB/DTLB U/M-bit drain store keeps the merged
     * descriptor BYTE (8 flops) instead of a 128-bit line beat with the byte placed at its
     * lane and zeros elsewhere; the beat is the byte replicated into all 16 lanes. The store
@@ -1268,19 +1268,19 @@ object ShippingCoreConfig {
     * WSTRB) reads only strobed lanes, so memory and cache contents are identical. Saves
     * ~120 FF + the 128-LUT lane-placement decode per TLB. Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
-  val tlbDrainNarrow: Boolean = envFlag("CPU_TLB_DRAIN_NARROW", false)
+  val tlbDrainNarrow: Boolean = envFlag("CPU_TLB_DRAIN_NARROW", true)
   /** Timing/fanout (fable `fanout`): the L1D PROBE-side multi-hot evidence latch is fed
     * one cycle late (registered fire + address), like the load/store sites already are
     * under `CPU_DCACHE_TAG_CE_RETIME`. Debug-only latch; i20 tail: 8 of the 200 worst
     * paths end on its CE. Default OFF; echoed in `SHIPPING_CONFIG`. */
-  val dcProbeMhLag: Boolean = envFlag("CPU_DC_PROBE_MH_LAG", false)
+  val dcProbeMhLag: Boolean = envFlag("CPU_DC_PROBE_MH_LAG", true)
   /** Fanout (fable `fanout`): payload registers whose value is don't-care while their valid
     * is low load unconditionally instead of under a deep clock enable. L1D: the store-miss
     * payload (`pendingStorePaddr/MergeData/MergeStrb/VictimWay/VictimDirty`, loads while
     * `!pendingStoreMiss`) and the S3 write-forward D1 payload (`stS3Write*D1`, loads every
     * cycle; read only under `stS3WriteD1`). L2 TLB filter: a granule register loads while
     * its entry is free. All exact. Default OFF; echoed in `SHIPPING_CONFIG`. */
-  val dcFreeCapture: Boolean = envFlag("CPU_DC_FREE_CAPTURE", false)
+  val dcFreeCapture: Boolean = envFlag("CPU_DC_FREE_CAPTURE", true)
   /** Area/fanout (fable `fanout`): the full DebugCtrl's architectural apply reads the
     * `archShadow` words IN PLACE instead of a 1024-flop start-of-apply copy
     * (`archApplyShadow`, whose 1024-load clock enable and POR resets go with it). To keep
@@ -1291,7 +1291,7 @@ object ShippingCoreConfig {
     * identical; only that write's response latency moves. Writes to OFF_ARCH_APPLY/STATUS
     * are not held (a busy re-apply is still rejected). Default OFF; echoed in
     * `SHIPPING_CONFIG`. */
-  val dbgApplyNoSnap: Boolean = envFlag("CPU_DBG_APPLY_NOSNAP", false)
+  val dbgApplyNoSnap: Boolean = envFlag("CPU_DBG_APPLY_NOSNAP", true)
   /** Area (fable `area4`): the store queue's store-to-load forward picks its source with a
     * one-hot select (youngest older overlapping entry, from `head` and the overlap vector,
     * no-hit default = entry depth-1 exactly as before) and ONE AND-OR over the entries'
