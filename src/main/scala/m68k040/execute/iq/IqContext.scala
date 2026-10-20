@@ -180,7 +180,11 @@ case class IqHot() extends Bundle {
     isLsClass := u.cluster === m68k040.isa.Cluster.LS &&
       (u.memOp =/= m68k040.isa.MemOp.NONE || u.leaAddr)
     isCplxClass := u.cluster === m68k040.isa.Cluster.CPLX
-    srcBRead := u.psrcBValid && (!u.useImm || isLsClass || srcBRegDespiteImm)
+    // A branch-class uop's psrcB is the branch EU's `anRd` operand (the A7 base an
+    // RTS/RTR adds anInc to, or CPU_RTD_PRECISE_A7's T1 = A7 + 4 + disp16 that the
+    // ibranch commits to A7). Its imm is the TARGET displacement, so `useImm` does not
+    // make srcB an immediate: the uop must wait for psrcB like any register read.
+    srcBRead := u.psrcBValid && (!u.useImm || isLsClass || srcBRegDespiteImm || u.isBranch)
     isLsLoad := isLsClass && (u.memOp === m68k040.isa.MemOp.LOAD)
     firstOfInstr := u.firstOfInstr
     fourCycleBaseLoad := FourCycleLoadForm.applies(u)
